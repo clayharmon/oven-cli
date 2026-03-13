@@ -1,14 +1,14 @@
 use askama::Template;
 
-use crate::github::Issue;
+use crate::issues::PipelineIssue;
 
 #[derive(Template)]
 #[template(path = "planner.txt")]
 struct PlannerPrompt<'a> {
-    issues: &'a [Issue],
+    issues: &'a [PipelineIssue],
 }
 
-pub fn build_prompt(issues: &[Issue]) -> String {
+pub fn build_prompt(issues: &[PipelineIssue]) -> String {
     let tmpl = PlannerPrompt { issues };
     tmpl.render().expect("planner template render failed")
 }
@@ -16,21 +16,23 @@ pub fn build_prompt(issues: &[Issue]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{Issue, IssueLabel};
+    use crate::issues::IssueOrigin;
 
-    fn sample_issues() -> Vec<Issue> {
+    fn sample_issues() -> Vec<PipelineIssue> {
         vec![
-            Issue {
+            PipelineIssue {
                 number: 1,
                 title: "Add login".to_string(),
                 body: "implement login flow".to_string(),
-                labels: vec![IssueLabel { name: "o-ready".to_string() }],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
-            Issue {
+            PipelineIssue {
                 number: 2,
                 title: "Fix bug".to_string(),
                 body: "crash on startup".to_string(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
         ]
     }

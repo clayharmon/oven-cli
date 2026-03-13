@@ -14,7 +14,8 @@ use crate::{
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
     git,
-    github::{self, GhClient, Issue, issues::parse_issue_frontmatter},
+    github::{self, GhClient},
+    issues::{IssueOrigin, IssueProvider, PipelineIssue},
     process::CommandRunner,
 };
 
@@ -22,6 +23,7 @@ use crate::{
 pub struct PipelineExecutor<R: CommandRunner> {
     pub runner: Arc<R>,
     pub github: Arc<GhClient<R>>,
+    pub issues: Arc<dyn IssueProvider>,
     pub db: Arc<Mutex<Connection>>,
     pub config: Config,
     pub cancel_token: CancellationToken,
@@ -30,27 +32,21 @@ pub struct PipelineExecutor<R: CommandRunner> {
 
 impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     /// Run the full pipeline for a single issue.
-    pub async fn run_issue(&self, issue: &Issue, auto_merge: bool) -> Result<()> {
+    pub async fn run_issue(&self, issue: &PipelineIssue, auto_merge: bool) -> Result<()> {
         self.run_issue_with_complexity(issue, auto_merge, None).await
     }
 
     /// Run the full pipeline for a single issue with an optional complexity classification.
     pub async fn run_issue_with_complexity(
         &self,
-        issue: &Issue,
+        issue: &PipelineIssue,
         auto_merge: bool,
         complexity: Option<Complexity>,
     ) -> Result<()> {
         let run_id = generate_run_id();
 
         // Determine target repo for worktrees and PRs (multi-repo routing)
-        let parsed = parse_issue_frontmatter(issue, &self.config.multi_repo.target_field);
-        let (target_dir, is_multi_repo) = self.resolve_target_dir(parsed.target_repo.as_ref())?;
-        let agent_body = if is_multi_repo {
-            parsed.body_without_frontmatter.clone()
-        } else {
-            issue.body.clone()
-        };
+        let (target_dir, is_multi_repo) = self.resolve_target_dir(issue.target_repo.as_ref())?;
 
         let base_branch = git::default_branch(&target_dir).await?;
 
@@ -63,13 +59,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             db::runs::insert_run(&conn, &run)?;
         }
 
-        github::transition_issue(
-            &self.github,
-            issue.number,
-            &self.config.labels.ready,
-            &self.config.labels.cooking,
-        )
-        .await?;
+        self.issues
+            .transition(issue.number, &self.config.labels.ready, &self.config.labels.cooking)
+            .await?;
 
         let worktree = git::create_worktree(&target_dir, issue.number, &base_branch).await?;
         self.record_worktree(&run_id, &worktree).await?;
@@ -78,28 +70,33 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             run_id = %run_id,
             issue = issue.number,
             branch = %worktree.branch,
-            target_repo = ?parsed.target_repo,
+            target_repo = ?issue.target_repo,
             "starting pipeline"
         );
 
-        let pr_number = self.create_pr_in(&run_id, issue, &worktree.branch, &target_dir).await?;
+        let issue_source_str = match issue.source {
+            IssueOrigin::Github => "github",
+            IssueOrigin::Local => "local",
+        };
+
+        let pr_number = self.create_pr(&run_id, issue, &worktree.branch, &target_dir).await?;
 
         let ctx = AgentContext {
             issue_number: issue.number,
             issue_title: issue.title.clone(),
-            issue_body: agent_body,
+            issue_body: issue.body.clone(),
             branch: worktree.branch.clone(),
             pr_number: Some(pr_number),
             test_command: self.config.project.test.clone(),
             lint_command: self.config.project.lint.clone(),
             review_findings: None,
             cycle: 1,
-            target_repo: if is_multi_repo { parsed.target_repo.clone() } else { None },
+            target_repo: if is_multi_repo { issue.target_repo.clone() } else { None },
+            issue_source: issue_source_str.to_string(),
         };
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge).await;
-        self.finalize_run(&run_id, issue, pr_number, &result, parsed.target_repo.as_deref())
-            .await?;
+        self.finalize_run(&run_id, issue, pr_number, &result).await?;
 
         if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
             warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
@@ -111,7 +108,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     /// Invoke the planner agent to decide batching and complexity for a set of issues.
     ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
-    pub async fn plan_issues(&self, issues: &[Issue]) -> Option<PlannerOutput> {
+    pub async fn plan_issues(&self, issues: &[PipelineIssue]) -> Option<PlannerOutput> {
         let prompt = agents::planner::build_prompt(issues);
         let invocation = AgentInvocation {
             role: AgentRole::Planner,
@@ -161,18 +158,29 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
-    async fn create_pr_in(
+    async fn create_pr(
         &self,
         run_id: &str,
-        issue: &Issue,
+        issue: &PipelineIssue,
         branch: &str,
         repo_dir: &std::path::Path,
     ) -> Result<u32> {
-        let pr_title = format!("fix(#{}): {}", issue.number, issue.title);
-        let pr_body = format!(
-            "Resolves #{}\n\nAutomated by [oven](https://github.com/clayharmon/oven-cli).",
-            issue.number
-        );
+        let (pr_title, pr_body) = match issue.source {
+            IssueOrigin::Github => (
+                format!("fix(#{}): {}", issue.number, issue.title),
+                format!(
+                    "Resolves #{}\n\nAutomated by [oven](https://github.com/clayharmon/oven-cli).",
+                    issue.number
+                ),
+            ),
+            IssueOrigin::Local => (
+                format!("fix: {}", issue.title),
+                format!(
+                    "From local issue #{}\n\nAutomated by [oven](https://github.com/clayharmon/oven-cli).",
+                    issue.number
+                ),
+            ),
+        };
 
         git::push_branch(repo_dir, branch).await?;
         let pr_number =
@@ -190,30 +198,36 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     async fn finalize_run(
         &self,
         run_id: &str,
-        issue: &Issue,
+        issue: &PipelineIssue,
         pr_number: u32,
         result: &Result<()>,
-        target_repo: Option<&str>,
     ) -> Result<()> {
         let (final_status, error_msg) = match result {
             Ok(()) => {
-                github::transition_issue(
-                    &self.github,
-                    issue.number,
-                    &self.config.labels.cooking,
-                    &self.config.labels.complete,
-                )
-                .await?;
+                self.issues
+                    .transition(
+                        issue.number,
+                        &self.config.labels.cooking,
+                        &self.config.labels.complete,
+                    )
+                    .await?;
 
-                // In multi-repo mode the merger can't close the god repo issue
-                // (it runs in the target repo dir), so the executor handles it.
-                if let Some(repo_name) = target_repo {
-                    let comment = format!("Implemented in {repo_name}#{pr_number}");
-                    if let Err(e) = self.github.close_issue(issue.number, Some(&comment)).await {
+                // Close the issue when the merger can't do it:
+                // - Local issues: merger can't use `gh issue close`
+                // - Multi-repo: merger runs in target repo, can't close god-repo issue
+                let should_close =
+                    issue.source == IssueOrigin::Local || issue.target_repo.is_some();
+
+                if should_close {
+                    let comment = issue.target_repo.as_ref().map_or_else(
+                        || format!("Implemented in #{pr_number}"),
+                        |repo_name| format!("Implemented in {repo_name}#{pr_number}"),
+                    );
+                    if let Err(e) = self.issues.close(issue.number, Some(&comment)).await {
                         warn!(
                             run_id = %run_id,
                             error = %e,
-                            "failed to close god-repo issue in multi-repo mode"
+                            "failed to close issue"
                         );
                     }
                 }
@@ -224,13 +238,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 warn!(run_id = %run_id, error = %e, "pipeline failed");
                 github::safe_comment(&self.github, pr_number, &format!("Pipeline failed: {e:#}"))
                     .await;
-                let _ = github::transition_issue(
-                    &self.github,
-                    issue.number,
-                    &self.config.labels.cooking,
-                    &self.config.labels.failed,
-                )
-                .await;
+                let _ = self
+                    .issues
+                    .transition(
+                        issue.number,
+                        &self.config.labels.cooking,
+                        &self.config.labels.failed,
+                    )
+                    .await;
                 (RunStatus::Failed, Some(format!("{e:#}")))
             }
         };
@@ -467,7 +482,7 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
     comment
 }
 
-fn new_run(run_id: &str, issue: &Issue, auto_merge: bool) -> Run {
+fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
     Run {
         id: run_id.to_string(),
         issue_number: issue.number,

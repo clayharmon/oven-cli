@@ -30,6 +30,7 @@ mod tests {
             review_findings: None,
             cycle: 1,
             target_repo: None,
+            issue_source: "github".to_string(),
         }
     }
 
@@ -91,5 +92,23 @@ mod tests {
     fn prompt_includes_issue_close_in_single_repo() {
         let prompt = build_prompt(&sample_context(), true);
         assert!(prompt.contains("gh issue close 42"));
+    }
+
+    #[test]
+    fn prompt_skips_issue_close_for_local_source() {
+        let mut ctx = sample_context();
+        ctx.issue_source = "local".to_string();
+        let prompt = build_prompt(&ctx, true);
+        assert!(prompt.contains("gh pr merge 99"));
+        assert!(!prompt.contains("gh issue close"));
+    }
+
+    #[test]
+    fn prompt_uses_local_issue_reference_for_local_source() {
+        let mut ctx = sample_context();
+        ctx.issue_source = "local".to_string();
+        let prompt = build_prompt(&ctx, true);
+        assert!(prompt.contains("From local issue #42"));
+        assert!(!prompt.contains("Resolves #42"));
     }
 }

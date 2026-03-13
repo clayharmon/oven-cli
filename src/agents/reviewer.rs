@@ -30,6 +30,7 @@ mod tests {
             review_findings: None,
             cycle: 1,
             target_repo: None,
+            issue_source: "github".to_string(),
         }
     }
 

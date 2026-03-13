@@ -38,7 +38,7 @@ gh pr edit {{ ctx.pr_number.as_ref().unwrap() }} --title "<type>(#{{ ctx.issue_n
 
 All tests passing.
 
-Resolves #{{ ctx.issue_number }}
+{% if ctx.issue_source == "github" %}Resolves #{{ ctx.issue_number }}{% else %}From local issue #{{ ctx.issue_number }}{% endif %}
 
 ---
 Automated by [oven](https://github.com/clayharmon/oven-cli)"
@@ -62,7 +62,7 @@ After merging:
 git checkout main
 git pull
 ```
-{% if ctx.target_repo.is_none() %}
+{% if ctx.target_repo.is_none() && ctx.issue_source == "github" %}
 ## Step 5: Close Issue
 
 Close the issue with a comment linking to the PR:

@@ -82,6 +82,9 @@ pub struct AgentContext {
     /// different repo than the issue. The merger should skip closing the issue
     /// (the executor handles it).
     pub target_repo: Option<String>,
+    /// Issue source: "github" or "local". The merger skips `gh issue close`
+    /// for local issues since they're not on GitHub.
+    pub issue_source: String,
 }
 
 /// An invocation ready to be sent to the process runner.

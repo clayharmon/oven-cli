@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{GlobalOpts, OnArgs};
 use crate::{
-    config::Config,
+    config::{Config, IssueSource},
     github::GhClient,
+    issues::{IssueProvider, github::GithubIssueProvider, local::LocalIssueProvider},
     pipeline::{executor::PipelineExecutor, runner},
     process::RealCommandRunner,
 };
@@ -48,9 +49,18 @@ pub async fn run(args: OnArgs, global: &GlobalOpts) -> Result<()> {
     let conn = crate::db::open(&db_path)?;
     let db = Arc::new(Mutex::new(conn));
 
+    // Build the issue provider based on config
+    let issues: Arc<dyn IssueProvider> = match config.project.issue_source {
+        IssueSource::Github => {
+            Arc::new(GithubIssueProvider::new(Arc::clone(&github), &config.multi_repo.target_field))
+        }
+        IssueSource::Local => Arc::new(LocalIssueProvider::new(&project_dir)),
+    };
+
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues: Arc::clone(&issues),
         db,
         config: config.clone(),
         cancel_token: cancel_token.clone(),
@@ -59,11 +69,10 @@ pub async fn run(args: OnArgs, global: &GlobalOpts) -> Result<()> {
 
     if let Some(ids_str) = &args.ids {
         // Run specific issues
-        let issues = parse_issue_ids(ids_str)?;
-        let gh = GhClient::new(RealCommandRunner, &executor.repo_dir);
+        let ids = parse_issue_ids(ids_str)?;
         let mut fetched = Vec::new();
-        for id in issues {
-            let issue = gh.get_issue(id).await?;
+        for id in ids {
+            let issue = issues.get_issue(id).await?;
             fetched.push(issue);
         }
 

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use super::executor::PipelineExecutor;
-use crate::{agents::Complexity, github::Issue, process::CommandRunner};
+use crate::{agents::Complexity, issues::PipelineIssue, process::CommandRunner};
 
 /// Run the pipeline for a batch of issues, limiting parallelism with a semaphore.
 ///
@@ -21,7 +21,7 @@ use crate::{agents::Complexity, github::Issue, process::CommandRunner};
 /// [`polling_loop`] which handles continuous issue discovery.
 pub async fn run_batch<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
-    issues: Vec<Issue>,
+    issues: Vec<PipelineIssue>,
     max_parallel: usize,
     auto_merge: bool,
 ) -> Result<()> {
@@ -72,7 +72,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
 /// Returns an empty map if the planner fails or returns unparseable output.
 async fn get_complexity_map<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
-    issues: &[Issue],
+    issues: &[PipelineIssue],
 ) -> HashMap<u32, Complexity> {
     let mut map = HashMap::new();
     if let Some(plan) = executor.plan_issues(issues).await {
@@ -129,7 +129,7 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
                 break;
             }
             () = tokio::time::sleep(poll_interval) => {
-                match executor.github.get_issues_by_label(&ready_label).await {
+                match executor.issues.get_ready_issues(&ready_label).await {
                     Ok(issues) => {
                         let in_flight_guard = in_flight.lock().await;
                         let new_issues: Vec<_> = issues
@@ -207,6 +207,7 @@ mod tests {
     use crate::{
         config::Config,
         github::GhClient,
+        issues::{IssueOrigin, IssueProvider, github::GithubIssueProvider},
         process::{AgentResult, CommandOutput, MockCommandRunner},
     };
 
@@ -236,11 +237,16 @@ mod tests {
         mock
     }
 
+    fn make_github_provider(gh: &Arc<GhClient<MockCommandRunner>>) -> Arc<dyn IssueProvider> {
+        Arc::new(GithubIssueProvider::new(Arc::clone(gh), "target_repo"))
+    }
+
     #[tokio::test]
     async fn cancellation_stops_polling() {
         let cancel = CancellationToken::new();
         let runner = Arc::new(mock_runner_for_batch());
         let github = Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+        let issues = make_github_provider(&github);
         let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
 
         let mut config = Config::default();
@@ -249,6 +255,7 @@ mod tests {
         let executor = Arc::new(PipelineExecutor {
             runner,
             github,
+            issues,
             db,
             config,
             cancel_token: cancel.clone(),
@@ -270,6 +277,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let runner = Arc::new(mock_runner_for_batch());
         let github = Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+        let issues = make_github_provider(&github);
         let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
 
         let mut config = Config::default();
@@ -278,6 +286,7 @@ mod tests {
         let executor = Arc::new(PipelineExecutor {
             runner,
             github,
+            issues,
             db,
             config,
             cancel_token: cancel.clone(),
@@ -304,23 +313,26 @@ mod tests {
         in_flight.lock().await.insert(1);
 
         let issues = vec![
-            Issue {
+            PipelineIssue {
                 number: 1,
                 title: "Already running".to_string(),
                 body: String::new(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
-            Issue {
+            PipelineIssue {
                 number: 2,
                 title: "New issue".to_string(),
                 body: String::new(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
-            Issue {
+            PipelineIssue {
                 number: 3,
                 title: "Another new".to_string(),
                 body: String::new(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
         ];
 
@@ -367,22 +379,25 @@ mod tests {
 
         let runner = Arc::new(mock);
         let github = Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+        let issues_provider = make_github_provider(&github);
         let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
 
         let executor = Arc::new(PipelineExecutor {
             runner,
             github,
+            issues: issues_provider,
             db,
             config: Config::default(),
             cancel_token: CancellationToken::new(),
             repo_dir: PathBuf::from("/tmp"),
         });
 
-        let issues = vec![Issue {
+        let issues = vec![PipelineIssue {
             number: 1,
             title: "Test".to_string(),
             body: "body".to_string(),
-            labels: vec![],
+            source: IssueOrigin::Github,
+            target_repo: None,
         }];
 
         let map = get_complexity_map(&executor, &issues).await;
@@ -412,11 +427,13 @@ mod tests {
 
         let runner = Arc::new(mock);
         let github = Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+        let issues_provider = make_github_provider(&github);
         let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
 
         let executor = Arc::new(PipelineExecutor {
             runner,
             github,
+            issues: issues_provider,
             db,
             config: Config::default(),
             cancel_token: CancellationToken::new(),
@@ -424,17 +441,19 @@ mod tests {
         });
 
         let issues = vec![
-            Issue {
+            PipelineIssue {
                 number: 1,
                 title: "Simple".to_string(),
                 body: "simple change".to_string(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
-            Issue {
+            PipelineIssue {
                 number: 2,
                 title: "Complex".to_string(),
                 body: "big feature".to_string(),
-                labels: vec![],
+                source: IssueOrigin::Github,
+                target_repo: None,
             },
         ];
 

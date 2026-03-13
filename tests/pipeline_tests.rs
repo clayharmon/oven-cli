@@ -14,7 +14,8 @@ use oven_cli::{
     agents::{Complexity, Severity, parse_planner_output, parse_review_output},
     config::{Config, MultiRepoConfig},
     db::{self, RunStatus},
-    github::{GhClient, Issue, issues::parse_issue_frontmatter},
+    github::GhClient,
+    issues::{IssueOrigin, IssueProvider, PipelineIssue, github::GithubIssueProvider},
     pipeline::{
         executor::{PipelineExecutor, generate_run_id},
         runner,
@@ -346,6 +347,20 @@ fn test_runner_clean_review() -> TestRunner {
     }
 }
 
+fn make_github_issue(number: u32, title: &str, body: &str) -> PipelineIssue {
+    PipelineIssue {
+        number,
+        title: title.to_string(),
+        body: body.to_string(),
+        source: IssueOrigin::Github,
+        target_repo: None,
+    }
+}
+
+fn make_github_provider(gh: &Arc<GhClient<TestRunner>>) -> Arc<dyn IssueProvider> {
+    Arc::new(GithubIssueProvider::new(Arc::clone(gh), "target_repo"))
+}
+
 #[tokio::test]
 async fn e2e_pipeline_clean_review_completes() {
     let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
@@ -353,23 +368,21 @@ async fn e2e_pipeline_clean_review_completes() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: CancellationToken::new(),
         repo_dir: repo_dir.clone(),
     });
 
-    let issue = Issue {
-        number: 7,
-        title: "Add retry logic".to_string(),
-        body: "Implement retry for transient API failures.".to_string(),
-        labels: vec![],
-    };
+    let issue =
+        make_github_issue(7, "Add retry logic", "Implement retry for transient API failures.");
 
     // Run the full pipeline
     let result = executor.run_issue(&issue, false).await;
@@ -454,23 +467,21 @@ async fn e2e_pipeline_with_one_fix_cycle() {
 
     let runner = Arc::new(test_runner_with_fix_cycle());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 12,
-        title: "Fix bug in parser".to_string(),
-        body: "The JSON parser crashes on empty input.".to_string(),
-        labels: vec![],
-    };
+    let issue =
+        make_github_issue(12, "Fix bug in parser", "The JSON parser crashes on empty input.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline failed: {result:?}");
@@ -504,23 +515,20 @@ async fn e2e_pipeline_cancellation_stops_run() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: cancel,
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 99,
-        title: "Should be cancelled".to_string(),
-        body: "This should not complete.".to_string(),
-        labels: vec![],
-    };
+    let issue = make_github_issue(99, "Should be cancelled", "This should not complete.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_err());
@@ -542,23 +550,20 @@ async fn e2e_pipeline_cost_budget_enforced() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config,
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 50,
-        title: "Expensive issue".to_string(),
-        body: "This will exceed the budget.".to_string(),
-        labels: vec![],
-    };
+    let issue = make_github_issue(50, "Expensive issue", "This will exceed the budget.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_err());
@@ -577,11 +582,13 @@ async fn e2e_batch_runs_multiple_issues() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues_provider = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues: issues_provider,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: CancellationToken::new(),
@@ -589,18 +596,8 @@ async fn e2e_batch_runs_multiple_issues() {
     });
 
     let issues = vec![
-        Issue {
-            number: 1,
-            title: "First issue".to_string(),
-            body: "First.".to_string(),
-            labels: vec![],
-        },
-        Issue {
-            number: 2,
-            title: "Second issue".to_string(),
-            body: "Second.".to_string(),
-            labels: vec![],
-        },
+        make_github_issue(1, "First issue", "First."),
+        make_github_issue(2, "Second issue", "Second."),
     ];
 
     // Run batch with max_parallel=1 (serial) to avoid worktree conflicts
@@ -662,23 +659,20 @@ async fn e2e_complexity_recorded_in_db() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 33,
-        title: "Simple config change".to_string(),
-        body: "Update a config value.".to_string(),
-        labels: vec![],
-    };
+    let issue = make_github_issue(33, "Simple config change", "Update a config value.");
 
     // Run with explicit simple complexity
     let result = executor.run_issue_with_complexity(&issue, false, Some(Complexity::Simple)).await;
@@ -697,23 +691,20 @@ async fn e2e_default_complexity_is_full() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config: Config::default(),
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 34,
-        title: "Regular issue".to_string(),
-        body: "Normal work.".to_string(),
-        labels: vec![],
-    };
+    let issue = make_github_issue(34, "Regular issue", "Normal work.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline failed: {result:?}");
@@ -771,9 +762,13 @@ async fn e2e_continuous_polling_processes_issues() {
 
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
+    let github = Arc::new(GhClient::new(gh_runner, &repo_dir));
+    let issues = make_github_provider(&github);
+
     let executor = Arc::new(PipelineExecutor {
         runner: Arc::new(test_runner_clean_review()),
-        github: Arc::new(GhClient::new(gh_runner, &repo_dir)),
+        github,
+        issues,
         db: Arc::clone(&db),
         config,
         cancel_token: cancel.clone(),
@@ -850,9 +845,13 @@ async fn e2e_continuous_polling_multiple_issues() {
 
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
+    let github = Arc::new(GhClient::new(gh_runner, &repo_dir));
+    let issues = make_github_provider(&github);
+
     let executor = Arc::new(PipelineExecutor {
         runner: Arc::new(test_runner_clean_review()),
-        github: Arc::new(GhClient::new(gh_runner, &repo_dir)),
+        github,
+        issues,
         db: Arc::clone(&db),
         config,
         cancel_token: cancel.clone(),
@@ -887,44 +886,6 @@ async fn e2e_continuous_polling_multiple_issues() {
 }
 
 // -- Multi-repo tests --
-
-#[test]
-fn frontmatter_extracts_target_repo() {
-    let issue = Issue {
-        number: 10,
-        title: "Fix auth".to_string(),
-        body: "---\ntarget_repo: backend-api\n---\n\nFix the auth bug".to_string(),
-        labels: vec![],
-    };
-    let parsed = parse_issue_frontmatter(&issue, "target_repo");
-    assert_eq!(parsed.target_repo.as_deref(), Some("backend-api"));
-    assert_eq!(parsed.body_without_frontmatter, "Fix the auth bug");
-}
-
-#[test]
-fn frontmatter_returns_none_when_missing() {
-    let issue = Issue {
-        number: 11,
-        title: "Normal issue".to_string(),
-        body: "Just a regular issue body.".to_string(),
-        labels: vec![],
-    };
-    let parsed = parse_issue_frontmatter(&issue, "target_repo");
-    assert!(parsed.target_repo.is_none());
-    assert_eq!(parsed.body_without_frontmatter, "Just a regular issue body.");
-}
-
-#[test]
-fn frontmatter_custom_field_name() {
-    let issue = Issue {
-        number: 12,
-        title: "Custom field".to_string(),
-        body: "---\nrepo: my-service\n---\n\nDo work".to_string(),
-        labels: vec![],
-    };
-    let parsed = parse_issue_frontmatter(&issue, "repo");
-    assert_eq!(parsed.target_repo.as_deref(), Some("my-service"));
-}
 
 #[tokio::test]
 async fn e2e_multi_repo_routes_to_target() {
@@ -968,6 +929,7 @@ async fn e2e_multi_repo_routes_to_target() {
     };
 
     let github = Arc::new(GhClient::new(gh_runner, &god_dir));
+    let issues_provider = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     let config = Config {
@@ -979,17 +941,19 @@ async fn e2e_multi_repo_routes_to_target() {
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues: issues_provider,
         db: Arc::clone(&db),
         config,
         cancel_token: CancellationToken::new(),
         repo_dir: god_dir,
     });
 
-    let issue = Issue {
+    let issue = PipelineIssue {
         number: 42,
         title: "Fix backend bug".to_string(),
-        body: "---\ntarget_repo: backend\n---\n\nFix the auth bug in backend service.".to_string(),
-        labels: vec![],
+        body: "Fix the auth bug in backend service.".to_string(),
+        source: IssueOrigin::Github,
+        target_repo: Some("backend".to_string()),
     };
 
     let result = executor.run_issue(&issue, false).await;
@@ -1023,6 +987,7 @@ async fn e2e_multi_repo_no_frontmatter_uses_god_repo() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     // No repos configured, but that's fine since this issue has no frontmatter
@@ -1034,18 +999,14 @@ async fn e2e_multi_repo_no_frontmatter_uses_god_repo() {
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config,
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
-        number: 50,
-        title: "Regular issue".to_string(),
-        body: "No frontmatter, uses god repo.".to_string(),
-        labels: vec![],
-    };
+    let issue = make_github_issue(50, "Regular issue", "No frontmatter, uses god repo.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline should work without frontmatter: {result:?}");
@@ -1063,6 +1024,7 @@ async fn e2e_multi_repo_missing_repo_config_errors() {
 
     let runner = Arc::new(test_runner_clean_review());
     let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
     // No repos configured -- referencing an unknown repo should fail
@@ -1074,17 +1036,19 @@ async fn e2e_multi_repo_missing_repo_config_errors() {
     let executor = Arc::new(PipelineExecutor {
         runner,
         github,
+        issues,
         db: Arc::clone(&db),
         config,
         cancel_token: CancellationToken::new(),
         repo_dir,
     });
 
-    let issue = Issue {
+    let issue = PipelineIssue {
         number: 60,
         title: "Unknown repo".to_string(),
-        body: "---\ntarget_repo: nonexistent\n---\n\nThis should fail.".to_string(),
-        labels: vec![],
+        body: "This should fail.".to_string(),
+        source: IssueOrigin::Github,
+        target_repo: Some("nonexistent".to_string()),
     };
 
     let result = executor.run_issue(&issue, false).await;
@@ -1095,22 +1059,19 @@ async fn e2e_multi_repo_missing_repo_config_errors() {
 
 #[test]
 fn multi_repo_disabled_ignores_frontmatter() {
-    // When multi_repo.enabled is false, frontmatter is parsed but target_repo
-    // is not acted on -- the pipeline uses the god repo for everything.
-    // This is verified structurally: resolve_target_dir returns (self.repo_dir, false)
-    // when multi_repo.enabled is false, regardless of frontmatter content.
-
+    // When multi_repo.enabled is false, target_repo on the issue is not acted on.
+    // The pipeline uses the god repo for everything.
     let config = Config::default();
     assert!(!config.multi_repo.enabled);
 
-    // Even with frontmatter, parsing still works
-    let issue = Issue {
+    // Even with target_repo set, the executor would not route because
+    // multi_repo.enabled is false.
+    let issue = PipelineIssue {
         number: 70,
-        title: "Ignored frontmatter".to_string(),
-        body: "---\ntarget_repo: some-repo\n---\n\nBody".to_string(),
-        labels: vec![],
+        title: "Ignored target".to_string(),
+        body: "Body".to_string(),
+        source: IssueOrigin::Github,
+        target_repo: Some("some-repo".to_string()),
     };
-    let parsed = parse_issue_frontmatter(&issue, &config.multi_repo.target_field);
-    assert_eq!(parsed.target_repo.as_deref(), Some("some-repo"));
-    // But the executor would not use it because multi_repo.enabled is false
+    assert!(issue.target_repo.is_some());
 }
