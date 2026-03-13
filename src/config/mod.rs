@@ -12,8 +12,22 @@ pub struct Config {
     pub project: ProjectConfig,
     pub pipeline: PipelineConfig,
     pub labels: LabelConfig,
+    pub multi_repo: MultiRepoConfig,
     #[serde(default)]
     pub repos: HashMap<String, PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MultiRepoConfig {
+    pub enabled: bool,
+    pub target_field: String,
+}
+
+impl Default for MultiRepoConfig {
+    fn default() -> Self {
+        Self { enabled: false, target_field: "target_repo".to_string() }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +81,7 @@ struct RawConfig {
     project: Option<RawProjectConfig>,
     pipeline: Option<RawPipelineConfig>,
     labels: Option<RawLabelConfig>,
+    multi_repo: Option<RawMultiRepoConfig>,
     repos: Option<HashMap<String, PathBuf>>,
 }
 
@@ -94,6 +109,13 @@ struct RawLabelConfig {
     cooking: Option<String>,
     complete: Option<String>,
     failed: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawMultiRepoConfig {
+    enabled: Option<bool>,
+    target_field: Option<String>,
 }
 
 impl Config {
@@ -129,6 +151,31 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Resolve a repo name to a local path.
+    ///
+    /// Returns an error if the repo name is not in the config or the path doesn't exist.
+    pub fn resolve_repo(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let path = self
+            .repos
+            .get(name)
+            .with_context(|| format!("repo '{name}' not found in user config [repos] section"))?;
+
+        let expanded = if path.starts_with("~") {
+            dirs::home_dir().map_or_else(
+                || path.clone(),
+                |home| home.join(path.strip_prefix("~").unwrap_or(path)),
+            )
+        } else {
+            path.clone()
+        };
+
+        if !expanded.exists() {
+            anyhow::bail!("repo '{name}' path does not exist: {}", expanded.display());
+        }
+
+        Ok(expanded)
     }
 
     /// Generate a starter project TOML for `oven prep`.
@@ -198,6 +245,16 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
         }
     }
 
+    // multi_repo settings from project config (controls feature enablement)
+    if let Some(ref multi_repo) = raw.multi_repo {
+        if let Some(v) = multi_repo.enabled {
+            config.multi_repo.enabled = v;
+        }
+        if let Some(ref v) = multi_repo.target_field {
+            config.multi_repo.target_field.clone_from(v);
+        }
+    }
+
     // repos only honored from user config (security: project config shouldn't
     // be able to point the tool at arbitrary repos on the filesystem)
     if allow_repos {
@@ -229,6 +286,7 @@ mod tests {
                 project: ProjectConfig::default(),
                 pipeline: PipelineConfig { max_parallel, cost_budget, poll_interval, turn_limit },
                 labels: LabelConfig { ready, cooking, complete, failed },
+                multi_repo: MultiRepoConfig::default(),
                 repos: HashMap::new(),
             };
             let serialized = toml::to_string(&config).unwrap();
@@ -278,6 +336,8 @@ mod tests {
         assert_eq!(config.labels.failed, "o-failed");
         assert!(config.project.name.is_none());
         assert!(config.repos.is_empty());
+        assert!(!config.multi_repo.enabled);
+        assert_eq!(config.multi_repo.target_field, "target_repo");
     }
 
     #[test]
@@ -392,10 +452,65 @@ api = "/home/user/dev/api"
             },
             pipeline: PipelineConfig { max_parallel: 5, cost_budget: 25.0, ..Default::default() },
             labels: LabelConfig::default(),
+            multi_repo: MultiRepoConfig::default(),
             repos: HashMap::from([("svc".to_string(), PathBuf::from("/tmp/svc"))]),
         };
         let serialized = toml::to_string(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn multi_repo_config_from_project_toml() {
+        let toml_str = r#"
+[multi_repo]
+enabled = true
+target_field = "repo"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert!(config.multi_repo.enabled);
+        assert_eq!(config.multi_repo.target_field, "repo");
+    }
+
+    #[test]
+    fn multi_repo_defaults_when_not_specified() {
+        let toml_str = r"
+[pipeline]
+max_parallel = 1
+";
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert!(!config.multi_repo.enabled);
+        assert_eq!(config.multi_repo.target_field, "target_repo");
+    }
+
+    #[test]
+    fn resolve_repo_finds_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.repos.insert("test-repo".to_string(), dir.path().to_path_buf());
+
+        let resolved = config.resolve_repo("test-repo").unwrap();
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn resolve_repo_missing_name_errors() {
+        let config = Config::default();
+        let result = config.resolve_repo("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found in user config"));
+    }
+
+    #[test]
+    fn resolve_repo_missing_path_errors() {
+        let mut config = Config::default();
+        config.repos.insert("bad".to_string(), PathBuf::from("/nonexistent/path/xyz"));
+        let result = config.resolve_repo("bad");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
     }
 }
