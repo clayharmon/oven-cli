@@ -43,8 +43,8 @@ Phases on the same level can be worked in parallel if desired (e.g., 6, 7 can ha
 | 8. GitHub | done | GhClient for labels/issues/PRs, 11 mock tests |
 | 9. Agents | done | 5 roles with askama templates, review parser, 15 tests |
 | 10. Pipeline | done | State machine, executor with review-fix loop, parallel runner, polling loop, 15 tests |
-| 11. prep + on + off | not started | |
-| 12. look + report + clean + ticket | not started | |
+| 11. prep + on + off | done | Scaffolding with embedded templates, pipeline startup, detached mode, PID-based stop, 13 tests |
+| 12. look + report + clean + ticket | done | Log tailing, cost reports with JSON, selective cleanup, ticket CRUD, 20 tests |
 | 13. Integration Tests | not started | |
 | 14. CI + Release | not started | |
 
