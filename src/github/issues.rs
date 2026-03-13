@@ -3,6 +3,64 @@ use anyhow::{Context, Result};
 use super::{GhClient, Issue};
 use crate::process::CommandRunner;
 
+/// An issue with parsed frontmatter metadata.
+///
+/// When multi-repo mode is enabled, issues can include YAML frontmatter at the
+/// top of the body to specify which target repo the work should go to.
+#[derive(Debug, Clone)]
+pub struct ParsedIssue {
+    pub issue: Issue,
+    pub target_repo: Option<String>,
+    pub body_without_frontmatter: String,
+}
+
+/// Parse YAML frontmatter from an issue body, extracting the target repo field.
+///
+/// Frontmatter is delimited by `---` on its own line at the very start of the body.
+/// Only the field named by `target_field` is extracted; all other frontmatter is ignored.
+/// The returned `body_without_frontmatter` has the frontmatter block stripped.
+pub fn parse_issue_frontmatter(issue: &Issue, target_field: &str) -> ParsedIssue {
+    let body = issue.body.trim_start();
+
+    if !body.starts_with("---") {
+        return ParsedIssue {
+            issue: issue.clone(),
+            target_repo: None,
+            body_without_frontmatter: issue.body.clone(),
+        };
+    }
+
+    // Find the closing --- delimiter (skip the opening one)
+    let after_open = &body[3..];
+    let closing = after_open.find("\n---");
+
+    let Some(close_idx) = closing else {
+        // No closing delimiter -- treat entire body as content (not frontmatter)
+        return ParsedIssue {
+            issue: issue.clone(),
+            target_repo: None,
+            body_without_frontmatter: issue.body.clone(),
+        };
+    };
+
+    let frontmatter = &after_open[..close_idx];
+    let rest = &after_open[close_idx + 4..]; // skip "\n---"
+    let body_without = rest.trim_start_matches('\n').to_string();
+
+    // Simple key: value extraction (no full YAML parser needed)
+    let needle = format!("{target_field}:");
+    let target_repo = frontmatter.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with(&needle) {
+            Some(trimmed[needle.len()..].trim().to_string())
+        } else {
+            None
+        }
+    });
+
+    ParsedIssue { issue: issue.clone(), target_repo, body_without_frontmatter: body_without }
+}
+
 impl<R: CommandRunner> GhClient<R> {
     /// Fetch open issues with the given label, ordered oldest first.
     pub async fn get_issues_by_label(&self, label: &str) -> Result<Vec<Issue>> {
@@ -75,6 +133,7 @@ impl<R: CommandRunner> GhClient<R> {
 mod tests {
     use std::path::Path;
 
+    use super::*;
     use crate::{
         github::GhClient,
         process::{CommandOutput, MockCommandRunner},
@@ -137,5 +196,80 @@ mod tests {
         let client = GhClient::new(mock, Path::new("/tmp"));
         let result = client.comment_on_issue(42, "hello").await;
         assert!(result.is_ok());
+    }
+
+    fn make_issue(body: &str) -> Issue {
+        Issue { number: 1, title: "Test".to_string(), body: body.to_string(), labels: vec![] }
+    }
+
+    #[test]
+    fn parse_frontmatter_extracts_target_repo() {
+        let issue = make_issue("---\ntarget_repo: my-service\n---\n\nFix the bug");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert_eq!(parsed.target_repo.as_deref(), Some("my-service"));
+        assert_eq!(parsed.body_without_frontmatter, "Fix the bug");
+    }
+
+    #[test]
+    fn parse_frontmatter_custom_field_name() {
+        let issue = make_issue("---\nrepo: other-thing\n---\n\nDo stuff");
+        let parsed = parse_issue_frontmatter(&issue, "repo");
+        assert_eq!(parsed.target_repo.as_deref(), Some("other-thing"));
+    }
+
+    #[test]
+    fn parse_frontmatter_no_frontmatter() {
+        let issue = make_issue("Just a regular issue body");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert!(parsed.target_repo.is_none());
+        assert_eq!(parsed.body_without_frontmatter, "Just a regular issue body");
+    }
+
+    #[test]
+    fn parse_frontmatter_unclosed_delimiters() {
+        let issue = make_issue("---\ntarget_repo: oops\nno closing delimiter");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert!(parsed.target_repo.is_none());
+        assert_eq!(parsed.body_without_frontmatter, issue.body);
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_field() {
+        let issue = make_issue("---\nother_key: value\n---\n\nBody here");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert!(parsed.target_repo.is_none());
+        assert_eq!(parsed.body_without_frontmatter, "Body here");
+    }
+
+    #[test]
+    fn parse_frontmatter_strips_leading_newlines() {
+        let issue = make_issue("---\ntarget_repo: svc\n---\n\n\nBody");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert_eq!(parsed.body_without_frontmatter, "Body");
+    }
+
+    #[test]
+    fn parse_frontmatter_preserves_issue() {
+        let issue = make_issue("---\ntarget_repo: api\n---\nContent");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert_eq!(parsed.issue.number, 1);
+        assert_eq!(parsed.issue.title, "Test");
+    }
+
+    #[test]
+    fn parse_frontmatter_with_extra_fields() {
+        let issue =
+            make_issue("---\npriority: high\ntarget_repo: backend\nlabel: bug\n---\n\nDetails");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert_eq!(parsed.target_repo.as_deref(), Some("backend"));
+        assert_eq!(parsed.body_without_frontmatter, "Details");
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_body() {
+        let issue = make_issue("");
+        let parsed = parse_issue_frontmatter(&issue, "target_repo");
+        assert!(parsed.target_repo.is_none());
+        assert_eq!(parsed.body_without_frontmatter, "");
     }
 }
