@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use askama::Template;
 
 use super::AgentContext;
@@ -9,9 +10,9 @@ struct MergerPrompt<'a> {
     auto_merge: bool,
 }
 
-pub fn build_prompt(ctx: &AgentContext, auto_merge: bool) -> String {
+pub fn build_prompt(ctx: &AgentContext, auto_merge: bool) -> Result<String> {
     let tmpl = MergerPrompt { ctx, auto_merge };
-    tmpl.render().expect("merger template render failed")
+    tmpl.render().context("rendering merger template")
 }
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ mod tests {
 
     #[test]
     fn prompt_references_pr_number() {
-        let prompt = build_prompt(&sample_context(), false);
+        let prompt = build_prompt(&sample_context(), false).unwrap();
         assert!(prompt.contains("PR #99"));
         assert!(prompt.contains("gh pr ready 99"));
         assert!(prompt.contains("#42"));
@@ -44,14 +45,14 @@ mod tests {
 
     #[test]
     fn prompt_without_merge() {
-        let prompt = build_prompt(&sample_context(), false);
+        let prompt = build_prompt(&sample_context(), false).unwrap();
         assert!(prompt.contains("gh pr ready 99"));
         assert!(!prompt.contains("gh pr merge"));
     }
 
     #[test]
     fn prompt_with_merge() {
-        let prompt = build_prompt(&sample_context(), true);
+        let prompt = build_prompt(&sample_context(), true).unwrap();
         assert!(prompt.contains("gh pr ready 99"));
         assert!(prompt.contains("gh pr merge 99"));
         assert!(prompt.contains("--squash"));
@@ -60,20 +61,20 @@ mod tests {
 
     #[test]
     fn prompt_includes_issue_close_when_auto_merge() {
-        let prompt = build_prompt(&sample_context(), true);
+        let prompt = build_prompt(&sample_context(), true).unwrap();
         assert!(prompt.contains("gh issue close 42"));
     }
 
     #[test]
     fn prompt_includes_pr_description_update() {
-        let prompt = build_prompt(&sample_context(), false);
+        let prompt = build_prompt(&sample_context(), false).unwrap();
         assert!(prompt.contains("gh pr edit 99"));
         assert!(prompt.contains("Resolves #42"));
     }
 
     #[test]
     fn prompt_includes_merge_summary_output() {
-        let prompt = build_prompt(&sample_context(), false);
+        let prompt = build_prompt(&sample_context(), false).unwrap();
         assert!(prompt.contains("Merge Summary"));
     }
 
@@ -81,7 +82,7 @@ mod tests {
     fn prompt_skips_issue_close_in_multi_repo() {
         let mut ctx = sample_context();
         ctx.target_repo = Some("backend-api".to_string());
-        let prompt = build_prompt(&ctx, true);
+        let prompt = build_prompt(&ctx, true).unwrap();
         // Should still merge the PR
         assert!(prompt.contains("gh pr merge 99"));
         // But should NOT try to close the issue (executor handles it)
@@ -90,7 +91,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_issue_close_in_single_repo() {
-        let prompt = build_prompt(&sample_context(), true);
+        let prompt = build_prompt(&sample_context(), true).unwrap();
         assert!(prompt.contains("gh issue close 42"));
     }
 
@@ -98,7 +99,7 @@ mod tests {
     fn prompt_skips_issue_close_for_local_source() {
         let mut ctx = sample_context();
         ctx.issue_source = "local".to_string();
-        let prompt = build_prompt(&ctx, true);
+        let prompt = build_prompt(&ctx, true).unwrap();
         assert!(prompt.contains("gh pr merge 99"));
         assert!(!prompt.contains("gh issue close"));
     }
@@ -107,7 +108,7 @@ mod tests {
     fn prompt_uses_local_issue_reference_for_local_source() {
         let mut ctx = sample_context();
         ctx.issue_source = "local".to_string();
-        let prompt = build_prompt(&ctx, true);
+        let prompt = build_prompt(&ctx, true).unwrap();
         assert!(prompt.contains("From local issue #42"));
         assert!(!prompt.contains("Resolves #42"));
     }

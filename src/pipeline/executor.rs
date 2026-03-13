@@ -109,7 +109,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
     pub async fn plan_issues(&self, issues: &[PipelineIssue]) -> Option<PlannerOutput> {
-        let prompt = agents::planner::build_prompt(issues);
+        let prompt = match agents::planner::build_prompt(issues) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "planner prompt build failed");
+                return None;
+            }
+        };
         let invocation = AgentInvocation {
             role: AgentRole::Planner,
             prompt,
@@ -265,7 +271,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         // 1. Implement
         self.update_status(run_id, RunStatus::Implementing).await?;
-        let impl_prompt = agents::implementer::build_prompt(ctx);
+        let impl_prompt = agents::implementer::build_prompt(ctx)?;
         self.run_agent(run_id, AgentRole::Implementer, &impl_prompt, worktree_path, 1).await?;
 
         git::push_branch(worktree_path, &ctx.branch).await?;
@@ -281,7 +287,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         self.check_cancelled()?;
         ctx.pr_number.context("no PR number for merge step")?;
         self.update_status(run_id, RunStatus::Merging).await?;
-        let merge_prompt = agents::merger::build_prompt(ctx, auto_merge);
+        let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
         self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
 
         Ok(())
@@ -297,7 +303,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
-            let review_prompt = agents::reviewer::build_prompt(ctx);
+            let review_prompt = agents::reviewer::build_prompt(ctx)?;
             let review_result = self
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
@@ -331,7 +337,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 db::agent_runs::get_unresolved_findings(&conn, run_id)?
             };
 
-            let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved);
+            let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
             self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
 
             git::push_branch(worktree_path, &ctx.branch).await?;

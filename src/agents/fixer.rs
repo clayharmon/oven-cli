@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use askama::Template;
 
 use super::AgentContext;
@@ -10,9 +11,9 @@ struct FixerPrompt<'a> {
     findings: &'a [ReviewFinding],
 }
 
-pub fn build_prompt(ctx: &AgentContext, findings: &[ReviewFinding]) -> String {
+pub fn build_prompt(ctx: &AgentContext, findings: &[ReviewFinding]) -> Result<String> {
     let tmpl = FixerPrompt { ctx, findings };
-    tmpl.render().expect("fixer template render failed")
+    tmpl.render().context("rendering fixer template")
 }
 
 #[cfg(test)]
@@ -51,7 +52,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_findings() {
-        let prompt = build_prompt(&sample_context(), &sample_findings());
+        let prompt = build_prompt(&sample_context(), &sample_findings()).unwrap();
         assert!(prompt.contains("fixer agent"));
         assert!(prompt.contains("[critical] bug"));
         assert!(prompt.contains("src/main.rs:10"));
@@ -62,21 +63,21 @@ mod tests {
 
     #[test]
     fn prompt_includes_scope_discipline() {
-        let prompt = build_prompt(&sample_context(), &sample_findings());
+        let prompt = build_prompt(&sample_context(), &sample_findings()).unwrap();
         assert!(prompt.contains("Scope Discipline"));
         assert!(prompt.contains("Do NOT refactor code that wasn't flagged"));
     }
 
     #[test]
     fn prompt_includes_verification_section() {
-        let prompt = build_prompt(&sample_context(), &sample_findings());
+        let prompt = build_prompt(&sample_context(), &sample_findings()).unwrap();
         assert!(prompt.contains("Verification"));
         assert!(prompt.contains("git diff main --stat"));
     }
 
     #[test]
     fn prompt_includes_skip_guidance() {
-        let prompt = build_prompt(&sample_context(), &sample_findings());
+        let prompt = build_prompt(&sample_context(), &sample_findings()).unwrap();
         assert!(prompt.contains("Handling Unclear Findings"));
         assert!(prompt.contains("Skip it"));
     }

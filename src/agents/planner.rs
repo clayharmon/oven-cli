@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use askama::Template;
 
 use crate::issues::PipelineIssue;
@@ -8,9 +9,9 @@ struct PlannerPrompt<'a> {
     issues: &'a [PipelineIssue],
 }
 
-pub fn build_prompt(issues: &[PipelineIssue]) -> String {
+pub fn build_prompt(issues: &[PipelineIssue]) -> Result<String> {
     let tmpl = PlannerPrompt { issues };
-    tmpl.render().expect("planner template render failed")
+    tmpl.render().context("rendering planner template")
 }
 
 #[cfg(test)]
@@ -39,7 +40,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_issue_details() {
-        let prompt = build_prompt(&sample_issues());
+        let prompt = build_prompt(&sample_issues()).unwrap();
         assert!(prompt.contains("#1: Add login"));
         assert!(prompt.contains("#2: Fix bug"));
         assert!(prompt.contains("<issue_body>implement login flow</issue_body>"));
@@ -48,7 +49,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_complexity_classification() {
-        let prompt = build_prompt(&sample_issues());
+        let prompt = build_prompt(&sample_issues()).unwrap();
         assert!(prompt.contains("**simple**"));
         assert!(prompt.contains("**full**"));
         assert!(prompt.contains("Complexity Classification"));
@@ -56,7 +57,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_conflict_detection() {
-        let prompt = build_prompt(&sample_issues());
+        let prompt = build_prompt(&sample_issues()).unwrap();
         assert!(prompt.contains("Conflict Detection"));
         assert!(prompt.contains("CANNOT parallelize"));
         assert!(prompt.contains("CAN parallelize"));
@@ -64,7 +65,7 @@ mod tests {
 
     #[test]
     fn prompt_structured_json_output_is_valid() {
-        let prompt = build_prompt(&sample_issues());
+        let prompt = build_prompt(&sample_issues()).unwrap();
         // The template includes an example JSON block -- verify it has the new fields
         assert!(prompt.contains("\"complexity\": \"simple\""));
         assert!(prompt.contains("\"has_migration\""));

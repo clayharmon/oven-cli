@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use askama::Template;
 
 use super::AgentContext;
@@ -8,9 +9,9 @@ struct ReviewerPrompt<'a> {
     ctx: &'a AgentContext,
 }
 
-pub fn build_prompt(ctx: &AgentContext) -> String {
+pub fn build_prompt(ctx: &AgentContext) -> Result<String> {
     let tmpl = ReviewerPrompt { ctx };
-    tmpl.render().expect("reviewer template render failed")
+    tmpl.render().context("rendering reviewer template")
 }
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_review_instructions() {
-        let prompt = build_prompt(&sample_context());
+        let prompt = build_prompt(&sample_context()).unwrap();
         assert!(prompt.contains("reviewer agent"));
         assert!(prompt.contains("#42"));
         assert!(prompt.contains("<issue_title>Fix bug</issue_title>"));
@@ -45,7 +46,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_all_checklist_categories() {
-        let prompt = build_prompt(&sample_context());
+        let prompt = build_prompt(&sample_context()).unwrap();
         assert!(prompt.contains("Pattern Consistency"));
         assert!(prompt.contains("Error Handling"));
         assert!(prompt.contains("Test Coverage"));
@@ -56,7 +57,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_severity_guide() {
-        let prompt = build_prompt(&sample_context());
+        let prompt = build_prompt(&sample_context()).unwrap();
         assert!(prompt.contains("**critical**: Must fix before merge"));
         assert!(prompt.contains("**warning**: Should fix"));
         assert!(prompt.contains("**info**: Noteworthy"));
@@ -64,7 +65,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_json_output_format() {
-        let prompt = build_prompt(&sample_context());
+        let prompt = build_prompt(&sample_context()).unwrap();
         assert!(prompt.contains("\"severity\": \"critical\""));
         assert!(prompt.contains("\"file_path\""));
         assert!(prompt.contains("\"line_number\""));
@@ -72,7 +73,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_specificity_requirement() {
-        let prompt = build_prompt(&sample_context());
+        let prompt = build_prompt(&sample_context()).unwrap();
         assert!(prompt.contains("Specificity Requirement"));
     }
 }
