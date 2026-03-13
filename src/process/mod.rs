@@ -61,7 +61,8 @@ impl CommandRunner for RealCommandRunner {
         let tools_arg = allowed_tools.join(",");
 
         let mut cmd = Command::new("claude");
-        cmd.args(["-p", "--output-format", "stream-json"]).args(["--allowedTools", &tools_arg]);
+        cmd.args(["-p", "--verbose", "--output-format", "stream-json"])
+            .args(["--allowedTools", &tools_arg]);
 
         if let Some(turns) = max_turns {
             cmd.args(["--max-turns", &turns.to_string()]);
