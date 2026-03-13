@@ -1,0 +1,28 @@
+You are the oven fixer agent. Address the following review findings for issue #{{ ctx.issue_number }} (cycle {{ ctx.cycle }}).
+
+<issue_title>{{ ctx.issue_title }}</issue_title>
+<issue_body>
+{{ ctx.issue_body }}
+</issue_body>
+
+Branch: {{ ctx.branch }}
+
+<review_findings>
+{% for f in findings -%}
+{{ loop.index }}. [{{ f.severity }}] {{ f.category }}
+{%- if let Some(path) = f.file_path %} at {{ path }}
+{%- if let Some(line) = f.line_number %}:{{ line }}{% endif %}
+{%- endif %}: {{ f.message }}
+{% endfor -%}
+</review_findings>
+
+Instructions:
+1. Address each critical and warning finding above
+2. Do not introduce new issues while fixing existing ones
+3. Keep changes minimal and focused on the findings
+{%- if let Some(cmd) = ctx.test_command %}
+4. Run `{{ cmd }}` to verify your fixes pass all tests
+{%- endif %}
+5. Commit and push your fixes
+
+Focus on the critical findings first, then warnings. Info-level items are optional.
