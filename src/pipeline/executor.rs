@@ -383,6 +383,7 @@ fn new_run(run_id: &str, issue: &Issue, auto_merge: bool) -> Run {
         started_at: chrono::Utc::now().to_rfc3339(),
         finished_at: None,
         error_message: None,
+        complexity: "full".to_string(),
     }
 }
 

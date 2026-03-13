@@ -8,8 +8,9 @@ use rusqlite::Connection;
 use rusqlite_migration::{M, Migrations};
 
 pub static MIGRATIONS: std::sync::LazyLock<Migrations<'static>> = std::sync::LazyLock::new(|| {
-    Migrations::new(vec![M::up(
-        "CREATE TABLE runs (
+    Migrations::new(vec![
+        M::up(
+            "CREATE TABLE runs (
     id TEXT PRIMARY KEY,
     issue_number INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -53,7 +54,9 @@ CREATE INDEX idx_runs_issue ON runs(issue_number);
 CREATE INDEX idx_agent_runs_run ON agent_runs(run_id);
 CREATE INDEX idx_findings_agent_run ON review_findings(agent_run_id);
 CREATE INDEX idx_findings_severity ON review_findings(severity);",
-    )])
+        ),
+        M::up("ALTER TABLE runs ADD COLUMN complexity TEXT NOT NULL DEFAULT 'full';"),
+    ])
 });
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -135,6 +138,7 @@ pub struct Run {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub error_message: Option<String>,
+    pub complexity: String,
 }
 
 /// An agent execution record.

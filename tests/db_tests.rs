@@ -18,6 +18,7 @@ fn full_run_lifecycle() {
         started_at: "2026-03-12T10:00:00".to_string(),
         finished_at: None,
         error_message: None,
+        complexity: "full".to_string(),
     };
 
     // Insert
@@ -62,6 +63,7 @@ fn agent_run_with_findings() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: None,
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
@@ -147,6 +149,7 @@ fn multiple_runs_query_correctly() {
                 started_at: format!("2026-03-{i:02}T10:00:00"),
                 finished_at: None,
                 error_message: None,
+                complexity: "full".to_string(),
             },
         )
         .unwrap();

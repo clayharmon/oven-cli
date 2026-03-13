@@ -277,6 +277,7 @@ fn report_with_seeded_run() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: Some("2026-03-12T10:08:32".to_string()),
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
@@ -313,6 +314,7 @@ fn report_json_with_seeded_run() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
@@ -349,6 +351,7 @@ fn report_all_with_multiple_runs() {
                 started_at: format!("2026-03-{i:02}T10:00:00"),
                 finished_at: None,
                 error_message: None,
+                complexity: "full".to_string(),
             },
         )
         .unwrap();
@@ -386,6 +389,7 @@ fn look_with_seeded_run_and_log() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
@@ -431,6 +435,7 @@ fn look_with_agent_filter() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
@@ -474,6 +479,7 @@ fn look_missing_log_file_errors() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();

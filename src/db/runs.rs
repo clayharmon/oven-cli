@@ -6,8 +6,8 @@ use super::{Run, RunStatus};
 pub fn insert_run(conn: &Connection, run: &Run) -> Result<()> {
     conn.execute(
         "INSERT INTO runs (id, issue_number, status, pr_number, branch, worktree_path, \
-         cost_usd, auto_merge, started_at, finished_at, error_message) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         cost_usd, auto_merge, started_at, finished_at, error_message, complexity) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             run.id,
             run.issue_number,
@@ -20,6 +20,7 @@ pub fn insert_run(conn: &Connection, run: &Run) -> Result<()> {
             run.started_at,
             run.finished_at,
             run.error_message,
+            run.complexity,
         ],
     )
     .context("inserting run")?;
@@ -30,7 +31,7 @@ pub fn get_run(conn: &Connection, id: &str) -> Result<Option<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
              FROM runs WHERE id = ?1",
         )
         .context("preparing get_run")?;
@@ -46,7 +47,7 @@ pub fn get_runs_by_status(conn: &Connection, status: RunStatus) -> Result<Vec<Ru
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
              FROM runs WHERE status = ?1 ORDER BY started_at",
         )
         .context("preparing get_runs_by_status")?;
@@ -61,7 +62,7 @@ pub fn get_latest_run(conn: &Connection) -> Result<Option<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
              FROM runs ORDER BY started_at DESC LIMIT 1",
         )
         .context("preparing get_latest_run")?;
@@ -77,7 +78,7 @@ pub fn get_all_runs(conn: &Connection) -> Result<Vec<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
              FROM runs ORDER BY started_at DESC",
         )
         .context("preparing get_all_runs")?;
@@ -119,6 +120,12 @@ pub fn finish_run(
     Ok(())
 }
 
+pub fn update_run_complexity(conn: &Connection, id: &str, complexity: &str) -> Result<()> {
+    conn.execute("UPDATE runs SET complexity = ?1 WHERE id = ?2", params![complexity, id])
+        .context("updating run complexity")?;
+    Ok(())
+}
+
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let status_str: String = row.get(2)?;
     let status: RunStatus = status_str.parse().map_err(|_| {
@@ -136,6 +143,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         started_at: row.get(8)?,
         finished_at: row.get(9)?,
         error_message: row.get(10)?,
+        complexity: row.get(11)?,
     })
 }
 
@@ -161,6 +169,7 @@ mod tests {
             started_at: "2026-03-12T00:00:00".to_string(),
             finished_at: None,
             error_message: None,
+            complexity: "full".to_string(),
         }
     }
 

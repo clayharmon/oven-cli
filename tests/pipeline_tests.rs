@@ -135,6 +135,7 @@ fn run_and_agent_run_cost_aggregation() {
             started_at: "2026-03-12T10:00:00".to_string(),
             finished_at: None,
             error_message: None,
+            complexity: "full".to_string(),
         },
     )
     .unwrap();
