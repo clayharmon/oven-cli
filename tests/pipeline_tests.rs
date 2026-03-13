@@ -1076,3 +1076,157 @@ fn multi_repo_disabled_ignores_frontmatter() {
     };
     assert!(issue.target_repo.is_some());
 }
+
+// -- Local issue source tests --
+
+fn make_local_issue(number: u32, title: &str, body: &str) -> PipelineIssue {
+    PipelineIssue {
+        number,
+        title: title.to_string(),
+        body: body.to_string(),
+        source: IssueOrigin::Local,
+        target_repo: None,
+    }
+}
+
+fn make_local_provider(project_dir: &std::path::Path) -> Arc<dyn IssueProvider> {
+    Arc::new(oven_cli::issues::local::LocalIssueProvider::new(project_dir))
+}
+
+#[tokio::test]
+async fn e2e_local_issue_completes_pipeline() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    // Create a local issue file
+    let issues_dir = repo_dir.join(".oven").join("issues");
+    tokio::fs::create_dir_all(&issues_dir).await.unwrap();
+    tokio::fs::write(
+        issues_dir.join("1.md"),
+        "---\nid: 1\ntitle: Local feature\nstatus: open\nlabels: [\"o-ready\"]\n---\n\nImplement the feature.\n",
+    )
+    .await
+    .unwrap();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_local_provider(&repo_dir);
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        issues,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir: repo_dir.clone(),
+    });
+
+    let issue = make_local_issue(1, "Local feature", "Implement the feature.");
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "local issue pipeline failed: {result:?}");
+
+    // Verify issue_source is "local" in DB
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.issue_source, "local");
+
+    // Verify local issue was closed
+    let content = tokio::fs::read_to_string(issues_dir.join("1.md")).await.unwrap();
+    assert!(content.contains("status: closed"), "local issue should be closed after pipeline");
+}
+
+#[tokio::test]
+async fn e2e_local_issue_records_github_source() {
+    // Verify GitHub issues still get "github" as issue_source
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        issues,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issue = make_github_issue(42, "GitHub issue", "From GitHub.");
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok());
+
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.issue_source, "github");
+}
+
+#[tokio::test]
+async fn e2e_local_issue_with_target_repo() {
+    let (god_work_dir, _god_bare) = setup_git_repo_with_remote().await;
+    let god_dir = god_work_dir.path().to_path_buf();
+
+    let (target_work_dir, _target_bare) = setup_git_repo_with_remote().await;
+    let target_dir = target_work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &god_dir));
+    let issues = make_local_provider(&god_dir);
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    // Create a local issue with target_repo
+    let issues_dir = god_dir.join(".oven").join("issues");
+    tokio::fs::create_dir_all(&issues_dir).await.unwrap();
+    tokio::fs::write(
+        issues_dir.join("5.md"),
+        "---\nid: 5\ntitle: Backend fix\nstatus: open\nlabels: [\"o-ready\"]\ntarget_repo: backend\n---\n\nFix backend.\n",
+    )
+    .await
+    .unwrap();
+
+    let config = Config {
+        multi_repo: MultiRepoConfig { enabled: true, target_field: "target_repo".to_string() },
+        repos: std::collections::HashMap::from([("backend".to_string(), target_dir)]),
+        ..Config::default()
+    };
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        issues,
+        db: Arc::clone(&db),
+        config,
+        cancel_token: CancellationToken::new(),
+        repo_dir: god_dir.clone(),
+    });
+
+    let issue = PipelineIssue {
+        number: 5,
+        title: "Backend fix".to_string(),
+        body: "Fix backend.".to_string(),
+        source: IssueOrigin::Local,
+        target_repo: Some("backend".to_string()),
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "local multi-repo pipeline failed: {result:?}");
+
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.issue_source, "local");
+
+    // Verify local issue was closed
+    let content = tokio::fs::read_to_string(issues_dir.join("5.md")).await.unwrap();
+    assert!(content.contains("status: closed"));
+}
