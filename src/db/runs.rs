@@ -111,6 +111,16 @@ pub fn update_run_cost(conn: &Connection, id: &str, cost_usd: f64) -> Result<()>
     Ok(())
 }
 
+/// Atomically add `delta` to the run's cost and return the new total.
+pub fn increment_run_cost(conn: &Connection, id: &str, delta: f64) -> Result<f64> {
+    conn.execute("UPDATE runs SET cost_usd = cost_usd + ?1 WHERE id = ?2", params![delta, id])
+        .context("incrementing run cost")?;
+    let new_cost: f64 = conn
+        .query_row("SELECT cost_usd FROM runs WHERE id = ?1", params![id], |row| row.get(0))
+        .context("reading updated cost")?;
+    Ok(new_cost)
+}
+
 pub fn finish_run(
     conn: &Connection,
     id: &str,

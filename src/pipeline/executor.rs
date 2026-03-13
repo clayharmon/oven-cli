@@ -345,17 +345,17 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     }
 
     async fn store_findings(&self, run_id: &str, findings: &[agents::Finding]) -> Result<()> {
-        let agent_runs = {
-            let conn = self.db.lock().await;
-            db::agent_runs::get_agent_runs_for_run(&conn, run_id)?
-        };
-        let reviewer_run = agent_runs.iter().rev().find(|ar| ar.agent == "reviewer");
-        if let Some(ar) = reviewer_run {
-            let conn = self.db.lock().await;
+        let conn = self.db.lock().await;
+        let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, run_id)?;
+        let reviewer_run_id = agent_runs
+            .iter()
+            .rev()
+            .find_map(|ar| if ar.agent == "reviewer" { Some(ar.id) } else { None });
+        if let Some(ar_id) = reviewer_run_id {
             for finding in findings {
                 let db_finding = ReviewFinding {
                     id: 0,
-                    agent_run_id: ar.id,
+                    agent_run_id: ar_id,
                     severity: finding.severity.to_string(),
                     category: finding.category.clone(),
                     file_path: finding.file_path.clone(),
@@ -366,6 +366,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 db::agent_runs::insert_finding(&conn, &db_finding)?;
             }
         }
+        drop(conn);
         Ok(())
     }
 
@@ -445,9 +446,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             None,
         )?;
 
-        let run = db::runs::get_run(&conn, run_id)?.context("run not found")?;
-        let new_cost = run.cost_usd + agent_result.cost_usd;
-        db::runs::update_run_cost(&conn, run_id, new_cost)?;
+        let new_cost = db::runs::increment_run_cost(&conn, run_id, agent_result.cost_usd)?;
         drop(conn);
 
         if new_cost > self.config.pipeline.cost_budget {
