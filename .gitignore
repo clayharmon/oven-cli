@@ -5,6 +5,13 @@
 *~
 .DS_Store
 lcov.info
+# Secrets and credentials
 .env
 .env.*
+*.pem
+*.key
+*.secret
+credentials*
+node_modules/
+
 .claude/settings.local.json
