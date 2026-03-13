@@ -1,0 +1,16 @@
+[project]
+name = "oven-cli"    # auto-detected from git remote
+test = "cargo test"    # test command
+lint = "cargo clippy"  # lint command
+issue_source = "github"  # "github" (default) or "local"
+
+[pipeline]
+max_parallel = 2
+cost_budget = 15.0
+poll_interval = 60
+
+[labels]
+ready = "o-ready"
+cooking = "o-cooking"
+complete = "o-complete"
+failed = "o-failed"
