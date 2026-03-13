@@ -74,7 +74,7 @@ fn parse_local_issue(content: &str) -> Result<LocalTicket> {
 }
 
 /// Rewrite the labels line in a frontmatter block.
-fn rewrite_frontmatter_labels(content: &str, labels: &[String]) -> String {
+pub fn rewrite_frontmatter_labels(content: &str, labels: &[String]) -> String {
     let labels_str = labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
     let new_labels_line = format!("labels: [{labels_str}]");
 

@@ -114,6 +114,10 @@ pub enum TicketCommands {
     View(TicketViewArgs),
     /// Close a local issue
     Close(TicketCloseArgs),
+    /// Add or remove a label on a local issue
+    Label(TicketLabelArgs),
+    /// Open a local issue in $EDITOR
+    Edit(TicketEditArgs),
 }
 
 #[derive(Args)]
@@ -126,6 +130,9 @@ pub struct TicketCreateArgs {
     /// Add o-ready label immediately
     #[arg(long)]
     pub ready: bool,
+    /// Target repo for multi-repo routing
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -133,6 +140,9 @@ pub struct TicketListArgs {
     /// Filter by label
     #[arg(long)]
     pub label: Option<String>,
+    /// Filter by status (open/closed)
+    #[arg(long)]
+    pub status: Option<String>,
 }
 
 #[derive(Args)]
@@ -143,6 +153,23 @@ pub struct TicketViewArgs {
 
 #[derive(Args)]
 pub struct TicketCloseArgs {
+    /// Issue ID
+    pub id: u32,
+}
+
+#[derive(Args)]
+pub struct TicketLabelArgs {
+    /// Issue ID
+    pub id: u32,
+    /// Label to add or remove
+    pub label: String,
+    /// Remove the label instead of adding it
+    #[arg(long)]
+    pub remove: bool,
+}
+
+#[derive(Args)]
+pub struct TicketEditArgs {
     /// Issue ID
     pub id: u32,
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::{GlobalOpts, TicketArgs, TicketCommands};
+use crate::issues::local::rewrite_frontmatter_labels;
 
 #[allow(clippy::unused_async)]
 pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
@@ -15,7 +16,14 @@ pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
             let id = next_ticket_id(&issues_dir)?;
             let labels = if create_args.ready { vec!["o-ready".to_string()] } else { Vec::new() };
             let body = create_args.body.unwrap_or_default();
-            let content = format_ticket(id, &create_args.title, "open", &labels, &body);
+            let content = format_ticket(
+                id,
+                &create_args.title,
+                "open",
+                &labels,
+                &body,
+                create_args.repo.as_deref(),
+            );
             let path = issues_dir.join(format!("{id}.md"));
             std::fs::write(&path, content).context("writing ticket")?;
             println!("created ticket #{id}: {}", create_args.title);
@@ -26,10 +34,13 @@ pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
                 return Ok(());
             }
             let tickets = read_all_tickets(&issues_dir)?;
-            let filtered: Vec<_> = list_args.label.as_ref().map_or_else(
-                || tickets.iter().collect(),
-                |label| tickets.iter().filter(|t| t.labels.contains(label)).collect(),
-            );
+            let filtered: Vec<_> = tickets
+                .iter()
+                .filter(|t| {
+                    list_args.label.as_ref().is_none_or(|l| t.labels.contains(l))
+                        && list_args.status.as_ref().is_none_or(|s| t.status == *s)
+                })
+                .collect();
 
             if filtered.is_empty() {
                 println!("no tickets found");
@@ -61,6 +72,32 @@ pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
             std::fs::write(&path, updated).context("updating ticket")?;
             println!("closed ticket #{}", close_args.id);
         }
+        TicketCommands::Label(label_args) => {
+            let path = issues_dir.join(format!("{}.md", label_args.id));
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("ticket #{} not found", label_args.id))?;
+            let mut ticket =
+                parse_ticket_frontmatter(&content).context("failed to parse ticket frontmatter")?;
+            if label_args.remove {
+                ticket.labels.retain(|l| l != &label_args.label);
+            } else if !ticket.labels.contains(&label_args.label) {
+                ticket.labels.push(label_args.label.clone());
+            }
+            let updated = rewrite_frontmatter_labels(&content, &ticket.labels);
+            std::fs::write(&path, updated).context("updating ticket")?;
+            println!("updated ticket #{}", label_args.id);
+        }
+        TicketCommands::Edit(edit_args) => {
+            let path = issues_dir.join(format!("{}.md", edit_args.id));
+            if !path.exists() {
+                anyhow::bail!("ticket #{} not found", edit_args.id);
+            }
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+            std::process::Command::new(&editor)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("opening {editor}"))?;
+        }
     }
 
     Ok(())
@@ -73,15 +110,23 @@ struct Ticket {
     labels: Vec<String>,
 }
 
-fn format_ticket(id: u32, title: &str, status: &str, labels: &[String], body: &str) -> String {
+fn format_ticket(
+    id: u32,
+    title: &str,
+    status: &str,
+    labels: &[String],
+    body: &str,
+    target_repo: Option<&str>,
+) -> String {
     let labels_str = if labels.is_empty() {
         "[]".to_string()
     } else {
         format!("[{}]", labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", "))
     };
     let now = chrono::Utc::now().to_rfc3339();
+    let target_line = target_repo.map_or_else(String::new, |r| format!("target_repo: {r}\n"));
     format!(
-        "---\nid: {id}\ntitle: {title}\nstatus: {status}\nlabels: {labels_str}\ncreated_at: {now}\n---\n\n{body}\n"
+        "---\nid: {id}\ntitle: {title}\nstatus: {status}\nlabels: {labels_str}\n{target_line}created_at: {now}\n---\n\n{body}\n"
     )
 }
 
@@ -172,18 +217,26 @@ mod tests {
             "open",
             &["o-ready".to_string()],
             "Implement retry.",
+            None,
         );
         assert!(content.contains("id: 1"));
         assert!(content.contains("title: Add retry logic"));
         assert!(content.contains("status: open"));
         assert!(content.contains("\"o-ready\""));
         assert!(content.contains("Implement retry."));
+        assert!(!content.contains("target_repo:"));
     }
 
     #[test]
     fn format_ticket_no_labels() {
-        let content = format_ticket(1, "Test", "open", &[], "body");
+        let content = format_ticket(1, "Test", "open", &[], "body", None);
         assert!(content.contains("labels: []"));
+    }
+
+    #[test]
+    fn format_ticket_with_target_repo() {
+        let content = format_ticket(1, "Multi", "open", &[], "body", Some("api"));
+        assert!(content.contains("target_repo: api"));
     }
 
     #[test]
@@ -242,6 +295,51 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("this is a long string", 10), "this is...");
+    }
+
+    #[test]
+    fn label_add_and_remove() {
+        let content = "---\nid: 1\ntitle: Test\nstatus: open\nlabels: [\"o-ready\"]\n---\n\nbody";
+        let mut ticket = parse_ticket_frontmatter(content).unwrap();
+        assert_eq!(ticket.labels, vec!["o-ready"]);
+
+        // Add a label
+        if !ticket.labels.contains(&"o-cooking".to_string()) {
+            ticket.labels.push("o-cooking".to_string());
+        }
+        let updated = rewrite_frontmatter_labels(content, &ticket.labels);
+        assert!(updated.contains("\"o-ready\""));
+        assert!(updated.contains("\"o-cooking\""));
+
+        // Remove a label
+        ticket.labels.retain(|l| l != "o-ready");
+        let updated2 = rewrite_frontmatter_labels(content, &ticket.labels);
+        assert!(!updated2.contains("\"o-ready\""));
+        assert!(updated2.contains("\"o-cooking\""));
+    }
+
+    #[test]
+    fn list_filters_by_status() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("1.md"),
+            "---\nid: 1\ntitle: Open\nstatus: open\nlabels: []\n---\n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("2.md"),
+            "---\nid: 2\ntitle: Closed\nstatus: closed\nlabels: []\n---\n\n",
+        )
+        .unwrap();
+
+        let tickets = read_all_tickets(&dir.path().to_path_buf()).unwrap();
+        let open: Vec<_> = tickets.iter().filter(|t| t.status == "open").collect();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, 1);
+
+        let closed: Vec<_> = tickets.iter().filter(|t| t.status == "closed").collect();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, 2);
     }
 
     #[test]
