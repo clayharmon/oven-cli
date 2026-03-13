@@ -126,4 +126,6 @@ After presenting the report, offer:
 If the user accepts:
 1. Generate one issue per critical/high finding using the `/cook` issue format
 2. Group closely related findings into a single issue when they share the same root cause
-3. Offer to create them with `gh issue create --label "o-ready"`
+3. Check `recipe.toml` for `issue_source` to determine where to create issues:
+   - If `issue_source = "local"`: use `oven ticket create "<title>" --body "..." --ready`
+   - Otherwise (default): use `gh issue create --title "<title>" --body "..." --label "o-ready"`

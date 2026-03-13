@@ -107,8 +107,15 @@ Write the issue using this exact format:
 
 1. Show the full draft to the user
 2. Ask: "Anything you'd like to adjust before I create the issue?"
-3. After the user approves, create the issue:
+3. After the user approves, check `recipe.toml` for `issue_source` to determine where to create the issue:
 
+**If `issue_source = "local"` (or no GitHub remote):**
+```bash
+oven ticket create "Brief imperative title (under 70 chars)" --body "..." --ready
+```
+If multi-repo routing is needed, add `--repo <target>`.
+
+**Otherwise (default, `issue_source = "github"`):**
 ```bash
 gh issue create --title "Brief imperative title (under 70 chars)" --body "..." --label "o-ready"
 ```
