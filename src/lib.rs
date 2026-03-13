@@ -5,6 +5,7 @@ pub mod db;
 pub mod errors;
 pub mod git;
 pub mod github;
+pub mod issues;
 pub mod logging;
 pub mod pipeline;
 pub mod process;
