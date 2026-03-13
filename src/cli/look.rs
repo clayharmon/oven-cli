@@ -25,22 +25,25 @@ pub async fn run(args: LookArgs, _global: &GlobalOpts) -> Result<()> {
         anyhow::bail!("no log file found for run {}", run.id);
     }
 
+    let agent_tag = args.agent.as_deref().map(|a| format!("agent={a}"));
     let is_active = !matches!(run.status, RunStatus::Complete | RunStatus::Failed);
 
     if is_active {
-        tail_log(&log_file, args.agent.as_deref()).await?;
+        tail_log(&log_file, args.agent.as_deref(), agent_tag.as_deref()).await?;
     } else {
-        dump_log(&log_file, args.agent.as_deref()).await?;
+        dump_log(&log_file, args.agent.as_deref(), agent_tag.as_deref()).await?;
     }
 
     Ok(())
 }
 
-async fn dump_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
-    let content = tokio::fs::read_to_string(path).await.context("reading log file")?;
+async fn dump_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&str>) -> Result<()> {
+    let file = tokio::fs::File::open(path).await.context("reading log file")?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
 
-    for line in content.lines() {
-        if should_show_line(line, agent_filter) {
+    while let Some(line) = lines.next_line().await.context("reading log line")? {
+        if should_show_line(&line, agent_filter, agent_tag) {
             println!("{line}");
         }
     }
@@ -48,7 +51,7 @@ async fn dump_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn tail_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
+async fn tail_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&str>) -> Result<()> {
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();
 
@@ -73,7 +76,7 @@ async fn tail_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
                     }
                     Ok(_) => {
                         let trimmed = line.trim_end();
-                        if should_show_line(trimmed, agent_filter) {
+                        if should_show_line(trimmed, agent_filter, agent_tag) {
                             println!("{trimmed}");
                         }
                         line.clear();
@@ -87,9 +90,11 @@ async fn tail_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn should_show_line(line: &str, agent_filter: Option<&str>) -> bool {
-    agent_filter
-        .is_none_or(|agent| line.contains(&format!("agent={agent}")) || line.contains(agent))
+fn should_show_line(line: &str, agent_filter: Option<&str>, agent_tag: Option<&str>) -> bool {
+    match (agent_filter, agent_tag) {
+        (Some(agent), Some(tag)) => line.contains(tag) || line.contains(agent),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -98,17 +103,30 @@ mod tests {
 
     #[test]
     fn filter_matches_agent_field() {
-        assert!(should_show_line(r#"{"agent":"reviewer","msg":"ok"}"#, Some("reviewer")));
-        assert!(!should_show_line(r#"{"agent":"implementer","msg":"ok"}"#, Some("reviewer")));
+        let tag = "agent=reviewer";
+        assert!(should_show_line(
+            r#"{"agent":"reviewer","msg":"ok"}"#,
+            Some("reviewer"),
+            Some(tag)
+        ));
+        assert!(!should_show_line(
+            r#"{"agent":"implementer","msg":"ok"}"#,
+            Some("reviewer"),
+            Some(tag)
+        ));
     }
 
     #[test]
     fn no_filter_shows_all() {
-        assert!(should_show_line("any line at all", None));
+        assert!(should_show_line("any line at all", None, None));
     }
 
     #[test]
     fn filter_matches_substring() {
-        assert!(should_show_line("agent=reviewer cycle=1", Some("reviewer")));
+        assert!(should_show_line(
+            "agent=reviewer cycle=1",
+            Some("reviewer"),
+            Some("agent=reviewer")
+        ));
     }
 }
