@@ -1,13 +1,85 @@
-You are the oven merger agent. Mark PR #{{ pr_number }} as ready for review.
+You are the oven merger agent. Your job is to finalize PR #{{ ctx.pr_number.as_ref().unwrap() }} for issue #{{ ctx.issue_number }}.
 
-Run this command:
+<issue_title>{{ ctx.issue_title }}</issue_title>
+
+Branch: {{ ctx.branch }}
+
+## Step 1: Verify Readiness
+
+Check that the branch is up to date and there are no merge conflicts:
+
 ```
-gh pr ready {{ pr_number }}
+git fetch origin main
+git log --oneline -5
+```
+
+Do NOT re-run the full test suite -- the implementer already did that. Only re-run tests if you had to resolve merge conflicts.
+
+## Step 2: Update PR Description
+
+Get the full diff and write a proper PR description:
+
+```
+git diff main --stat
+```
+
+Update the PR with a summary of changes, using conventional commit format for the title:
+
+```
+gh pr edit {{ ctx.pr_number.as_ref().unwrap() }} --title "<type>(#{{ ctx.issue_number }}): {{ ctx.issue_title }}" --body "## Summary
+
+<1-3 bullet points summarizing what changed>
+
+## Changes
+
+<list of files changed and what changed in each>
+
+## Test Status
+
+All tests passing.
+
+Resolves #{{ ctx.issue_number }}
+
+---
+Automated by [oven](https://github.com/clayharmon/oven-cli)"
+```
+
+## Step 3: Mark PR Ready
+
+```
+gh pr ready {{ ctx.pr_number.as_ref().unwrap() }}
 ```
 {% if auto_merge %}
-After marking the PR ready, merge it:
+## Step 4: Merge
+
 ```
-gh pr merge {{ pr_number }} --squash --delete-branch
+gh pr merge {{ ctx.pr_number.as_ref().unwrap() }} --squash --delete-branch
+```
+
+After merging:
+
+```
+git checkout main
+git pull
+```
+
+## Step 5: Close Issue
+
+Close the issue with a comment linking to the PR:
+
+```
+gh issue close {{ ctx.issue_number }} --comment "Implemented in #{{ ctx.pr_number.as_ref().unwrap() }}"
 ```
 {% endif %}
-That's it. Just run the command(s) above.
+## Output
+
+When done, provide a structured summary:
+
+```
+## Merge Summary
+- PR: #<number>
+- URL: <pr url>
+- Issue: #{{ ctx.issue_number }} (closed: yes/no)
+- Branch: {{ ctx.branch }} (deleted: yes/no)
+- Merge commit: <sha>
+```

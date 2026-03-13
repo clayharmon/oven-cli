@@ -167,9 +167,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         // 3. Merge
         self.check_cancelled()?;
-        let pr_number = ctx.pr_number.context("no PR number for merge step")?;
+        ctx.pr_number.context("no PR number for merge step")?;
         self.update_status(run_id, RunStatus::Merging).await?;
-        let merge_prompt = agents::merger::build_prompt(pr_number, auto_merge);
+        let merge_prompt = agents::merger::build_prompt(ctx, auto_merge);
         self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
 
         Ok(())
