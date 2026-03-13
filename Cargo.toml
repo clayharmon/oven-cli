@@ -6,6 +6,12 @@ rust-version = "1.85"
 description = "CLI that runs Claude Code agent pipelines against GitHub issues"
 license = "MIT"
 repository = "https://github.com/clayharmon/oven-cli"
+homepage = "https://github.com/clayharmon/oven-cli"
+readme = "README.md"
+authors = ["Clay Harmon"]
+keywords = ["cli", "claude", "github", "automation", "ai-agents"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".oven/", ".claude/", ".github/", "action/", "tests/", "justfile", "deny.toml"]
 
 [[bin]]
 name = "oven"

@@ -5,3 +5,6 @@
 *~
 .DS_Store
 lcov.info
+.env
+.env.*
+.claude/settings.local.json
