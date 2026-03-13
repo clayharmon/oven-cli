@@ -6,8 +6,9 @@ use super::{Run, RunStatus};
 pub fn insert_run(conn: &Connection, run: &Run) -> Result<()> {
     conn.execute(
         "INSERT INTO runs (id, issue_number, status, pr_number, branch, worktree_path, \
-         cost_usd, auto_merge, started_at, finished_at, error_message, complexity) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+         issue_source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             run.id,
             run.issue_number,
@@ -21,6 +22,7 @@ pub fn insert_run(conn: &Connection, run: &Run) -> Result<()> {
             run.finished_at,
             run.error_message,
             run.complexity,
+            run.issue_source,
         ],
     )
     .context("inserting run")?;
@@ -31,7 +33,8 @@ pub fn get_run(conn: &Connection, id: &str) -> Result<Option<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+             issue_source \
              FROM runs WHERE id = ?1",
         )
         .context("preparing get_run")?;
@@ -47,7 +50,8 @@ pub fn get_runs_by_status(conn: &Connection, status: RunStatus) -> Result<Vec<Ru
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+             issue_source \
              FROM runs WHERE status = ?1 ORDER BY started_at",
         )
         .context("preparing get_runs_by_status")?;
@@ -62,7 +66,8 @@ pub fn get_latest_run(conn: &Connection) -> Result<Option<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+             issue_source \
              FROM runs ORDER BY started_at DESC LIMIT 1",
         )
         .context("preparing get_latest_run")?;
@@ -78,7 +83,8 @@ pub fn get_all_runs(conn: &Connection) -> Result<Vec<Run>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
-             cost_usd, auto_merge, started_at, finished_at, error_message, complexity \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+             issue_source \
              FROM runs ORDER BY started_at DESC",
         )
         .context("preparing get_all_runs")?;
@@ -144,6 +150,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         finished_at: row.get(9)?,
         error_message: row.get(10)?,
         complexity: row.get(11)?,
+        issue_source: row.get(12)?,
     })
 }
 
@@ -170,6 +177,7 @@ mod tests {
             finished_at: None,
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         }
     }
 
@@ -289,5 +297,25 @@ mod tests {
         let all = get_all_runs(&conn).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, "bbb22222"); // most recent first
+    }
+
+    #[test]
+    fn issue_source_persists() {
+        let conn = test_db();
+        let mut run = sample_run("local001", 1);
+        run.issue_source = "local".to_string();
+        insert_run(&conn, &run).unwrap();
+
+        let retrieved = get_run(&conn, "local001").unwrap().unwrap();
+        assert_eq!(retrieved.issue_source, "local");
+    }
+
+    #[test]
+    fn issue_source_defaults_to_github() {
+        let conn = test_db();
+        insert_run(&conn, &sample_run("gh000001", 1)).unwrap();
+
+        let retrieved = get_run(&conn, "gh000001").unwrap().unwrap();
+        assert_eq!(retrieved.issue_source, "github");
     }
 }

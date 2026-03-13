@@ -278,6 +278,7 @@ fn report_with_seeded_run() {
             finished_at: Some("2026-03-12T10:08:32".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();
@@ -315,6 +316,7 @@ fn report_json_with_seeded_run() {
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();
@@ -352,6 +354,7 @@ fn report_all_with_multiple_runs() {
                 finished_at: None,
                 error_message: None,
                 complexity: "full".to_string(),
+                issue_source: "github".to_string(),
             },
         )
         .unwrap();
@@ -390,6 +393,7 @@ fn look_with_seeded_run_and_log() {
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();
@@ -436,6 +440,7 @@ fn look_with_agent_filter() {
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();
@@ -480,6 +485,7 @@ fn look_missing_log_file_errors() {
             finished_at: Some("2026-03-12T10:05:00".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();

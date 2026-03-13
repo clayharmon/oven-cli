@@ -153,6 +153,7 @@ mod tests {
             finished_at: Some("2026-03-12T10:08:32".to_string()),
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         }
     }
 
@@ -243,6 +244,7 @@ mod tests {
                 finished_at: None,
                 error_message: Some("budget exceeded".to_string()),
                 complexity: "full".to_string(),
+                issue_source: "github".to_string(),
             },
         ];
         print_runs_table(&runs);
@@ -263,6 +265,7 @@ mod tests {
             finished_at: Some("2026-03-12T10:30:00".to_string()),
             error_message: Some("cost exceeded".to_string()),
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         };
         let agents = vec![AgentRun {
             id: 1,

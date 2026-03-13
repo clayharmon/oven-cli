@@ -19,6 +19,7 @@ fn full_run_lifecycle() {
         finished_at: None,
         error_message: None,
         complexity: "full".to_string(),
+        issue_source: "github".to_string(),
     };
 
     // Insert
@@ -64,6 +65,7 @@ fn agent_run_with_findings() {
             finished_at: None,
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();
@@ -150,6 +152,7 @@ fn multiple_runs_query_correctly() {
                 finished_at: None,
                 error_message: None,
                 complexity: "full".to_string(),
+                issue_source: "github".to_string(),
             },
         )
         .unwrap();

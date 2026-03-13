@@ -137,6 +137,7 @@ fn run_and_agent_run_cost_aggregation() {
             finished_at: None,
             error_message: None,
             complexity: "full".to_string(),
+            issue_source: "github".to_string(),
         },
     )
     .unwrap();

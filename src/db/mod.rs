@@ -56,6 +56,7 @@ CREATE INDEX idx_findings_agent_run ON review_findings(agent_run_id);
 CREATE INDEX idx_findings_severity ON review_findings(severity);",
         ),
         M::up("ALTER TABLE runs ADD COLUMN complexity TEXT NOT NULL DEFAULT 'full';"),
+        M::up("ALTER TABLE runs ADD COLUMN issue_source TEXT NOT NULL DEFAULT 'github';"),
     ])
 });
 
@@ -139,6 +140,7 @@ pub struct Run {
     pub finished_at: Option<String>,
     pub error_message: Option<String>,
     pub complexity: String,
+    pub issue_source: String,
 }
 
 /// An agent execution record.
