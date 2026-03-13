@@ -44,7 +44,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 21. Multi-repo Support | done | Route issues to target repos via config + issue frontmatter |
 | 22. GitHub Action | todo | JS/TS action for running oven in CI |
 | 23. Local CI Script | done | justfile with `just ci` and `just check` |
-| 24. Local Issue Source | todo | Pipeline reads from .oven/issues/ instead of GitHub issues |
+| 24. Local Issue Source | done | IssueProvider trait, local/GitHub providers, issue_source in DB, /cook skill updated |
 
 ---
 
