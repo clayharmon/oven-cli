@@ -1,0 +1,37 @@
+name: 'Oven Pipeline'
+description: 'Run oven agent pipeline on labeled GitHub issues'
+author: 'Clay Harmon'
+
+inputs:
+  anthropic-api-key:
+    description: 'Anthropic API key'
+    required: true
+  github-token:
+    description: 'GitHub token (from github-app-token action or GITHUB_TOKEN)'
+    required: true
+  oven-version:
+    description: 'Version of oven to install (default: latest)'
+    default: 'latest'
+  auto-merge:
+    description: 'Auto-merge PRs after pipeline completes'
+    default: 'false'
+  max-parallel:
+    description: 'Maximum parallel pipelines'
+    default: '2'
+  cost-budget:
+    description: 'Maximum cost in USD per issue'
+    default: '10.0'
+
+outputs:
+  run-id:
+    description: 'The oven run ID (8 hex chars)'
+  status:
+    description: 'Pipeline result: complete, failed, or cancelled'
+  cost:
+    description: 'Total cost in USD'
+  pr-number:
+    description: 'Pull request number created by the pipeline'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
