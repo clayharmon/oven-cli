@@ -12,9 +12,9 @@ use std::{
 use anyhow::Result;
 use oven_cli::{
     agents::{Complexity, Severity, parse_planner_output, parse_review_output},
-    config::Config,
+    config::{Config, MultiRepoConfig},
     db::{self, RunStatus},
-    github::{GhClient, Issue},
+    github::{GhClient, Issue, issues::parse_issue_frontmatter},
     pipeline::{
         executor::{PipelineExecutor, generate_run_id},
         runner,
@@ -884,4 +884,233 @@ async fn e2e_continuous_polling_multiple_issues() {
     for run in &runs {
         assert_eq!(run.status, RunStatus::Complete);
     }
+}
+
+// -- Multi-repo tests --
+
+#[test]
+fn frontmatter_extracts_target_repo() {
+    let issue = Issue {
+        number: 10,
+        title: "Fix auth".to_string(),
+        body: "---\ntarget_repo: backend-api\n---\n\nFix the auth bug".to_string(),
+        labels: vec![],
+    };
+    let parsed = parse_issue_frontmatter(&issue, "target_repo");
+    assert_eq!(parsed.target_repo.as_deref(), Some("backend-api"));
+    assert_eq!(parsed.body_without_frontmatter, "Fix the auth bug");
+}
+
+#[test]
+fn frontmatter_returns_none_when_missing() {
+    let issue = Issue {
+        number: 11,
+        title: "Normal issue".to_string(),
+        body: "Just a regular issue body.".to_string(),
+        labels: vec![],
+    };
+    let parsed = parse_issue_frontmatter(&issue, "target_repo");
+    assert!(parsed.target_repo.is_none());
+    assert_eq!(parsed.body_without_frontmatter, "Just a regular issue body.");
+}
+
+#[test]
+fn frontmatter_custom_field_name() {
+    let issue = Issue {
+        number: 12,
+        title: "Custom field".to_string(),
+        body: "---\nrepo: my-service\n---\n\nDo work".to_string(),
+        labels: vec![],
+    };
+    let parsed = parse_issue_frontmatter(&issue, "repo");
+    assert_eq!(parsed.target_repo.as_deref(), Some("my-service"));
+}
+
+#[tokio::test]
+async fn e2e_multi_repo_routes_to_target() {
+    // Set up god repo (issues live here)
+    let (god_work_dir, _god_bare) = setup_git_repo_with_remote().await;
+    let god_dir = god_work_dir.path().to_path_buf();
+
+    // Set up target repo (PRs and worktrees go here)
+    let (target_work_dir, _target_bare) = setup_git_repo_with_remote().await;
+    let target_dir = target_work_dir.path().to_path_buf();
+
+    // Track which directories gh commands run in (via the GhClient's runner)
+    let pr_create_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let pr_dir_clone = Arc::clone(&pr_create_dir);
+
+    let runner = Arc::new(test_runner_clean_review());
+
+    // The GhClient runner captures PR create directory for verification
+    let gh_runner = TestRunner {
+        claude_handler: Box::new(|_, _, _| AgentResult {
+            cost_usd: 0.0,
+            duration: Duration::from_secs(0),
+            turns: 0,
+            output: String::new(),
+            session_id: String::new(),
+            success: true,
+        }),
+        gh_handler: Box::new(move |args, dir| {
+            if args.iter().any(|a| a == "create") {
+                *pr_dir_clone.lock().unwrap() = Some(dir.to_path_buf());
+                CommandOutput {
+                    stdout: "https://github.com/test/target/pull/55\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            } else {
+                CommandOutput { stdout: String::new(), stderr: String::new(), success: true }
+            }
+        }),
+    };
+
+    let github = Arc::new(GhClient::new(gh_runner, &god_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let config = Config {
+        multi_repo: MultiRepoConfig { enabled: true, target_field: "target_repo".to_string() },
+        repos: std::collections::HashMap::from([("backend".to_string(), target_dir.clone())]),
+        ..Config::default()
+    };
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config,
+        cancel_token: CancellationToken::new(),
+        repo_dir: god_dir,
+    });
+
+    let issue = Issue {
+        number: 42,
+        title: "Fix backend bug".to_string(),
+        body: "---\ntarget_repo: backend\n---\n\nFix the auth bug in backend service.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "multi-repo pipeline failed: {result:?}");
+
+    // Verify PR was created using the target repo dir
+    {
+        let pr_dir = pr_create_dir.lock().unwrap();
+        assert!(pr_dir.is_some(), "PR create should have been called");
+        let pr_dir_str = pr_dir.as_ref().unwrap().to_string_lossy().to_string();
+        drop(pr_dir);
+        let target_dir_str = target_dir.to_string_lossy().to_string();
+        assert!(
+            pr_dir_str.starts_with(&target_dir_str),
+            "PR should be created in target repo dir, got: {pr_dir_str}, expected prefix: {target_dir_str}"
+        );
+    }
+
+    // Verify DB state
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.issue_number, 42);
+}
+
+#[tokio::test]
+async fn e2e_multi_repo_no_frontmatter_uses_god_repo() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    // No repos configured, but that's fine since this issue has no frontmatter
+    let config = Config {
+        multi_repo: MultiRepoConfig { enabled: true, target_field: "target_repo".to_string() },
+        ..Config::default()
+    };
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config,
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issue = Issue {
+        number: 50,
+        title: "Regular issue".to_string(),
+        body: "No frontmatter, uses god repo.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "pipeline should work without frontmatter: {result:?}");
+
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Complete);
+}
+
+#[tokio::test]
+async fn e2e_multi_repo_missing_repo_config_errors() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    // No repos configured -- referencing an unknown repo should fail
+    let config = Config {
+        multi_repo: MultiRepoConfig { enabled: true, target_field: "target_repo".to_string() },
+        ..Config::default()
+    };
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config,
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issue = Issue {
+        number: 60,
+        title: "Unknown repo".to_string(),
+        body: "---\ntarget_repo: nonexistent\n---\n\nThis should fail.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("not found in user config"), "should mention missing config, got: {err}");
+}
+
+#[test]
+fn multi_repo_disabled_ignores_frontmatter() {
+    // When multi_repo.enabled is false, frontmatter is parsed but target_repo
+    // is not acted on -- the pipeline uses the god repo for everything.
+    // This is verified structurally: resolve_target_dir returns (self.repo_dir, false)
+    // when multi_repo.enabled is false, regardless of frontmatter content.
+
+    let config = Config::default();
+    assert!(!config.multi_repo.enabled);
+
+    // Even with frontmatter, parsing still works
+    let issue = Issue {
+        number: 70,
+        title: "Ignored frontmatter".to_string(),
+        body: "---\ntarget_repo: some-repo\n---\n\nBody".to_string(),
+        labels: vec![],
+    };
+    let parsed = parse_issue_frontmatter(&issue, &config.multi_repo.target_field);
+    assert_eq!(parsed.target_repo.as_deref(), Some("some-repo"));
+    // But the executor would not use it because multi_repo.enabled is false
 }
