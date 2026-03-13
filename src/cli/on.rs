@@ -17,7 +17,7 @@ pub async fn run(args: OnArgs, global: &GlobalOpts) -> Result<()> {
     let project_dir = std::env::current_dir().context("getting current directory")?;
     let config = Config::load(&project_dir)?;
 
-    let run_id = crate::pipeline::executor::generate_run_id();
+    let run_id = args.run_id.clone().unwrap_or_else(crate::pipeline::executor::generate_run_id);
 
     // Detached mode: re-spawn self without -d flag
     if args.detached {
@@ -102,6 +102,7 @@ fn spawn_detached(project_dir: &std::path::Path, args: &OnArgs, run_id: &str) ->
     if args.merge {
         cmd_args.push("-m".to_string());
     }
+    cmd_args.extend(["--run-id".to_string(), run_id.to_string()]);
 
     let log_dir = project_dir.join(".oven").join("logs");
     std::fs::create_dir_all(&log_dir).context("creating log dir for detached")?;
