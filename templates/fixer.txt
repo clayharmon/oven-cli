@@ -16,13 +16,78 @@ Branch: {{ ctx.branch }}
 {% endfor -%}
 </review_findings>
 
-Instructions:
-1. Address each critical and warning finding above
-2. Do not introduce new issues while fixing existing ones
-3. Keep changes minimal and focused on the findings
-{%- if let Some(cmd) = ctx.test_command %}
-4. Run `{{ cmd }}` to verify your fixes pass all tests
-{%- endif %}
-5. Commit and push your fixes
+## Before You Start
 
-Focus on the critical findings first, then warnings. Info-level items are optional.
+1. Read the full file for each finding -- not just the line number. Context matters for correct fixes.
+2. Read `CLAUDE.md` for project conventions
+3. Understand the original issue's acceptance criteria so your fixes don't break them
+
+## Scope Discipline (CRITICAL)
+
+You are here to fix the review findings above. Nothing else.
+
+- Do NOT refactor code that wasn't flagged
+- Do NOT add features or improvements beyond the findings
+- Do NOT change code unrelated to the findings
+- Do NOT delete existing tests
+- Do NOT introduce new patterns or abstractions
+
+After every fix, run `git diff main --stat` and verify no files appear that aren't related to the findings. Revert unrelated changes with `git checkout main -- <file>`.
+
+## Fix Priority
+
+1. **Critical findings first** -- these block the merge
+2. **Warning findings second** -- these should be fixed if possible
+3. **Info findings** -- skip these entirely, they are optional
+
+## Handling Unclear Findings
+
+If a finding is unclear, contradictory, or would require changes outside the issue's scope to fix:
+- Skip it
+- Note in your output why you skipped it
+- Do NOT guess at what the reviewer meant
+
+## Fix Rules
+
+- Keep changes minimal. The smallest correct fix is the best fix.
+- Match existing code style exactly
+- If a finding says "add a test", add the test in the same test module/file where related tests already live
+- Run tests after each fix to make sure you haven't broken anything
+
+## Verification
+
+After all fixes are applied:
+
+1. Scope check: `git diff main --stat` -- verify every changed file is justified
+2. Deleted test check: `git diff main` -- verify no existing tests were deleted
+{%- if let Some(cmd) = ctx.test_command %}
+3. Tests: `{{ cmd }}`
+{%- endif %}
+{%- if let Some(cmd) = ctx.lint_command %}
+4. Lint: `{{ cmd }}`
+{%- endif %}
+
+Do NOT stop until all commands pass. Maximum 5 fix attempts per command.
+
+## Commit Workflow
+
+Make atomic conventional commits for your fixes. Use `fix(<scope>): <description>` format.
+
+- Never use `git add -A` or `git add .` -- stage specific files
+- Do NOT amend previous commits -- always create new ones
+
+## Output
+
+When done, provide a summary:
+
+```
+## Findings Addressed
+- [finding #]: [what you did to fix it]
+
+## Findings Skipped
+- [finding #]: [why you skipped it]
+
+## Verification
+- Tests: pass/fail
+- Lint: pass/fail
+```
