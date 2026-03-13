@@ -120,6 +120,14 @@ pub async fn list_merged_branches(repo_dir: &Path, base: &str) -> Result<Vec<Str
     Ok(branches)
 }
 
+/// Create an empty commit (used to seed a branch before PR creation).
+pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
+    run_git(repo_dir, &["commit", "--allow-empty", "-m", message])
+        .await
+        .context("creating empty commit")?;
+    Ok(())
+}
+
 /// Push a branch to origin.
 pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_git(repo_dir, &["push", "origin", branch]).await.context("pushing branch")?;
