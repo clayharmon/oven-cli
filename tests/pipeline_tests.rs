@@ -1,10 +1,56 @@
 mod common;
 
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+
+use anyhow::Result;
 use oven_cli::{
     agents::{Severity, parse_review_output},
+    config::Config,
     db::{self, RunStatus},
-    pipeline::executor::generate_run_id,
+    github::{GhClient, Issue},
+    pipeline::{
+        executor::{PipelineExecutor, generate_run_id},
+        runner,
+    },
+    process::{AgentResult, CommandOutput, CommandRunner},
 };
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+/// A test mock for `CommandRunner` that dispatches based on tool lists.
+///
+/// Since mockall's `MockCommandRunner` is only available within the crate
+/// (`cfg(test)` doesn't apply to integration tests), we implement the trait
+/// directly with configurable behavior.
+type ClaudeHandler = Box<dyn Fn(&str, &[String], &Path) -> AgentResult + Send + Sync>;
+type GhHandler = Box<dyn Fn(&[String], &Path) -> CommandOutput + Send + Sync>;
+
+struct TestRunner {
+    claude_handler: ClaudeHandler,
+    gh_handler: GhHandler,
+}
+
+impl CommandRunner for TestRunner {
+    async fn run_claude(
+        &self,
+        prompt: &str,
+        allowed_tools: &[String],
+        working_dir: &Path,
+    ) -> Result<AgentResult> {
+        Ok((self.claude_handler)(prompt, allowed_tools, working_dir))
+    }
+
+    async fn run_gh(&self, args: &[String], working_dir: &Path) -> Result<CommandOutput> {
+        Ok((self.gh_handler)(args, working_dir))
+    }
+}
 
 // -- State machine integration tests --
 
@@ -103,7 +149,7 @@ fn run_and_agent_run_cost_aggregation() {
             &db::AgentRun {
                 id: 0,
                 run_id: "cost0001".to_string(),
-                agent: agent.to_string(),
+                agent: (*agent).to_string(),
                 cycle: 1,
                 status: "complete".to_string(),
                 cost_usd: *cost,
@@ -150,9 +196,7 @@ fn review_output_with_mixed_severities() {
     assert_eq!(critical[0].file_path.as_deref(), Some("src/auth.rs"));
     assert_eq!(critical[0].line_number, Some(15));
 
-    let actionable: Vec<_> =
-        output.findings.iter().filter(|f| f.severity != Severity::Info).collect();
-    assert_eq!(actionable.len(), 2);
+    assert_eq!(output.findings.iter().filter(|f| f.severity != Severity::Info).count(), 2);
 }
 
 #[test]
@@ -189,5 +233,385 @@ fn run_ids_contain_only_hex() {
         let id = generate_run_id();
         assert_eq!(id.len(), 8, "run ID should be 8 chars: {id}");
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "run ID should be hex only: {id}");
+    }
+}
+
+// -- End-to-end pipeline tests with mocked claude/gh --
+
+/// Set up a temp git repo with a bare remote so `git push origin` works.
+async fn setup_git_repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) {
+    let bare_dir = tempfile::tempdir().unwrap();
+    let work_dir = tempfile::tempdir().unwrap();
+
+    // Create bare remote
+    tokio::process::Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(bare_dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    // Init working repo
+    tokio::process::Command::new("git")
+        .args(["init"])
+        .current_dir(work_dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    // Configure git
+    for args in [vec!["config", "user.email", "test@test.com"], vec!["config", "user.name", "Test"]]
+    {
+        tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(work_dir.path())
+            .output()
+            .await
+            .unwrap();
+    }
+
+    // Add remote
+    let remote_url = bare_dir.path().to_string_lossy().to_string();
+    tokio::process::Command::new("git")
+        .args(["remote", "add", "origin", &remote_url])
+        .current_dir(work_dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    // Initial commit
+    tokio::fs::write(work_dir.path().join("README.md"), "# test\n").await.unwrap();
+    tokio::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(work_dir.path())
+        .output()
+        .await
+        .unwrap();
+    tokio::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(work_dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    // Push to establish remote tracking
+    tokio::process::Command::new("git")
+        .args(["push", "-u", "origin", "main"])
+        .current_dir(work_dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    // Create .oven directories
+    tokio::fs::create_dir_all(work_dir.path().join(".oven/worktrees")).await.unwrap();
+    tokio::fs::create_dir_all(work_dir.path().join(".oven/logs")).await.unwrap();
+
+    (work_dir, bare_dir)
+}
+
+/// Build a `TestRunner` where the reviewer returns clean findings (no issues).
+///
+/// - gh calls: all return success. PR create returns a URL with PR #42.
+/// - claude calls: implementer returns code output, reviewer returns clean
+///   findings, merger returns success.
+fn test_runner_clean_review() -> TestRunner {
+    TestRunner {
+        claude_handler: Box::new(|_prompt, tools, _dir| {
+            let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let output = if tool_list == ["Bash"] {
+                "PR marked as ready for review.".to_string()
+            } else if tool_list == ["Read", "Glob", "Grep"] {
+                r#"{"findings":[],"summary":"all clean, no issues found"}"#.to_string()
+            } else {
+                "Implementation complete. All tests pass.".to_string()
+            };
+            AgentResult {
+                cost_usd: 1.50,
+                duration: Duration::from_secs(10),
+                turns: 5,
+                output,
+                session_id: "sess-e2e".to_string(),
+                success: true,
+            }
+        }),
+        gh_handler: Box::new(|args, _dir| {
+            let stdout = if args.get(1).map(String::as_str) == Some("create") {
+                "https://github.com/test/repo/pull/42\n".to_string()
+            } else {
+                String::new()
+            };
+            CommandOutput { stdout, stderr: String::new(), success: true }
+        }),
+    }
+}
+
+#[tokio::test]
+async fn e2e_pipeline_clean_review_completes() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir: repo_dir.clone(),
+    });
+
+    let issue = Issue {
+        number: 7,
+        title: "Add retry logic".to_string(),
+        body: "Implement retry for transient API failures.".to_string(),
+        labels: vec![],
+    };
+
+    // Run the full pipeline
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "pipeline failed: {result:?}");
+
+    // Verify DB state
+    let conn = db.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.issue_number, 7);
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.pr_number, Some(42));
+    assert!(run.finished_at.is_some());
+
+    // Verify cost was tracked (3 agents x $1.50 = $4.50)
+    assert!(run.cost_usd > 0.0, "cost should be tracked");
+
+    // Verify agent runs were recorded
+    let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, &run.id).unwrap();
+    drop(conn);
+    assert_eq!(agent_runs.len(), 3, "should have implementer + reviewer + merger");
+
+    let agents: Vec<&str> = agent_runs.iter().map(|ar| ar.agent.as_str()).collect();
+    assert!(agents.contains(&"implementer"));
+    assert!(agents.contains(&"reviewer"));
+    assert!(agents.contains(&"merger"));
+
+    // All agent runs should be complete
+    for ar in &agent_runs {
+        assert_eq!(ar.status, "complete", "agent {} should be complete", ar.agent);
+        assert!(ar.cost_usd > 0.0);
+        assert!(ar.turns > 0);
+    }
+}
+
+/// Build a `TestRunner` where the reviewer returns findings on first review,
+/// clean on second review (triggering one fix cycle).
+fn test_runner_with_fix_cycle() -> TestRunner {
+    let review_count = Arc::new(AtomicU32::new(0));
+    let review_count_clone = Arc::clone(&review_count);
+
+    TestRunner {
+        claude_handler: Box::new(move |_prompt, tools, _dir| {
+            let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let output = if tool_list == ["Bash"] {
+                "PR ready.".to_string()
+            } else if tool_list == ["Read", "Glob", "Grep"] {
+                let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    r#"{"findings":[{"severity":"warning","category":"bug","message":"missing error handling"}],"summary":"1 issue"}"#.to_string()
+                } else {
+                    r#"{"findings":[],"summary":"all clean"}"#.to_string()
+                }
+            } else {
+                "Done.".to_string()
+            };
+            AgentResult {
+                cost_usd: 1.00,
+                duration: Duration::from_secs(8),
+                turns: 4,
+                output,
+                session_id: "sess-fix".to_string(),
+                success: true,
+            }
+        }),
+        gh_handler: Box::new(|args, _dir| {
+            let stdout = if args.get(1).map(String::as_str) == Some("create") {
+                "https://github.com/test/repo/pull/55\n".to_string()
+            } else {
+                String::new()
+            };
+            CommandOutput { stdout, stderr: String::new(), success: true }
+        }),
+    }
+}
+
+#[tokio::test]
+async fn e2e_pipeline_with_one_fix_cycle() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_with_fix_cycle());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issue = Issue {
+        number: 12,
+        title: "Fix bug in parser".to_string(),
+        body: "The JSON parser crashes on empty input.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "pipeline failed: {result:?}");
+
+    let conn = db.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    let run = &runs[0];
+    assert_eq!(run.status, RunStatus::Complete);
+
+    // Should have: implementer, reviewer (findings), fixer, reviewer (clean), merger
+    let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, &run.id).unwrap();
+    assert_eq!(agent_runs.len(), 5, "should have 5 agent runs for one fix cycle");
+
+    let agents: Vec<&str> = agent_runs.iter().map(|ar| ar.agent.as_str()).collect();
+    assert_eq!(agents, vec!["implementer", "reviewer", "fixer", "reviewer", "merger"]);
+
+    // Verify findings were stored
+    let findings = db::agent_runs::get_findings_for_agent_run(&conn, agent_runs[1].id).unwrap();
+    drop(conn);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, "warning");
+}
+
+#[tokio::test]
+async fn e2e_pipeline_cancellation_stops_run() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let cancel = CancellationToken::new();
+    cancel.cancel(); // Cancel immediately
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: cancel,
+        repo_dir,
+    });
+
+    let issue = Issue {
+        number: 99,
+        title: "Should be cancelled".to_string(),
+        body: "This should not complete.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_err());
+
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run.error_message.as_ref().is_some_and(|m| m.contains("cancelled")));
+}
+
+#[tokio::test]
+async fn e2e_pipeline_cost_budget_enforced() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let mut config = Config::default();
+    config.pipeline.cost_budget = 1.0; // Very low budget, agent costs $1.50
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config,
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issue = Issue {
+        number: 50,
+        title: "Expensive issue".to_string(),
+        body: "This will exceed the budget.".to_string(),
+        labels: vec![],
+    };
+
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_err());
+
+    let conn = db.lock().await;
+    let run = db::runs::get_latest_run(&conn).unwrap().unwrap();
+    drop(conn);
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run.error_message.as_ref().is_some_and(|m| m.contains("cost budget")));
+}
+
+#[tokio::test]
+async fn e2e_batch_runs_multiple_issues() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_clean_review());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        db: Arc::clone(&db),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir,
+    });
+
+    let issues = vec![
+        Issue {
+            number: 1,
+            title: "First issue".to_string(),
+            body: "First.".to_string(),
+            labels: vec![],
+        },
+        Issue {
+            number: 2,
+            title: "Second issue".to_string(),
+            body: "Second.".to_string(),
+            labels: vec![],
+        },
+    ];
+
+    // Run batch with max_parallel=1 (serial) to avoid worktree conflicts
+    let result = runner::run_batch(&executor, issues, 1, false).await;
+    assert!(result.is_ok(), "batch failed: {result:?}");
+
+    let conn = db.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    drop(conn);
+    assert_eq!(runs.len(), 2);
+
+    for run in &runs {
+        assert_eq!(run.status, RunStatus::Complete);
     }
 }
