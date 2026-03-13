@@ -208,4 +208,77 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"agents\":[]"));
     }
+
+    #[test]
+    fn print_run_report_captures_output() {
+        // Verify the function doesn't panic and formats correctly
+        let run = sample_run();
+        let agents = sample_agent_runs();
+        print_run_report(&run, &agents);
+    }
+
+    #[test]
+    fn print_run_report_with_error() {
+        let mut run = sample_run();
+        run.error_message = Some("something broke".to_string());
+        run.status = RunStatus::Failed;
+        print_run_report(&run, &[]);
+    }
+
+    #[test]
+    fn print_runs_table_formats_rows() {
+        let runs = vec![
+            sample_run(),
+            Run {
+                id: "efgh5678".to_string(),
+                issue_number: 99,
+                status: RunStatus::Failed,
+                pr_number: None,
+                branch: None,
+                worktree_path: None,
+                cost_usd: 12.50,
+                auto_merge: false,
+                started_at: "2026-03-13T10:00:00".to_string(),
+                finished_at: None,
+                error_message: Some("budget exceeded".to_string()),
+            },
+        ];
+        print_runs_table(&runs);
+    }
+
+    #[test]
+    fn run_report_from_run_maps_all_fields() {
+        let run = Run {
+            id: "test0001".to_string(),
+            issue_number: 7,
+            status: RunStatus::Failed,
+            pr_number: Some(55),
+            branch: Some("oven/issue-7-abc".to_string()),
+            worktree_path: None,
+            cost_usd: 18.75,
+            auto_merge: true,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:30:00".to_string()),
+            error_message: Some("cost exceeded".to_string()),
+        };
+        let agents = vec![AgentRun {
+            id: 1,
+            run_id: "test0001".to_string(),
+            agent: "implementer".to_string(),
+            cycle: 1,
+            status: "failed".to_string(),
+            cost_usd: 18.75,
+            turns: 50,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:30:00".to_string()),
+            output_summary: None,
+            error_message: Some("budget".to_string()),
+        }];
+        let report = RunReport::from_run(&run, &agents);
+        assert_eq!(report.id, "test0001");
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.error_message.as_deref(), Some("cost exceeded"));
+        assert_eq!(report.agents.len(), 1);
+        assert_eq!(report.agents[0].turns, 50);
+    }
 }

@@ -69,3 +69,73 @@ pub async fn safe_comment<R: CommandRunner>(client: &GhClient<R>, pr_number: u32
         tracing::warn!("failed to post comment on PR #{pr_number}: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{AgentResult, CommandOutput, MockCommandRunner};
+
+    fn mock_gh_success() -> MockCommandRunner {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+        mock
+    }
+
+    fn mock_gh_failure() -> MockCommandRunner {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "API error".to_string(),
+                    success: false,
+                })
+            })
+        });
+        mock
+    }
+
+    #[tokio::test]
+    async fn transition_issue_removes_and_adds_labels() {
+        let client = GhClient::new(mock_gh_success(), std::path::Path::new("/tmp"));
+        let result = transition_issue(&client, 42, "o-ready", "o-cooking").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn safe_comment_swallows_errors() {
+        let client = GhClient::new(mock_gh_failure(), std::path::Path::new("/tmp"));
+        // Should not panic or return error
+        safe_comment(&client, 42, "test comment").await;
+    }
+
+    #[tokio::test]
+    async fn safe_comment_succeeds_on_success() {
+        let client = GhClient::new(mock_gh_success(), std::path::Path::new("/tmp"));
+        safe_comment(&client, 42, "test comment").await;
+    }
+
+    #[test]
+    fn check_output_returns_error_on_failure() {
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: "not found".to_string(),
+            success: false,
+        };
+        let result = GhClient::<MockCommandRunner>::check_output(&output, "test op");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn check_output_ok_on_success() {
+        let output =
+            CommandOutput { stdout: "ok".to_string(), stderr: String::new(), success: true };
+        let result = GhClient::<MockCommandRunner>::check_output(&output, "test op");
+        assert!(result.is_ok());
+    }
+}

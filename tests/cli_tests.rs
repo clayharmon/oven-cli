@@ -256,6 +256,259 @@ fn ticket_create_multiple_auto_increments() {
 }
 
 #[test]
+fn report_with_seeded_run() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    oven_cli::db::runs::insert_run(
+        &conn,
+        &oven_cli::db::Run {
+            id: "abc12345".to_string(),
+            issue_number: 42,
+            status: oven_cli::db::RunStatus::Complete,
+            pr_number: Some(99),
+            branch: Some("oven/issue-42-abc".to_string()),
+            worktree_path: None,
+            cost_usd: 4.23,
+            auto_merge: false,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:08:32".to_string()),
+            error_message: None,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("report")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("abc12345"))
+        .stdout(predicate::str::contains("#42"))
+        .stdout(predicate::str::contains("$4.23"));
+}
+
+#[test]
+fn report_json_with_seeded_run() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    oven_cli::db::runs::insert_run(
+        &conn,
+        &oven_cli::db::Run {
+            id: "json1234".to_string(),
+            issue_number: 7,
+            status: oven_cli::db::RunStatus::Complete,
+            pr_number: None,
+            branch: None,
+            worktree_path: None,
+            cost_usd: 1.50,
+            auto_merge: false,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:05:00".to_string()),
+            error_message: None,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["report", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\": \"json1234\""))
+        .stdout(predicate::str::contains("\"issue_number\": 7"));
+}
+
+#[test]
+fn report_all_with_multiple_runs() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    for i in 1..=3 {
+        oven_cli::db::runs::insert_run(
+            &conn,
+            &oven_cli::db::Run {
+                id: format!("aabb00{i}0"),
+                issue_number: i,
+                status: oven_cli::db::RunStatus::Complete,
+                pr_number: None,
+                branch: None,
+                worktree_path: None,
+                cost_usd: f64::from(i),
+                auto_merge: false,
+                started_at: format!("2026-03-{i:02}T10:00:00"),
+                finished_at: None,
+                error_message: None,
+            },
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["report", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aabb0010"))
+        .stdout(predicate::str::contains("aabb0020"))
+        .stdout(predicate::str::contains("aabb0030"));
+}
+
+#[test]
+fn look_with_seeded_run_and_log() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    oven_cli::db::runs::insert_run(
+        &conn,
+        &oven_cli::db::Run {
+            id: "look1234".to_string(),
+            issue_number: 10,
+            status: oven_cli::db::RunStatus::Complete,
+            pr_number: None,
+            branch: None,
+            worktree_path: None,
+            cost_usd: 0.0,
+            auto_merge: false,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:05:00".to_string()),
+            error_message: None,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    // Create log directory and file
+    let log_dir = dir.path().join(".oven").join("logs").join("look1234");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(
+        log_dir.join("pipeline.log"),
+        "agent=implementer cycle=1 starting\nagent=reviewer cycle=1 reviewing\n",
+    )
+    .unwrap();
+
+    // Dump completed run
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["look", "look1234"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent=implementer"))
+        .stdout(predicate::str::contains("agent=reviewer"));
+}
+
+#[test]
+fn look_with_agent_filter() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    oven_cli::db::runs::insert_run(
+        &conn,
+        &oven_cli::db::Run {
+            id: "filt1234".to_string(),
+            issue_number: 10,
+            status: oven_cli::db::RunStatus::Complete,
+            pr_number: None,
+            branch: None,
+            worktree_path: None,
+            cost_usd: 0.0,
+            auto_merge: false,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:05:00".to_string()),
+            error_message: None,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let log_dir = dir.path().join(".oven").join("logs").join("filt1234");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(
+        log_dir.join("pipeline.log"),
+        "agent=implementer starting\nagent=reviewer reviewing\nagent=implementer done\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["look", "filt1234", "--agent", "reviewer"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent=reviewer"))
+        .stdout(predicate::str::contains("agent=implementer").not());
+}
+
+#[test]
+fn look_missing_log_file_errors() {
+    let dir = common::setup_oven_project();
+    let db_path = dir.path().join(".oven").join("oven.db");
+    let conn = oven_cli::db::open(&db_path).unwrap();
+
+    oven_cli::db::runs::insert_run(
+        &conn,
+        &oven_cli::db::Run {
+            id: "nolog123".to_string(),
+            issue_number: 10,
+            status: oven_cli::db::RunStatus::Complete,
+            pr_number: None,
+            branch: None,
+            worktree_path: None,
+            cost_usd: 0.0,
+            auto_merge: false,
+            started_at: "2026-03-12T10:00:00".to_string(),
+            finished_at: Some("2026-03-12T10:05:00".to_string()),
+            error_message: None,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    // Don't create log file
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["look", "nolog123"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no log file"));
+}
+
+#[test]
+fn clean_with_selective_flags() {
+    let dir = common::setup_oven_project();
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["clean", "--only-logs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed"));
+
+    Command::cargo_bin("oven")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["clean", "--only-trees"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pruned"));
+}
+
+#[test]
 fn ticket_list_filters_by_label() {
     let dir = common::setup_oven_project();
 
