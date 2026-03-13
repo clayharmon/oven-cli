@@ -66,6 +66,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         let worktree = git::create_worktree(&target_dir, issue.number, &base_branch).await?;
         self.record_worktree(&run_id, &worktree).await?;
 
+        // Seed branch with an empty commit so GitHub accepts the draft PR
+        git::empty_commit(
+            &worktree.path,
+            &format!("chore: start oven pipeline for issue #{}", issue.number),
+        )
+        .await?;
+
         info!(
             run_id = %run_id,
             issue = issue.number,
