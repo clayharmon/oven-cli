@@ -108,6 +108,8 @@ struct AgentRunReport {
     status: String,
     cost_usd: f64,
     turns: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_output: Option<String>,
 }
 
 impl RunReport {
@@ -128,6 +130,7 @@ impl RunReport {
                     status: ar.status.clone(),
                     cost_usd: ar.cost_usd,
                     turns: ar.turns,
+                    raw_output: ar.raw_output.clone(),
                 })
                 .collect(),
         }
@@ -171,6 +174,7 @@ mod tests {
                 finished_at: Some("2026-03-12T10:03:15".to_string()),
                 output_summary: None,
                 error_message: None,
+                raw_output: None,
             },
             AgentRun {
                 id: 2,
@@ -184,6 +188,7 @@ mod tests {
                 finished_at: Some("2026-03-12T10:04:57".to_string()),
                 output_summary: None,
                 error_message: None,
+                raw_output: None,
             },
         ]
     }
@@ -279,6 +284,7 @@ mod tests {
             finished_at: Some("2026-03-12T10:30:00".to_string()),
             output_summary: None,
             error_message: Some("budget".to_string()),
+            raw_output: None,
         }];
         let report = RunReport::from_run(&run, &agents);
         assert_eq!(report.id, "test0001");

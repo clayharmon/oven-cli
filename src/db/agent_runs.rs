@@ -6,8 +6,8 @@ use super::{AgentRun, ReviewFinding};
 pub fn insert_agent_run(conn: &Connection, agent_run: &AgentRun) -> Result<i64> {
     conn.execute(
         "INSERT INTO agent_runs (run_id, agent, cycle, status, cost_usd, turns, \
-         started_at, finished_at, output_summary, error_message) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         started_at, finished_at, output_summary, error_message, raw_output) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             agent_run.run_id,
             agent_run.agent,
@@ -19,6 +19,7 @@ pub fn insert_agent_run(conn: &Connection, agent_run: &AgentRun) -> Result<i64> 
             agent_run.finished_at,
             agent_run.output_summary,
             agent_run.error_message,
+            agent_run.raw_output,
         ],
     )
     .context("inserting agent run")?;
@@ -29,7 +30,7 @@ pub fn get_agent_runs_for_run(conn: &Connection, run_id: &str) -> Result<Vec<Age
     let mut stmt = conn
         .prepare(
             "SELECT id, run_id, agent, cycle, status, cost_usd, turns, \
-             started_at, finished_at, output_summary, error_message \
+             started_at, finished_at, output_summary, error_message, raw_output \
              FROM agent_runs WHERE run_id = ?1 ORDER BY id",
         )
         .context("preparing get_agent_runs_for_run")?;
@@ -48,6 +49,7 @@ pub fn get_agent_runs_for_run(conn: &Connection, run_id: &str) -> Result<Vec<Age
                 finished_at: row.get(8)?,
                 output_summary: row.get(9)?,
                 error_message: row.get(10)?,
+                raw_output: row.get(11)?,
             })
         })
         .context("querying agent runs")?;
@@ -55,6 +57,7 @@ pub fn get_agent_runs_for_run(conn: &Connection, run_id: &str) -> Result<Vec<Age
     rows.collect::<std::result::Result<Vec<_>, _>>().context("collecting agent runs")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn finish_agent_run(
     conn: &Connection,
     id: i64,
@@ -63,12 +66,13 @@ pub fn finish_agent_run(
     turns: u32,
     output_summary: Option<&str>,
     error_message: Option<&str>,
+    raw_output: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "UPDATE agent_runs SET status = ?1, cost_usd = ?2, turns = ?3, \
-         finished_at = datetime('now'), output_summary = ?4, error_message = ?5 \
-         WHERE id = ?6",
-        params![status, cost_usd, turns, output_summary, error_message, id],
+         finished_at = datetime('now'), output_summary = ?4, error_message = ?5, \
+         raw_output = ?6 WHERE id = ?7",
+        params![status, cost_usd, turns, output_summary, error_message, raw_output, id],
     )
     .context("finishing agent run")?;
     Ok(())
@@ -190,6 +194,7 @@ mod tests {
             finished_at: None,
             output_summary: None,
             error_message: None,
+            raw_output: None,
         }
     }
 
@@ -213,7 +218,7 @@ mod tests {
         insert_test_run(&conn, "run1");
         let id = insert_agent_run(&conn, &sample_agent_run("run1", "reviewer")).unwrap();
 
-        finish_agent_run(&conn, id, "complete", 1.50, 8, Some("all good"), None).unwrap();
+        finish_agent_run(&conn, id, "complete", 1.50, 8, Some("all good"), None, None).unwrap();
 
         let runs = get_agent_runs_for_run(&conn, "run1").unwrap();
         assert_eq!(runs[0].status, "complete");
@@ -330,6 +335,19 @@ mod tests {
         let unresolved = get_unresolved_findings(&conn, "run1").unwrap();
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].message, "bad");
+    }
+
+    #[test]
+    fn raw_output_round_trips() {
+        let conn = test_db();
+        insert_test_run(&conn, "run1");
+        let id = insert_agent_run(&conn, &sample_agent_run("run1", "implementer")).unwrap();
+
+        let raw = r#"{"batches":[{"batch":1,"issues":[]}]}"#;
+        finish_agent_run(&conn, id, "complete", 0.5, 3, Some("ok"), None, Some(raw)).unwrap();
+
+        let runs = get_agent_runs_for_run(&conn, "run1").unwrap();
+        assert_eq!(runs[0].raw_output.as_deref(), Some(raw));
     }
 
     #[test]

@@ -85,6 +85,7 @@ fn agent_run_with_findings() {
             finished_at: None,
             output_summary: None,
             error_message: None,
+            raw_output: None,
         },
     )
     .unwrap();

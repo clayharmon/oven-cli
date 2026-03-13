@@ -57,6 +57,7 @@ CREATE INDEX idx_findings_severity ON review_findings(severity);",
         ),
         M::up("ALTER TABLE runs ADD COLUMN complexity TEXT NOT NULL DEFAULT 'full';"),
         M::up("ALTER TABLE runs ADD COLUMN issue_source TEXT NOT NULL DEFAULT 'github';"),
+        M::up("ALTER TABLE agent_runs ADD COLUMN raw_output TEXT;"),
     ])
 });
 
@@ -157,6 +158,7 @@ pub struct AgentRun {
     pub finished_at: Option<String>,
     pub output_summary: Option<String>,
     pub error_message: Option<String>,
+    pub raw_output: Option<String>,
 }
 
 /// A review finding from the reviewer agent.

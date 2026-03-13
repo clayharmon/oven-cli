@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     agents::{
@@ -127,9 +127,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         match invoke_agent(self.runner.as_ref(), &invocation).await {
             Ok(result) => {
+                debug!(output = %result.output, "raw planner output");
                 let parsed = parse_planner_output(&result.output);
                 if parsed.is_none() {
-                    warn!("planner returned unparseable output, falling back to single batch");
+                    warn!(output = %result.output, "planner returned unparseable output, falling back to single batch");
                 }
                 parsed
             }
@@ -429,6 +430,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     0,
                     None,
                     Some(&format!("{e:#}")),
+                    None,
                 )?;
             }
         }
@@ -449,6 +451,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             finished_at: None,
             output_summary: None,
             error_message: None,
+            raw_output: None,
         };
         let conn = self.db.lock().await;
         db::agent_runs::insert_agent_run(&conn, &agent_run)
@@ -469,6 +472,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             agent_result.turns,
             Some(&truncate(&agent_result.output, 500)),
             None,
+            Some(&agent_result.output),
         )?;
 
         let new_cost = db::runs::increment_run_cost(&conn, run_id, agent_result.cost_usd)?;
