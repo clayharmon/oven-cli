@@ -6,7 +6,7 @@ Read DECISIONS.md for the full design document. Read ROADMAP.md for the phased i
 
 ## What this project does
 
-Users label GitHub issues with `o-ready`. Oven's planner agent picks them up (oldest first), creates a draft PR, and runs a pipeline of Claude Code agents against that PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The planner continuously polls for new issues and can parallelize work mid-run.
+Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent picks them up (oldest first), creates a draft PR, and runs a pipeline of Claude Code agents against that PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The planner continuously polls for new issues and can parallelize work mid-run. Issue source is configurable: GitHub (default) or local `.oven/issues/` files. PRs are always created on GitHub regardless of issue source.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Users label GitHub issues with `o-ready`. Oven's planner agent picks them up (ol
 - `oven look [RUN_ID]` - view logs. Tails if active, dumps if done. `--agent <NAME>` filters.
 - `oven report [RUN_ID]` - cost, runtime, summary. `--all` for history, `--json` for machine output.
 - `oven clean` - remove worktrees, logs, merged branches. `--only-logs`, `--only-trees`, `--only-branches`.
-- `oven ticket create|list|view|close` - local issue management in .oven/issues/
+- `oven ticket create|list|view|close|label|edit` - local issue management in .oven/issues/
 
 ### Agents (5, all invoked via `claude -p --output-format stream-json`)
 1. **Planner** - read-only. Decides batching/parallelization, creates draft PRs, continuously re-evaluates.
@@ -90,6 +90,10 @@ src/
     labels.rs               label create/add/remove
     issues.rs               issue fetch/comment/transition
     prs.rs                  PR create/update/merge
+  issues/
+    mod.rs                  IssueProvider trait, PipelineIssue type
+    local.rs                LocalIssueProvider (reads .oven/issues/)
+    github.rs               GithubIssueProvider (wraps GhClient)
   agents/
     mod.rs                  AgentRole enum, invocation logic
     planner.rs

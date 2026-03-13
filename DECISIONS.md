@@ -245,6 +245,24 @@ Enterprise-grade approach based on research of Renovate, CodeRabbit, OpenHands, 
 - Heavy configurability
 - `allowed_authors` / `require_comment` safety config - revisit later
 
+## Local Issue Source
+
+Issues can come from GitHub or from local markdown files (`.oven/issues/`). Controlled by `issue_source` in `recipe.toml`:
+
+```toml
+[project]
+issue_source = "local"   # or "github" (default)
+```
+
+**Key decisions:**
+- PRs are always created on GitHub -- only the issue source changes
+- Local issues use the same label system (o-ready, o-cooking, etc.) stored in frontmatter
+- Local issues support `target_repo` in frontmatter for multi-repo routing
+- Pipeline comments are appended to the local issue file (audit trail)
+- PR titles for local issues say "From local issue #N" instead of "Resolves #N" to avoid linking to unrelated GitHub issues
+- An `IssueProvider` trait abstracts over the two sources so the pipeline doesn't care which one is active
+- The `/cook` skill reads `recipe.toml` and creates issues via `oven ticket create` or `gh issue create` accordingly
+
 ## Resolved Questions
 - **Default cost budget:** $10 per pipeline run (configurable via `pipeline.cost_budget`)
 - **Template engine:** askama (compile-time templates, `.txt` files in `templates/`)

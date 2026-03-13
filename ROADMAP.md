@@ -18,14 +18,17 @@ flowchart TD
     P18 --> P20[20. Continuous Polling]
     P19 --> P21[21. Multi-repo Support]
     P20 --> P22[22. GitHub Action]
+    P20 --> P24[24. Local Issue Source]
     P21 --> P22
+    P21 --> P24
     P22 --> P23[23. Local CI Script]
 
     style P15 fill:#fff3cd,stroke:#555
     style P23 fill:#f8d7da,stroke:#555
+    style P24 fill:#d4edda,stroke:#555
 ```
 
-Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in parallel. Phase 22 depends on most other phases being stable. Phase 23 has no hard dependencies and can be done at any time.
+Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in parallel. Phase 22 depends on most other phases being stable. Phase 23 has no hard dependencies and can be done at any time. Phase 24 depends on continuous polling (20) and multi-repo (21) being complete.
 
 ## Progress
 
@@ -41,6 +44,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 21. Multi-repo Support | todo | Route issues to target repos via config + issue frontmatter |
 | 22. GitHub Action | todo | JS/TS action for running oven in CI |
 | 23. Local CI Script | done | justfile with `just ci` and `just check` |
+| 24. Local Issue Source | todo | Pipeline reads from .oven/issues/ instead of GitHub issues |
 
 ---
 
@@ -1215,3 +1219,660 @@ check: fmt clippy test
 - `just check` runs the quick subset (fmt, clippy, test)
 - Recipes match exactly what `.github/workflows/ci.yml` runs
 - CLAUDE.md updated with `just ci` reference
+
+---
+
+## Phase 24: Local Issue Source
+
+**Goal:** Connect the existing local ticket system (`.oven/issues/`) to the pipeline so oven can run entirely without GitHub issues. A new config option `issue_source` controls whether the pipeline reads issues from GitHub or from local markdown files. PRs are still created on GitHub -- only the issue source changes. The `/cook` skill learns to create local issues when configured. The planner, continuous polling, and multi-repo features all work with local issues.
+
+**Why this matters:** Not every project uses GitHub Issues. Some teams track work in Linear, Jira, or locally. Some developers want to use oven as a personal tool without publishing issues. Local issues let you `oven ticket create "Add retry logic" --ready` and have the pipeline pick it up immediately, no GitHub round-trip. The pipeline still creates real PRs with real code review.
+
+**Dependencies:** Phase 20 (Continuous Polling) and Phase 21 (Multi-repo Support). Continuous polling needs to exist so the local file watcher / poll can be integrated. Multi-repo needs to exist so `target_repo` frontmatter works with local issues too.
+
+**Files to modify:**
+- `src/config/mod.rs` -- add `issue_source` config option
+- `src/cli/ticket.rs` -- add `label` and `edit` subcommands, add `target_repo` support
+- `src/cli/on.rs` -- route to local or GitHub issue fetching based on config
+- `src/pipeline/runner.rs` -- local issue polling, integrate with continuous polling
+- `src/pipeline/executor.rs` -- accept local issues, adapt label transitions
+- `src/github/mod.rs` -- `Issue` struct gets a `source` field
+- `src/github/issues.rs` -- new `get_local_issues_by_label()` function
+- `templates/skills/cook.md` -- conditional local vs GitHub issue creation
+- `src/cli/prep.rs` -- update default recipe.toml template
+
+**Files to create:**
+- `src/issues/mod.rs` -- issue source abstraction (trait + local/GitHub implementations)
+- `src/issues/local.rs` -- local issue reader, writer, label transitions
+- `src/issues/github.rs` -- thin wrapper re-exporting existing GhClient issue methods
+
+### Details
+
+#### 1. Config: `issue_source` option
+
+Add an `issue_source` field to the project config. This lives in `recipe.toml` (project-level), not user config, because it's a property of how the project uses oven.
+
+**In `src/config/mod.rs`:**
+
+```rust
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueSource {
+    #[default]
+    Github,
+    Local,
+}
+```
+
+Add to `ProjectConfig`:
+
+```rust
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProjectConfig {
+    pub name: Option<String>,
+    pub test: Option<String>,
+    pub lint: Option<String>,
+    pub issue_source: IssueSource,
+}
+```
+
+Add corresponding `issue_source: Option<IssueSource>` to `RawProjectConfig` and handle it in `apply_raw()`.
+
+**Recipe.toml example:**
+
+```toml
+[project]
+name = "my-project"
+test = "cargo test"
+lint = "cargo clippy"
+issue_source = "local"    # "github" (default) or "local"
+```
+
+When `issue_source = "github"` (or omitted), behavior is identical to today. When `issue_source = "local"`, the pipeline reads from `.oven/issues/` instead of `gh issue list`.
+
+#### 2. Issue source abstraction: `src/issues/mod.rs`
+
+Create a new top-level module that abstracts over where issues come from. This is the only new abstraction in the phase and it's justified because every downstream consumer (polling loop, `oven on`, planner, executor) needs to fetch issues from one of two sources without caring which.
+
+```rust
+pub mod github;
+pub mod local;
+
+use anyhow::Result;
+use async_trait::async_trait;
+
+/// A normalized issue from any source.
+///
+/// This is intentionally separate from `github::Issue` because local issues
+/// have different fields (e.g., no GitHub-specific labels object). Both sources
+/// are normalized into this struct before entering the pipeline.
+#[derive(Debug, Clone)]
+pub struct PipelineIssue {
+    /// Issue number. For GitHub issues, this is the GitHub number.
+    /// For local issues, this is the `.oven/issues/<number>.md` number.
+    pub number: u32,
+    pub title: String,
+    pub body: String,
+    pub source: IssueOrigin,
+    /// For multi-repo: which repo this issue targets.
+    /// Parsed from YAML frontmatter `target_repo: <name>`.
+    pub target_repo: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueOrigin {
+    Github,
+    Local,
+}
+
+/// Trait for fetching and transitioning issues regardless of source.
+#[async_trait]
+pub trait IssueProvider: Send + Sync {
+    /// Fetch all open issues with the given label.
+    async fn get_ready_issues(&self, label: &str) -> Result<Vec<PipelineIssue>>;
+
+    /// Fetch a single issue by number.
+    async fn get_issue(&self, number: u32) -> Result<PipelineIssue>;
+
+    /// Transition an issue from one label to another.
+    /// For GitHub: removes old label, adds new label.
+    /// For local: updates the labels array in the frontmatter.
+    async fn transition(&self, number: u32, from: &str, to: &str) -> Result<()>;
+
+    /// Post a comment on an issue (or append to the local issue body).
+    async fn comment(&self, number: u32, body: &str) -> Result<()>;
+
+    /// Close an issue.
+    async fn close(&self, number: u32) -> Result<()>;
+}
+```
+
+#### 3. Local issue provider: `src/issues/local.rs`
+
+Implements `IssueProvider` by reading/writing `.oven/issues/*.md` files.
+
+```rust
+use std::path::PathBuf;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use super::{IssueOrigin, IssueProvider, PipelineIssue};
+
+pub struct LocalIssueProvider {
+    issues_dir: PathBuf,
+}
+
+impl LocalIssueProvider {
+    pub fn new(project_dir: &std::path::Path) -> Self {
+        Self { issues_dir: project_dir.join(".oven").join("issues") }
+    }
+}
+```
+
+**Key implementation details:**
+
+**`get_ready_issues`:** Read all `.md` files in `.oven/issues/`, parse frontmatter, filter by:
+- `status: open` (skip closed issues)
+- `labels` array contains the requested label
+
+Sort by ID (oldest first, same FIFO as GitHub). Return as `Vec<PipelineIssue>`.
+
+Reuse the existing `parse_ticket_frontmatter()` logic from `src/cli/ticket.rs`. Extract that function (and the `Ticket` struct) into the new `src/issues/local.rs` module so both `ticket.rs` and the provider can use it. The `ticket.rs` CLI command imports from `issues::local` instead of having its own copy.
+
+**`get_issue`:** Read `.oven/issues/<number>.md`, parse, return.
+
+**`transition`:** Read the file, parse the labels array, remove `from`, add `to`, write back. Use a simple string replacement on the frontmatter line, same approach as the existing `close` command. Specifically:
+
+```rust
+// Read file
+let content = std::fs::read_to_string(&path)?;
+// Parse frontmatter to get current labels
+let mut ticket = parse_ticket(&content)?;
+ticket.labels.retain(|l| l != from);
+if !ticket.labels.contains(&to.to_string()) {
+    ticket.labels.push(to.to_string());
+}
+// Rewrite the labels line in frontmatter
+let new_content = rewrite_frontmatter_labels(&content, &ticket.labels);
+std::fs::write(&path, new_content)?;
+```
+
+**`comment`:** Append the comment text to the end of the issue markdown file, separated by a horizontal rule:
+
+```rust
+let mut content = std::fs::read_to_string(&path)?;
+content.push_str(&format!("\n---\n\n**Comment ({}):**\n\n{}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"), body));
+std::fs::write(&path, content)?;
+```
+
+This keeps a local audit trail of pipeline activity on the issue, similar to GitHub comments.
+
+**`close`:** Same as existing `oven ticket close` -- replace `status: open` with `status: closed`.
+
+**Frontmatter parsing -- target_repo support:**
+
+Extend the frontmatter parser to also extract `target_repo` if present:
+
+```markdown
+---
+id: 3
+title: Add caching to API responses
+status: open
+labels: ["o-ready"]
+target_repo: my-service
+created_at: 2026-03-13T10:00:00Z
+---
+
+Issue body here...
+```
+
+The `target_repo` field is optional. When present, it routes to the named repo from the user config's `[repos]` table (same as Phase 21's GitHub frontmatter approach). When absent, the issue targets the current repo.
+
+This means local issues and GitHub issues use the same multi-repo mechanism: YAML frontmatter with a `target_repo` key. The only difference is where the frontmatter lives -- in the `.oven/issues/<n>.md` file header vs. in the GitHub issue body.
+
+#### 4. GitHub issue provider: `src/issues/github.rs`
+
+Thin wrapper around the existing `GhClient` methods, adapting them to the `IssueProvider` trait:
+
+```rust
+use std::sync::Arc;
+use anyhow::Result;
+use async_trait::async_trait;
+use super::{IssueOrigin, IssueProvider, PipelineIssue};
+use crate::github::GhClient;
+use crate::process::CommandRunner;
+
+pub struct GithubIssueProvider<R: CommandRunner> {
+    client: Arc<GhClient<R>>,
+}
+
+impl<R: CommandRunner> GithubIssueProvider<R> {
+    pub fn new(client: Arc<GhClient<R>>) -> Self {
+        Self { client }
+    }
+}
+```
+
+**`get_ready_issues`:** Calls `self.client.get_issues_by_label(label)`, maps each `github::Issue` to a `PipelineIssue` with `source: IssueOrigin::Github`. Parses `target_repo` from the issue body frontmatter (same as Phase 21).
+
+**`transition`:** Calls the existing `github::transition_issue()`.
+
+**`comment`:** Calls `self.client.comment_on_issue()`.
+
+**`close`:** Calls `gh issue close <number>`.
+
+#### 5. Pipeline integration
+
+**`PipelineExecutor` changes:**
+
+Replace the `github: Arc<GhClient<R>>` field with an `issue_provider: Arc<dyn IssueProvider>` field. Keep the `github` field too -- it's still needed for PR operations (create PR, comment on PR, merge PR). The issue provider handles issue-specific operations only.
+
+```rust
+pub struct PipelineExecutor<R: CommandRunner> {
+    pub runner: Arc<R>,
+    pub github: Arc<GhClient<R>>,          // for PR operations
+    pub issues: Arc<dyn IssueProvider>,     // for issue operations
+    pub db: Arc<Mutex<Connection>>,
+    pub config: Config,
+    pub cancel_token: CancellationToken,
+    pub repo_dir: PathBuf,
+}
+```
+
+**Changes to `run_issue_with_complexity`:**
+
+Replace `github::transition_issue()` calls with `self.issues.transition()`:
+
+```rust
+// Before (current code):
+github::transition_issue(&self.github, issue.number, &self.config.labels.ready, &self.config.labels.cooking).await?;
+
+// After:
+self.issues.transition(issue.number, &self.config.labels.ready, &self.config.labels.cooking).await?;
+```
+
+Same for the `finalize_run` method's label transitions.
+
+**Issue number namespacing for PRs:**
+
+When creating a PR from a local issue, the PR title and body should NOT use `#<number>` syntax (that would reference a GitHub issue with that number, which is unrelated). Instead:
+
+```rust
+let (pr_title, pr_body) = match issue.source {
+    IssueOrigin::Github => (
+        format!("fix(#{}): {}", issue.number, issue.title),
+        format!("Resolves #{}\n\nAutomated by oven.", issue.number),
+    ),
+    IssueOrigin::Local => (
+        format!("fix: {}", issue.title),
+        format!("From local issue #{}\n\nAutomated by oven.", issue.number),
+    ),
+};
+```
+
+Local issue PRs say "From local issue #N" instead of "Resolves #N" to avoid accidentally linking to a GitHub issue.
+
+**`AgentContext` changes:**
+
+The `AgentContext` struct passed to all agent templates gains an `issue_source` field so templates can adapt:
+
+```rust
+pub struct AgentContext {
+    pub issue_number: u32,
+    pub issue_title: String,
+    pub issue_body: String,
+    pub branch: String,
+    pub pr_number: Option<u32>,
+    pub test_command: Option<String>,
+    pub lint_command: Option<String>,
+    pub review_findings: Option<String>,
+    pub cycle: u32,
+    pub issue_source: IssueOrigin,  // new
+}
+```
+
+Agent templates don't need to change for this -- the issue body is the same regardless of source. The `issue_source` field is available for future template conditionals if needed (e.g., the merger template could skip `gh issue close` for local issues).
+
+#### 6. Polling loop changes (`src/pipeline/runner.rs`)
+
+**Current polling (GitHub only):**
+```rust
+match executor.github.get_issues_by_label(&ready_label).await {
+    Ok(issues) => { ... }
+}
+```
+
+**New polling (source-aware):**
+```rust
+match executor.issues.get_ready_issues(&ready_label).await {
+    Ok(issues) => { ... }
+}
+```
+
+This is a one-line change. The `IssueProvider` abstraction handles whether it's reading from GitHub or local files.
+
+**Local polling behavior:** When `issue_source = "local"`, the polling loop reads `.oven/issues/` on each tick. This is a directory scan, not a file watcher -- same approach as the GitHub poll (periodic check). The `poll_interval` config controls frequency for both sources.
+
+**Continuous polling integration:** The Phase 20 continuous polling design (JoinSet + semaphore + in-flight tracking) works identically with local issues. The in-flight `HashSet<u32>` tracks issue numbers regardless of source. The semaphore limits concurrency. The only difference is the data source -- `get_ready_issues` reads files instead of calling `gh`.
+
+#### 7. `oven on` with explicit IDs (`src/cli/on.rs`)
+
+**Current behavior:** `oven on 42,43` calls `gh.get_issue(id)` for each ID.
+
+**New behavior:** Route based on config:
+
+```rust
+if let Some(ids_str) = &args.ids {
+    let ids = parse_issue_ids(ids_str)?;
+    let mut fetched = Vec::new();
+    for id in ids {
+        let issue = executor.issues.get_issue(id).await?;
+        fetched.push(issue);
+    }
+    runner::run_batch(&executor, fetched, config.pipeline.max_parallel as usize, args.merge).await?;
+}
+```
+
+When `issue_source = "local"`, `oven on 3` reads `.oven/issues/3.md`. When `issue_source = "github"`, it calls `gh issue view 3` as before.
+
+#### 8. Provider construction (`src/cli/on.rs`)
+
+Build the right provider based on config:
+
+```rust
+let issues: Arc<dyn IssueProvider> = match config.project.issue_source {
+    IssueSource::Github => Arc::new(
+        GithubIssueProvider::new(Arc::clone(&github))
+    ),
+    IssueSource::Local => Arc::new(
+        LocalIssueProvider::new(&project_dir)
+    ),
+};
+
+let executor = Arc::new(PipelineExecutor {
+    runner,
+    github,    // still needed for PR operations
+    issues,    // new: issue source
+    db,
+    config: config.clone(),
+    cancel_token: cancel_token.clone(),
+    repo_dir: project_dir,
+});
+```
+
+#### 9. Ticket CLI enhancements (`src/cli/ticket.rs`)
+
+**New subcommand: `oven ticket label <ID> <LABEL>`**
+
+Add/remove labels on local issues. Needed because the pipeline transitions labels (ready -> cooking -> complete/failed) and users may want to manually re-label.
+
+```rust
+TicketCommands::Label(label_args) => {
+    let path = issues_dir.join(format!("{}.md", label_args.id));
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("ticket #{} not found", label_args.id))?;
+    let mut ticket = parse_ticket(&content)?;
+    if label_args.remove {
+        ticket.labels.retain(|l| l != &label_args.label);
+    } else {
+        if !ticket.labels.contains(&label_args.label) {
+            ticket.labels.push(label_args.label.clone());
+        }
+    }
+    let updated = rewrite_frontmatter_labels(&content, &ticket.labels);
+    std::fs::write(&path, updated)?;
+    println!("updated ticket #{}", label_args.id);
+}
+```
+
+CLI definition:
+
+```rust
+/// Add or remove a label on a local issue
+Label(TicketLabelArgs),
+
+#[derive(Args)]
+pub struct TicketLabelArgs {
+    /// Issue ID
+    pub id: u32,
+    /// Label to add or remove
+    pub label: String,
+    /// Remove the label instead of adding it
+    #[arg(long)]
+    pub remove: bool,
+}
+```
+
+**New subcommand: `oven ticket edit <ID>`**
+
+Opens the issue file in `$EDITOR` for manual editing. Simple:
+
+```rust
+TicketCommands::Edit(edit_args) => {
+    let path = issues_dir.join(format!("{}.md", edit_args.id));
+    if !path.exists() {
+        anyhow::bail!("ticket #{} not found", edit_args.id);
+    }
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+    std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("opening {editor}"))?;
+}
+```
+
+**`oven ticket create` -- target_repo flag:**
+
+Add `--repo <NAME>` flag to set `target_repo` in frontmatter:
+
+```rust
+#[derive(Args)]
+pub struct TicketCreateArgs {
+    pub title: String,
+    #[arg(long)]
+    pub body: Option<String>,
+    #[arg(long)]
+    pub ready: bool,
+    /// Target repo for multi-repo routing
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+```
+
+When `--repo my-service` is passed, add `target_repo: my-service` to the frontmatter. Validate that the repo name exists in the user config's `[repos]` table at creation time.
+
+**`oven ticket list` -- status filter:**
+
+Add `--status <STATUS>` filter (open/closed):
+
+```rust
+#[derive(Args)]
+pub struct TicketListArgs {
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Filter by status (open/closed)
+    #[arg(long)]
+    pub status: Option<String>,
+}
+```
+
+#### 10. /cook skill update (`templates/skills/cook.md`)
+
+The `/cook` skill currently always creates issues with `gh issue create`. When `issue_source = "local"`, it should create local issues instead.
+
+Add a conditional section at the end of Phase 4:
+
+```markdown
+## Phase 4: Review and Create
+
+1. Show the full draft to the user
+2. Ask: "Anything you'd like to adjust before I create the issue?"
+3. After the user approves, check `recipe.toml` for the `issue_source` setting:
+
+**If `issue_source = "github"` (or not set):**
+```bash
+gh issue create --title "Brief imperative title" --body "..." --label "o-ready"
+```
+
+**If `issue_source = "local":**
+```bash
+oven ticket create "Brief imperative title" --body "..." --ready
+```
+
+If the issue targets a different repo in a multi-repo setup, add `--repo <name>`:
+```bash
+oven ticket create "Brief imperative title" --body "..." --ready --repo my-service
+```
+
+4. If the user described multiple distinct things, break them into separate issues
+```
+
+The skill reads `recipe.toml` in Phase 1 (during codebase research) and uses the appropriate creation method in Phase 4.
+
+#### 11. Prep command update (`src/cli/prep.rs`)
+
+Update `Config::default_project_toml()` in `src/config/mod.rs` to include the new option:
+
+```rust
+pub fn default_project_toml() -> String {
+    r#"[project]
+# name = "my-project"    # auto-detected from git remote
+# test = "cargo test"    # test command
+# lint = "cargo clippy"  # lint command
+# issue_source = "github"  # "github" (default) or "local"
+
+[pipeline]
+max_parallel = 2
+cost_budget = 15.0
+poll_interval = 60
+
+# [labels]
+# ready = "o-ready"
+# cooking = "o-cooking"
+# complete = "o-complete"
+# failed = "o-failed"
+"#
+    .to_string()
+}
+```
+
+#### 12. Multi-repo interaction
+
+When `issue_source = "local"` and a local issue has `target_repo: my-service` in its frontmatter:
+
+1. The local issue provider reads `.oven/issues/<n>.md` from the current (god) repo
+2. `PipelineIssue.target_repo` is set to `Some("my-service")`
+3. The executor resolves `my-service` to a filesystem path via user config `[repos]`
+4. Worktree is created in the target repo's directory
+5. PR is created in the target repo
+6. Label transitions (ready -> cooking -> complete) happen on the local issue file in the god repo
+7. Comments are appended to the local issue file in the god repo
+
+This mirrors Phase 21's multi-repo behavior exactly, just with local files instead of GitHub API calls for the issue side.
+
+#### 13. Database: issue_source column
+
+Add a migration to record the issue source on each run:
+
+```sql
+ALTER TABLE runs ADD COLUMN issue_source TEXT NOT NULL DEFAULT 'github';
+```
+
+Set this when creating a run so `oven report` can show where the issue came from.
+
+#### 14. Module declarations
+
+Add `pub mod issues;` to `src/lib.rs`. The module tree becomes:
+
+```
+src/
+  issues/
+    mod.rs          IssueProvider trait, PipelineIssue, IssueOrigin
+    local.rs        LocalIssueProvider (reads .oven/issues/)
+    github.rs       GithubIssueProvider (wraps GhClient)
+```
+
+### Dependency: async_trait
+
+Add `async_trait = "0.1"` to `[dependencies]` in `Cargo.toml`. This is needed for the `IssueProvider` trait since Rust stable doesn't fully support `async fn` in traits with `dyn` dispatch yet. Check the Rust edition and version -- if MSRV (1.85) supports native async trait dispatch via `dyn`, skip `async_trait` and use native syntax instead. As of Rust 1.85, `async fn` in traits is stable but `dyn` dispatch requires `async_trait` or boxing. Use `async_trait`.
+
+### Tests
+
+**Config tests (in `src/config/mod.rs`):**
+- `issue_source` defaults to `IssueSource::Github` when not specified
+- `issue_source = "local"` parses correctly
+- `issue_source = "github"` parses correctly
+- Invalid `issue_source` value produces a parse error
+- Config roundtrip with `issue_source` field
+
+**Local issue provider tests (in `src/issues/local.rs`):**
+- `get_ready_issues` returns only open issues with the requested label
+- `get_ready_issues` returns empty vec when no issues match
+- `get_ready_issues` sorts by ID (FIFO)
+- `get_ready_issues` skips closed issues
+- `get_issue` returns a specific issue by number
+- `get_issue` returns error for nonexistent issue
+- `transition` removes old label and adds new label
+- `transition` is idempotent (adding a label already present is a no-op)
+- `comment` appends text to the issue file
+- `close` sets status to closed
+- `target_repo` is parsed from frontmatter when present
+- `target_repo` is None when not in frontmatter
+- Body text is returned without frontmatter
+- Handles empty issues directory
+
+**GitHub issue provider tests (in `src/issues/github.rs`):**
+- `get_ready_issues` delegates to `GhClient::get_issues_by_label`
+- Maps `github::Issue` to `PipelineIssue` correctly
+- `transition` delegates to `github::transition_issue`
+
+**Pipeline integration tests (in `tests/pipeline_tests.rs`):**
+- Pipeline runs with `IssueSource::Local` config
+- Pipeline runs with `IssueSource::Github` config (unchanged behavior)
+- Local issue transitions from o-ready to o-cooking to o-complete
+- Local issue transitions to o-failed on pipeline error
+- PR title says "From local issue #N" not "Resolves #N" for local issues
+- Polling loop reads from local issues when configured
+
+**Ticket CLI tests (in `src/cli/ticket.rs` and `tests/cli_tests.rs`):**
+- `oven ticket label 1 o-ready` adds a label
+- `oven ticket label 1 o-ready --remove` removes a label
+- `oven ticket create "Title" --repo my-service` includes `target_repo` in frontmatter
+- `oven ticket list --status open` filters by status
+- `oven ticket list --status closed` filters by status
+
+**Migration test:**
+- New migration adds `issue_source` column to `runs` table
+- `MIGRATIONS.validate()` passes
+
+### Commits
+1. `feat(config): add issue_source config option (github/local)`
+2. `feat(issues): add IssueProvider trait and PipelineIssue type`
+3. `feat(issues): implement LocalIssueProvider for .oven/issues/`
+4. `feat(issues): implement GithubIssueProvider wrapping GhClient`
+5. `refactor(pipeline): use IssueProvider trait instead of direct GhClient for issue ops`
+6. `feat(pipeline): route polling and explicit IDs through IssueProvider`
+7. `feat(cli): add ticket label and edit subcommands`
+8. `feat(cli): add --repo flag to ticket create for multi-repo`
+9. `feat(skills): update /cook to create local issues when configured`
+10. `feat(db): add issue_source column to runs table`
+11. `test: add local issue source integration tests`
+
+### Done when
+- `issue_source = "local"` in recipe.toml makes the pipeline read from `.oven/issues/`
+- `issue_source = "github"` (or omitted) behaves identically to current behavior
+- Local issues go through the same label transitions (o-ready -> o-cooking -> o-complete/o-failed)
+- PRs are created on GitHub regardless of issue source
+- Local issue PRs don't use `Resolves #N` syntax
+- Comments from the pipeline are appended to local issue files
+- `oven ticket label` can add/remove labels
+- `oven ticket create --repo` sets `target_repo` in frontmatter
+- Multi-repo routing works with local issues (target_repo in local frontmatter)
+- Continuous polling works with local issues (periodic directory scan)
+- `/cook` skill creates local issues when `issue_source = "local"`
+- Planner works with local issues (receives same `PipelineIssue` format)
+- `oven report` shows the issue source
+- All agent templates receive the same `AgentContext` regardless of source
+- No behavior change when config is absent or set to `"github"`
+- All tests pass, clippy and fmt clean
+- Coverage >= 85%
