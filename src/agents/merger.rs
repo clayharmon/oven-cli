@@ -12,17 +12,21 @@ struct MergerPrompt<'a> {
     safe_title: String,
 }
 
-/// Escape shell metacharacters in a string for safe embedding in shell commands.
+/// Escape shell metacharacters in a string for safe embedding in double-quoted
+/// shell commands. Also strips control characters (newlines, tabs, etc.) that
+/// could break command structure.
 fn shell_escape(s: &str) -> String {
     s.chars()
-        .map(|c| match c {
-            '"' | '\\' | '$' | '`' | '!' => {
+        .filter_map(|c| match c {
+            '"' | '\\' | '$' | '`' | '!' | '\'' => {
                 let mut escaped = String::with_capacity(2);
                 escaped.push('\\');
                 escaped.push(c);
-                escaped
+                Some(escaped)
             }
-            _ => c.to_string(),
+            '\n' | '\r' | '\0' => None,
+            c if c.is_control() => None,
+            _ => Some(c.to_string()),
         })
         .collect()
 }
@@ -147,5 +151,20 @@ mod tests {
         ctx.issue_title = r#"Fix "bug" with $HOME expansion"#.to_string();
         let prompt = build_prompt(&ctx, false).unwrap();
         assert!(prompt.contains(r#"Fix \"bug\" with \$HOME expansion"#));
+    }
+
+    #[test]
+    fn shell_escape_strips_newlines() {
+        assert_eq!(shell_escape("line1\nline2\rline3"), "line1line2line3");
+    }
+
+    #[test]
+    fn shell_escape_strips_null_bytes() {
+        assert_eq!(shell_escape("before\0after"), "beforeafter");
+    }
+
+    #[test]
+    fn shell_escape_escapes_single_quotes() {
+        assert_eq!(shell_escape("it's"), r"it\'s");
     }
 }
