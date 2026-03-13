@@ -32,11 +32,11 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | Phase | Status | Notes |
 |-------|--------|-------|
 | 1-14. Core CLI | done | All commands, pipeline, CI, 179 tests, 80.57% coverage |
-| 15. Agent Templates | todo | Upgrade bare-bones templates with scope discipline, checklists, structured output |
-| 16. /cook Skill | todo | Interactive issue design skill |
-| 17. /refine Skill | todo | Codebase audit skill |
+| 15. Agent Templates | done | Upgraded all 5 templates with scope discipline, verification checklists, structured output |
+| 16. /cook Skill | done | Interactive issue design skill with 4-phase workflow |
+| 17. /refine Skill | done | Codebase audit skill with 6 analysis dimensions |
 | 18. Planner Intelligence | todo | Actually invoke planner, smarter batching, complexity classification |
-| 19. Skill Scaffolding in prep | todo | Embed skills in binary, scaffold during oven prep |
+| 19. Skill Scaffolding in prep | done | Embed skills in binary, scaffold during oven prep |
 | 20. Continuous Polling | todo | Pick up new issues mid-run, don't block on batch completion |
 | 21. Multi-repo Support | todo | Route issues to target repos via config + issue frontmatter |
 | 22. GitHub Action | todo | JS/TS action for running oven in CI |
