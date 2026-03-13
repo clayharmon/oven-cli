@@ -14,6 +14,12 @@ const AGENT_PROMPTS: &[(&str, &str)] = &[
     ("merger.md", include_str!("../../templates/merger.txt")),
 ];
 
+/// Embedded skill templates for scaffolding into .claude/skills/<name>/SKILL.md.
+const SKILL_TEMPLATES: &[(&str, &str, &str)] = &[
+    ("cook", "SKILL.md", include_str!("../../templates/skills/cook.md")),
+    ("refine", "SKILL.md", include_str!("../../templates/skills/refine.md")),
+];
+
 #[allow(clippy::unused_async)]
 pub async fn run(args: PrepArgs, _global: &GlobalOpts) -> Result<()> {
     let project_dir = std::env::current_dir().context("getting current directory")?;
@@ -47,6 +53,19 @@ pub async fn run(args: PrepArgs, _global: &GlobalOpts) -> Result<()> {
             content,
             args.force,
             &format!(".claude/agents/{filename}"),
+        )?;
+    }
+
+    // .claude/skills/
+    for (skill_name, filename, content) in SKILL_TEMPLATES {
+        let skill_dir = project_dir.join(".claude").join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir)
+            .with_context(|| format!("creating .claude/skills/{skill_name}/"))?;
+        write_if_new_or_forced(
+            &skill_dir.join(filename),
+            content,
+            args.force,
+            &format!(".claude/skills/{skill_name}/{filename}"),
         )?;
     }
 
@@ -176,6 +195,16 @@ mod tests {
         assert!(content.contains("Test Requirements"));
         assert!(content.contains("Out of Scope"));
         assert!(content.contains("Dependencies"));
+    }
+
+    #[test]
+    fn skill_templates_are_embedded() {
+        assert_eq!(SKILL_TEMPLATES.len(), 2);
+        for (name, filename, content) in SKILL_TEMPLATES {
+            assert!(!name.is_empty());
+            assert!(!filename.is_empty());
+            assert!(!content.is_empty());
+        }
     }
 
     #[test]

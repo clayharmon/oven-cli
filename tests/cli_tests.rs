@@ -53,6 +53,8 @@ fn prep_creates_project_structure() {
     dir.child(".oven/issues").assert(predicate::path::is_dir());
     dir.child(".claude/agents/implementer.md").assert(predicate::path::exists());
     dir.child(".claude/agents/reviewer.md").assert(predicate::path::exists());
+    dir.child(".claude/skills/cook/SKILL.md").assert(predicate::path::exists());
+    dir.child(".claude/skills/refine/SKILL.md").assert(predicate::path::exists());
 }
 
 #[test]
