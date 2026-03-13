@@ -201,8 +201,11 @@ impl Config {
                 self.pipeline.poll_interval
             );
         }
-        if self.pipeline.cost_budget <= 0.0 {
-            anyhow::bail!("pipeline.cost_budget must be > 0 (got {})", self.pipeline.cost_budget);
+        if !self.pipeline.cost_budget.is_finite() || self.pipeline.cost_budget <= 0.0 {
+            anyhow::bail!(
+                "pipeline.cost_budget must be a finite number > 0 (got {})",
+                self.pipeline.cost_budget
+            );
         }
         if self.pipeline.turn_limit == 0 {
             anyhow::bail!("pipeline.turn_limit must be >= 1 (got 0)");
@@ -636,6 +639,22 @@ issue_source = "github"
     fn validate_rejects_zero_cost_budget() {
         let mut config = Config::default();
         config.pipeline.cost_budget = 0.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cost_budget"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_nan_cost_budget() {
+        let mut config = Config::default();
+        config.pipeline.cost_budget = f64::NAN;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cost_budget"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_infinity_cost_budget() {
+        let mut config = Config::default();
+        config.pipeline.cost_budget = f64::INFINITY;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("cost_budget"), "error was: {err}");
     }
