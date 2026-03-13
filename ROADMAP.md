@@ -29,6 +29,25 @@ flowchart TD
 
 Phases on the same level can be worked in parallel if desired (e.g., 6, 7 can happen simultaneously). Most phases depend on 1 and 2 being done first.
 
+## Progress
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 1. Foundation | done | Cargo.toml, rustfmt, deny, nextest, gitignore |
+| 2. CLI + Errors | done | All subcommands, thiserror types, clap debug_assert test |
+| 3. Config | done | Two-level TOML loading, 8 tests |
+| 4. Database | done | SQLite WAL, migrations, CRUD for runs/agent_runs/findings, 20 tests |
+| 5. Logging | done | Dual-output tracing (stderr + JSON file) |
+| 6. Git Ops | done | Worktree create/remove/list/clean, branch ops, 5 async tests |
+| 7. Process Runner | done | CommandRunner trait, stream-json parser, 8 tests |
+| 8. GitHub | done | GhClient for labels/issues/PRs, 11 mock tests |
+| 9. Agents | done | 5 roles with askama templates, review parser, 15 tests |
+| 10. Pipeline | not started | |
+| 11. prep + on + off | not started | |
+| 12. look + report + clean + ticket | not started | |
+| 13. Integration Tests | not started | |
+| 14. CI + Release | not started | |
+
 ---
 
 ## Phase 1: Foundation
