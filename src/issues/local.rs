@@ -55,16 +55,7 @@ fn parse_local_issue(content: &str) -> Result<LocalTicket> {
         } else if let Some(val) = line.strip_prefix("status:") {
             status = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("labels:") {
-            // Parse ["label1", "label2"] format
-            let val = val.trim();
-            if val.starts_with('[') && val.ends_with(']') {
-                let inner = &val[1..val.len() - 1];
-                labels = inner
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
+            labels = parse_label_array(val);
         } else if let Some(val) = line.strip_prefix("target_repo:") {
             target_repo = Some(val.trim().to_string());
         }
@@ -87,6 +78,21 @@ fn replace_frontmatter_status(content: &str, from: &str, to: &str) -> String {
         }
     }
     content.to_string()
+}
+
+/// Parse a `["label1", "label2"]` string into a `Vec<String>`.
+pub(crate) fn parse_label_array(val: &str) -> Vec<String> {
+    let val = val.trim();
+    if val.starts_with('[') && val.ends_with(']') {
+        let inner = &val[1..val.len() - 1];
+        inner
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Rewrite the labels line in a frontmatter block.

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::{GlobalOpts, TicketArgs, TicketCommands};
-use crate::issues::local::rewrite_frontmatter_labels;
+use crate::issues::local::{parse_label_array, rewrite_frontmatter_labels};
 
 #[allow(clippy::unused_async)]
 pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
@@ -182,15 +182,7 @@ fn parse_ticket_frontmatter(content: &str) -> Option<Ticket> {
         } else if let Some(val) = line.strip_prefix("status: ") {
             status = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("labels: ") {
-            let val = val.trim();
-            if val.starts_with('[') && val.ends_with(']') {
-                let inner = &val[1..val.len() - 1];
-                labels = inner
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
+            labels = parse_label_array(val);
         }
     }
 
