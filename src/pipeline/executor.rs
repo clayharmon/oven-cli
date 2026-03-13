@@ -305,7 +305,21 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
 
-            let review_output = parse_review_output(&review_result.output)?;
+            let review_output = match parse_review_output(&review_result.output) {
+                Ok(output) => output,
+                Err(e) => {
+                    warn!(run_id = %run_id, cycle, error = %e, "review output unparseable, treating as failed review");
+                    if let Some(pr_number) = ctx.pr_number {
+                        github::safe_comment(
+                            &self.github,
+                            pr_number,
+                            &format!("Review cycle {cycle} returned unparseable output. Stopping pipeline."),
+                        )
+                        .await;
+                    }
+                    anyhow::bail!("reviewer returned unparseable output in cycle {cycle}");
+                }
+            };
             self.store_findings(run_id, &review_output.findings).await?;
 
             let actionable: Vec<_> =

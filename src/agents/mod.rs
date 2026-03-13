@@ -6,7 +6,7 @@ pub mod reviewer;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{db::ReviewFinding, process::CommandRunner};
@@ -226,10 +226,11 @@ impl std::fmt::Display for Severity {
 
 /// Parse structured review output from the reviewer's text response.
 ///
-/// The JSON may be wrapped in markdown code fences. Returns empty findings
-/// if the output is unparseable.
+/// The JSON may be wrapped in markdown code fences. Returns an error if the
+/// output is unparseable -- callers should treat this as a review failure,
+/// not a clean pass (which could let unreviewed code through to merge).
 pub fn parse_review_output(text: &str) -> Result<ReviewOutput> {
-    Ok(extract_json(text).unwrap_or(ReviewOutput { findings: Vec::new(), summary: String::new() }))
+    extract_json(text).context("reviewer returned unparseable output (no valid JSON found)")
 }
 
 /// Try to extract a JSON object of type `T` from text that may contain prose,
@@ -298,9 +299,8 @@ mod tests {
 
         #[test]
         fn parse_review_output_never_panics(text in "\\PC{0,500}") {
-            // parse_review_output should never panic on any input
-            let result = parse_review_output(&text);
-            assert!(result.is_ok());
+            // parse_review_output should never panic on any input (may return Err)
+            let _ = parse_review_output(&text);
         }
 
         #[test]
@@ -397,17 +397,18 @@ That's it."#;
     }
 
     #[test]
-    fn parse_review_output_no_json() {
+    fn parse_review_output_no_json_returns_error() {
         let text = "The code looks great, no issues found.";
-        let output = parse_review_output(text).unwrap();
-        assert!(output.findings.is_empty());
+        let result = parse_review_output(text);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unparseable"));
     }
 
     #[test]
-    fn parse_review_output_malformed_json() {
+    fn parse_review_output_malformed_json_returns_error() {
         let text = r#"{"findings": [{"broken json"#;
-        let output = parse_review_output(text).unwrap();
-        assert!(output.findings.is_empty());
+        let result = parse_review_output(text);
+        assert!(result.is_err());
     }
 
     // --- Planner output parsing tests ---
