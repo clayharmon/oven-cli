@@ -74,11 +74,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             "starting pipeline"
         );
 
-        let issue_source_str = match issue.source {
-            IssueOrigin::Github => "github",
-            IssueOrigin::Local => "local",
-        };
-
         let pr_number = self.create_pr(&run_id, issue, &worktree.branch, &target_dir).await?;
 
         let ctx = AgentContext {
@@ -92,7 +87,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             review_findings: None,
             cycle: 1,
             target_repo: if is_multi_repo { issue.target_repo.clone() } else { None },
-            issue_source: issue_source_str.to_string(),
+            issue_source: issue.source.as_str().to_string(),
         };
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge).await;
@@ -322,9 +317,12 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             info!(run_id = %run_id, cycle, findings = actionable.len(), "review found issues");
 
             if cycle == 2 {
-                let pr_number = ctx.pr_number.unwrap_or(0);
-                let comment = format_unresolved_comment(&actionable);
-                github::safe_comment(&self.github, pr_number, &comment).await;
+                if let Some(pr_number) = ctx.pr_number {
+                    let comment = format_unresolved_comment(&actionable);
+                    github::safe_comment(&self.github, pr_number, &comment).await;
+                } else {
+                    warn!(run_id = %run_id, "no PR number, cannot post unresolved findings");
+                }
                 return Ok(false);
             }
 
@@ -358,7 +356,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 let db_finding = ReviewFinding {
                     id: 0,
                     agent_run_id: ar.id,
-                    severity: format!("{:?}", finding.severity).to_lowercase(),
+                    severity: finding.severity.to_string(),
                     category: finding.category.clone(),
                     file_path: finding.file_path.clone(),
                     line_number: finding.line_number,
@@ -483,7 +481,7 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
             (Some(path), None) => format!(" in `{path}`"),
             _ => String::new(),
         };
-        let _ = writeln!(comment, "- **[{:?}]** {}{}: {}", f.severity, f.category, loc, f.message);
+        let _ = writeln!(comment, "- **[{}]** {}{}: {}", f.severity, f.category, loc, f.message);
     }
     comment
 }
