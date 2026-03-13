@@ -72,6 +72,8 @@ impl<R: CommandRunner> GhClient<R> {
                     "list",
                     "--label",
                     label,
+                    "--author",
+                    "@me",
                     "--json",
                     "number,title,body,labels",
                     "--state",
@@ -173,6 +175,22 @@ mod tests {
         assert_eq!(issues[0].number, 1);
         assert_eq!(issues[1].number, 2);
         assert_eq!(issues[2].number, 3);
+    }
+
+    #[tokio::test]
+    async fn get_issues_by_label_filters_by_current_user() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"--author".to_string()));
+            assert!(args.contains(&"@me".to_string()));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: "[]".to_string(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let issues = client.get_issues_by_label("o-ready").await.unwrap();
+        assert!(issues.is_empty());
     }
 
     #[tokio::test]
