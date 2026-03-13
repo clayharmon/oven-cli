@@ -320,25 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string() {
-        assert_eq!(truncate("this is a long string", 10), "this is...");
-    }
-
-    #[test]
-    fn truncate_multibyte_does_not_panic() {
-        let s = "😀😀😀"; // 12 bytes, each emoji is 4 bytes
-        let result = truncate(s, 6);
-        assert!(result.ends_with("..."));
-        // max_len=6, target=3, boundary at 0 (3 < 4 bytes for one emoji)
-        assert!(!result.contains('\u{FFFD}'));
-    }
-
-    #[test]
     fn label_add_and_remove() {
         let content = "---\nid: 1\ntitle: Test\nstatus: open\nlabels: [\"o-ready\"]\n---\n\nbody";
         let mut ticket = parse_ticket_frontmatter(content).unwrap();

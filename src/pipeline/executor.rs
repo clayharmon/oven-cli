@@ -511,13 +511,14 @@ pub fn generate_run_id() -> String {
 
 /// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
 ///
+/// Reserves 3 bytes for the "..." suffix so the total output never exceeds `max_len`.
 /// Always cuts at a valid UTF-8 character boundary to avoid panics on multi-byte input.
-fn truncate(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
     }
-    // Walk backward from max_len to find a char boundary
-    let mut end = max_len;
+    let target = max_len.saturating_sub(3);
+    let mut end = target;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -562,29 +563,30 @@ mod tests {
     fn truncate_long_string() {
         let long = "a".repeat(100);
         let result = truncate(&long, 10);
-        assert_eq!(result.len(), 13); // 10 + "..."
+        assert_eq!(result.len(), 10); // 7 chars + "..."
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn truncate_multibyte_does_not_panic() {
         // Each emoji is 4 bytes. "😀😀😀" = 12 bytes.
-        // Truncating at 5 must not split a 4-byte char.
+        // max_len=8, target=5, walks back to boundary at 4 (one emoji).
         let s = "😀😀😀";
-        let result = truncate(s, 5);
+        let result = truncate(s, 8);
         assert!(result.ends_with("..."));
-        // Should cut back to the boundary at byte 4 (one emoji)
         assert!(result.starts_with("😀"));
+        assert!(result.len() <= 8);
     }
 
     #[test]
     fn truncate_cjk_boundary() {
         // CJK chars are 3 bytes each
         let s = "你好世界测试"; // 18 bytes
-        let result = truncate(s, 7);
+        // max_len=10, target=7, walks back to boundary at 6 (two 3-byte chars).
+        let result = truncate(s, 10);
         assert!(result.ends_with("..."));
-        // 7 bytes -> boundary at 6 (two 3-byte chars)
         assert!(result.starts_with("你好"));
+        assert!(result.len() <= 10);
     }
 
     #[test]
