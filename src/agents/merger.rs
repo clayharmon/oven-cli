@@ -8,10 +8,29 @@ use super::AgentContext;
 struct MergerPrompt<'a> {
     ctx: &'a AgentContext,
     auto_merge: bool,
+    pr_number: u32,
+    safe_title: String,
+}
+
+/// Escape shell metacharacters in a string for safe embedding in shell commands.
+fn shell_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '$' | '`' | '!' => {
+                let mut escaped = String::with_capacity(2);
+                escaped.push('\\');
+                escaped.push(c);
+                escaped
+            }
+            _ => c.to_string(),
+        })
+        .collect()
 }
 
 pub fn build_prompt(ctx: &AgentContext, auto_merge: bool) -> Result<String> {
-    let tmpl = MergerPrompt { ctx, auto_merge };
+    let pr_number = ctx.pr_number.context("merger requires a PR number")?;
+    let safe_title = shell_escape(&ctx.issue_title);
+    let tmpl = MergerPrompt { ctx, auto_merge, pr_number, safe_title };
     tmpl.render().context("rendering merger template")
 }
 
@@ -111,5 +130,22 @@ mod tests {
         let prompt = build_prompt(&ctx, true).unwrap();
         assert!(prompt.contains("From local issue #42"));
         assert!(!prompt.contains("Resolves #42"));
+    }
+
+    #[test]
+    fn prompt_fails_without_pr_number() {
+        let mut ctx = sample_context();
+        ctx.pr_number = None;
+        let result = build_prompt(&ctx, false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("PR number"));
+    }
+
+    #[test]
+    fn prompt_escapes_shell_metacharacters_in_title() {
+        let mut ctx = sample_context();
+        ctx.issue_title = r#"Fix "bug" with $HOME expansion"#.to_string();
+        let prompt = build_prompt(&ctx, false).unwrap();
+        assert!(prompt.contains(r#"Fix \"bug\" with \$HOME expansion"#));
     }
 }
