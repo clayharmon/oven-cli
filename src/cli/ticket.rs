@@ -199,10 +199,14 @@ fn parse_ticket_frontmatter(content: &str) -> Option<Ticket> {
 
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        return s.to_string();
     }
+    let target = max_len.saturating_sub(3);
+    let mut end = target;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 #[cfg(test)]
@@ -295,6 +299,15 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("this is a long string", 10), "this is...");
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        let s = "😀😀😀"; // 12 bytes, each emoji is 4 bytes
+        let result = truncate(s, 6);
+        assert!(result.ends_with("..."));
+        // max_len=6, target=3, boundary at 0 (3 < 4 bytes for one emoji)
+        assert!(!result.contains('\u{FFFD}'));
     }
 
     #[test]

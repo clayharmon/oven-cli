@@ -509,9 +509,19 @@ pub fn generate_run_id() -> String {
     uuid::Uuid::new_v4().to_string()[..8].to_string()
 }
 
-/// Truncate a string to `max_len`, appending "..." if truncated.
+/// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
+///
+/// Always cuts at a valid UTF-8 character boundary to avoid panics on multi-byte input.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len { s.to_string() } else { format!("{}...", &s[..max_len]) }
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    // Walk backward from max_len to find a char boundary
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 #[cfg(test)]
@@ -554,6 +564,27 @@ mod tests {
         let result = truncate(&long, 10);
         assert_eq!(result.len(), 13); // 10 + "..."
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        // Each emoji is 4 bytes. "😀😀😀" = 12 bytes.
+        // Truncating at 5 must not split a 4-byte char.
+        let s = "😀😀😀";
+        let result = truncate(s, 5);
+        assert!(result.ends_with("..."));
+        // Should cut back to the boundary at byte 4 (one emoji)
+        assert!(result.starts_with("😀"));
+    }
+
+    #[test]
+    fn truncate_cjk_boundary() {
+        // CJK chars are 3 bytes each
+        let s = "你好世界测试"; // 18 bytes
+        let result = truncate(s, 7);
+        assert!(result.ends_with("..."));
+        // 7 bytes -> boundary at 6 (two 3-byte chars)
+        assert!(result.starts_with("你好"));
     }
 
     #[test]
