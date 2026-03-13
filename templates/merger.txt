@@ -62,7 +62,7 @@ After merging:
 git checkout main
 git pull
 ```
-
+{% if ctx.target_repo.is_none() %}
 ## Step 5: Close Issue
 
 Close the issue with a comment linking to the PR:
@@ -70,6 +70,7 @@ Close the issue with a comment linking to the PR:
 ```
 gh issue close {{ ctx.issue_number }} --comment "Implemented in #{{ ctx.pr_number.as_ref().unwrap() }}"
 ```
+{% endif %}
 {% endif %}
 ## Output
 

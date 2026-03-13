@@ -94,10 +94,12 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             lint_command: self.config.project.lint.clone(),
             review_findings: None,
             cycle: 1,
+            target_repo: if is_multi_repo { parsed.target_repo.clone() } else { None },
         };
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge).await;
-        self.finalize_run(&run_id, issue, pr_number, &result).await?;
+        self.finalize_run(&run_id, issue, pr_number, &result, parsed.target_repo.as_deref())
+            .await?;
 
         if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
             warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
@@ -191,6 +193,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         issue: &Issue,
         pr_number: u32,
         result: &Result<()>,
+        target_repo: Option<&str>,
     ) -> Result<()> {
         let (final_status, error_msg) = match result {
             Ok(()) => {
@@ -201,6 +204,20 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     &self.config.labels.complete,
                 )
                 .await?;
+
+                // In multi-repo mode the merger can't close the god repo issue
+                // (it runs in the target repo dir), so the executor handles it.
+                if let Some(repo_name) = target_repo {
+                    let comment = format!("Implemented in {repo_name}#{pr_number}");
+                    if let Err(e) = self.github.close_issue(issue.number, Some(&comment)).await {
+                        warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "failed to close god-repo issue in multi-repo mode"
+                        );
+                    }
+                }
+
                 (RunStatus::Complete, None)
             }
             Err(e) => {

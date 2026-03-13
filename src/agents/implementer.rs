@@ -28,6 +28,7 @@ mod tests {
             lint_command: Some("cargo clippy".to_string()),
             review_findings: None,
             cycle: 1,
+            target_repo: None,
         }
     }
 

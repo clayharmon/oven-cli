@@ -127,6 +127,19 @@ impl<R: CommandRunner> GhClient<R> {
         Self::check_output(&output, "comment on issue")?;
         Ok(())
     }
+
+    /// Close an issue with an optional comment.
+    pub async fn close_issue(&self, issue_number: u32, comment: Option<&str>) -> Result<()> {
+        let num_str = issue_number.to_string();
+        let mut args = vec!["issue", "close", &num_str];
+        if let Some(body) = comment {
+            args.extend(["--comment", body]);
+        }
+        let output =
+            self.runner.run_gh(&Self::s(&args), &self.repo_dir).await.context("closing issue")?;
+        Self::check_output(&output, "close issue")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +208,38 @@ mod tests {
 
         let client = GhClient::new(mock, Path::new("/tmp"));
         let result = client.comment_on_issue(42, "hello").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_issue_with_comment() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"issue".to_string()));
+            assert!(args.contains(&"close".to_string()));
+            assert!(args.contains(&"--comment".to_string()));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let result = client.close_issue(42, Some("Done")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_issue_without_comment() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(!args.contains(&"--comment".to_string()));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let result = client.close_issue(42, None).await;
         assert!(result.is_ok());
     }
 

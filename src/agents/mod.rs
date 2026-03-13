@@ -78,6 +78,10 @@ pub struct AgentContext {
     pub lint_command: Option<String>,
     pub review_findings: Option<Vec<ReviewFinding>>,
     pub cycle: u32,
+    /// When set, indicates this is a multi-repo pipeline where the PR lives in a
+    /// different repo than the issue. The merger should skip closing the issue
+    /// (the executor handles it).
+    pub target_repo: Option<String>,
 }
 
 /// An invocation ready to be sent to the process runner.

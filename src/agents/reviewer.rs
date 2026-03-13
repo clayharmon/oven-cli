@@ -29,6 +29,7 @@ mod tests {
             lint_command: None,
             review_findings: None,
             cycle: 1,
+            target_repo: None,
         }
     }
 

@@ -29,6 +29,7 @@ mod tests {
             lint_command: None,
             review_findings: None,
             cycle: 1,
+            target_repo: None,
         }
     }
 
@@ -73,5 +74,22 @@ mod tests {
     fn prompt_includes_merge_summary_output() {
         let prompt = build_prompt(&sample_context(), false);
         assert!(prompt.contains("Merge Summary"));
+    }
+
+    #[test]
+    fn prompt_skips_issue_close_in_multi_repo() {
+        let mut ctx = sample_context();
+        ctx.target_repo = Some("backend-api".to_string());
+        let prompt = build_prompt(&ctx, true);
+        // Should still merge the PR
+        assert!(prompt.contains("gh pr merge 99"));
+        // But should NOT try to close the issue (executor handles it)
+        assert!(!prompt.contains("gh issue close"));
+    }
+
+    #[test]
+    fn prompt_includes_issue_close_in_single_repo() {
+        let prompt = build_prompt(&sample_context(), true);
+        assert!(prompt.contains("gh issue close 42"));
     }
 }
