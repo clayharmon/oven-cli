@@ -49,16 +49,14 @@ impl<R: CommandRunner> GhClient<R> {
     }
 }
 
-/// Transition an issue from one label to another.
+/// Transition an issue from one label to another in a single gh call.
 pub async fn transition_issue<R: CommandRunner>(
     client: &GhClient<R>,
     issue_number: u32,
     from: &str,
     to: &str,
 ) -> Result<()> {
-    client.remove_label(issue_number, from).await?;
-    client.add_label(issue_number, to).await?;
-    Ok(())
+    client.swap_labels(issue_number, from, to).await
 }
 
 /// Post a comment, logging errors instead of propagating them.

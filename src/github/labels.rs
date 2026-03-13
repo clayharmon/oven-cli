@@ -43,6 +43,21 @@ impl<R: CommandRunner> GhClient<R> {
         Ok(())
     }
 
+    /// Remove one label and add another in a single gh CLI call.
+    pub async fn swap_labels(&self, issue_number: u32, remove: &str, add: &str) -> Result<()> {
+        let num = issue_number.to_string();
+        let output = self
+            .runner
+            .run_gh(
+                &Self::s(&["issue", "edit", &num, "--remove-label", remove, "--add-label", add]),
+                &self.repo_dir,
+            )
+            .await
+            .context("swapping labels")?;
+        Self::check_output(&output, "swap labels")?;
+        Ok(())
+    }
+
     /// Ensure all oven labels exist in the repository.
     pub async fn ensure_labels_exist(&self) -> Result<()> {
         for (name, color, description) in LABEL_COLORS {
