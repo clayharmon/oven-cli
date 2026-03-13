@@ -30,7 +30,7 @@ describe("install", () => {
     expect(exec.exec).toHaveBeenCalledWith("cargo", ["install", "oven-cli"]);
   });
 
-  it("installClaude installs via npm", async () => {
+  it("installClaude installs via npm with default version", async () => {
     const exec = await import("@actions/exec");
     const { installClaude } = await import("../src/install");
 
@@ -40,6 +40,30 @@ describe("install", () => {
       "-g",
       "@anthropic-ai/claude-code",
     ]);
+  });
+
+  it("installClaude installs pinned version when specified", async () => {
+    const exec = await import("@actions/exec");
+    const { installClaude } = await import("../src/install");
+
+    await installClaude("1.0.5");
+    expect(exec.exec).toHaveBeenCalledWith("npm", [
+      "install",
+      "-g",
+      "@anthropic-ai/claude-code@1.0.5",
+    ]);
+  });
+
+  it("installOven rejects path traversal in version", async () => {
+    const { installOven } = await import("../src/install");
+    await expect(installOven("../../evil")).rejects.toThrow("Invalid oven-version");
+  });
+
+  it("installOven rejects shell metacharacters in version", async () => {
+    const { installOven } = await import("../src/install");
+    await expect(installOven("1.0.0; rm -rf /")).rejects.toThrow(
+      "Invalid oven-version",
+    );
   });
 
   it("verifyInstallation calls both --version commands", async () => {

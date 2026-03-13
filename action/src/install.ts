@@ -34,7 +34,18 @@ function getPlatform(): Platform {
   return { os: osName, arch: archName };
 }
 
+const SEMVER_RE = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
+
+function validateVersion(version: string): void {
+  if (version !== "latest" && !SEMVER_RE.test(version)) {
+    throw new Error(
+      `Invalid oven-version "${version}": must be "latest" or a valid semver (e.g. "1.2.3")`,
+    );
+  }
+}
+
 export async function installOven(version: string): Promise<string> {
+  validateVersion(version);
   const platform = getPlatform();
 
   if (version === "latest") {
@@ -45,7 +56,7 @@ export async function installOven(version: string): Promise<string> {
 
   // Try to download a pre-built binary from GitHub releases
   const target = `${platform.arch}-unknown-${platform.os}-gnu`;
-  const ext = platform.os === "linux" ? "tar.gz" : "tar.gz";
+  const ext = "tar.gz";
   const url = `https://github.com/clayharmon/oven-cli/releases/download/v${version}/oven-${target}.${ext}`;
 
   core.info(`Downloading oven v${version} from ${url}`);
@@ -64,12 +75,12 @@ export async function installOven(version: string): Promise<string> {
   }
 }
 
-export async function installClaude(): Promise<void> {
-  const platform = getPlatform();
-
-  // Claude CLI is installed via npm
-  core.info("Installing Claude CLI via npm");
-  await exec.exec("npm", ["install", "-g", "@anthropic-ai/claude-code"]);
+export async function installClaude(claudeVersion?: string): Promise<void> {
+  const pkg = claudeVersion
+    ? `@anthropic-ai/claude-code@${claudeVersion}`
+    : "@anthropic-ai/claude-code";
+  core.info(`Installing Claude CLI via npm: ${pkg}`);
+  await exec.exec("npm", ["install", "-g", pkg]);
 }
 
 export async function verifyInstallation(): Promise<void> {
@@ -96,9 +107,12 @@ export async function verifyInstallation(): Promise<void> {
   core.info(`claude version: ${claudeOutput.trim()}`);
 }
 
-export async function install(version: string): Promise<void> {
+export async function install(
+  version: string,
+  claudeVersion?: string,
+): Promise<void> {
   const installedVersion = await installOven(version);
-  await installClaude();
+  await installClaude(claudeVersion);
   await verifyInstallation();
 
   const binDir = path.join(os.homedir(), ".cargo", "bin");

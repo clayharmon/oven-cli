@@ -6,7 +6,8 @@ async function main(): Promise<void> {
   try {
     // Install dependencies
     const version = core.getInput("oven-version");
-    await install(version);
+    const claudeVersion = core.getInput("claude-version") || undefined;
+    await install(version, claudeVersion);
 
     // Run the pipeline
     const result = await run();
@@ -31,9 +32,8 @@ async function main(): Promise<void> {
 
 // Register SIGTERM handler for graceful shutdown
 process.on("SIGTERM", () => {
-  core.warning("Received SIGTERM, shutting down gracefully");
-  // oven handles its own cleanup via CancellationToken
-  process.exit(0);
+  core.setFailed("Pipeline cancelled (SIGTERM)");
+  process.exit(1);
 });
 
 main();

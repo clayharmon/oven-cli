@@ -19,7 +19,7 @@ function getIssueNumber(): number | null {
         "",
       10,
     );
-    return isNaN(issueNumber) ? null : issueNumber;
+    return issueNumber > 0 ? issueNumber : null;
   }
 
   // issues event (labeled)
@@ -71,20 +71,26 @@ export async function run(): Promise<RunResult> {
   const maxParallel = core.getInput("max-parallel");
   const costBudget = core.getInput("cost-budget");
 
-  // Set up environment -- mask secrets so they don't appear in logs
+  // Mask secrets so they don't appear in logs. Do NOT use core.exportVariable
+  // which persists secrets to $GITHUB_ENV, making them available to all
+  // subsequent steps (including third-party actions).
   const anthropicKey = core.getInput("anthropic-api-key");
   const ghToken = core.getInput("github-token");
   core.setSecret(anthropicKey);
   core.setSecret(ghToken);
-  core.exportVariable("ANTHROPIC_API_KEY", anthropicKey);
-  core.exportVariable("GH_TOKEN", ghToken);
+
+  const secretEnv = {
+    ...process.env,
+    ANTHROPIC_API_KEY: anthropicKey,
+    GH_TOKEN: ghToken,
+  };
 
   // Run oven prep if recipe.toml doesn't exist
   try {
     await exec.exec("test", ["-f", "recipe.toml"]);
   } catch {
     core.info("No recipe.toml found, running oven prep");
-    await exec.exec("oven", ["prep"]);
+    await exec.exec("oven", ["prep"], { env: secretEnv });
   }
 
   // Build oven on command
@@ -102,7 +108,7 @@ export async function run(): Promise<RunResult> {
   try {
     exitCode = await exec.exec("oven", args, {
       env: {
-        ...process.env,
+        ...secretEnv,
         OVEN_MAX_PARALLEL: maxParallel,
         OVEN_COST_BUDGET: costBudget,
       },

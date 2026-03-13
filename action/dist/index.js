@@ -32521,7 +32521,8 @@ async function main() {
     try {
         // Install dependencies
         const version = core.getInput("oven-version");
-        await (0, install_1.install)(version);
+        const claudeVersion = core.getInput("claude-version") || undefined;
+        await (0, install_1.install)(version, claudeVersion);
         // Run the pipeline
         const result = await (0, run_1.run)();
         // Set outputs
@@ -32544,9 +32545,8 @@ async function main() {
 }
 // Register SIGTERM handler for graceful shutdown
 process.on("SIGTERM", () => {
-    core.warning("Received SIGTERM, shutting down gracefully");
-    // oven handles its own cleanup via CancellationToken
-    process.exit(0);
+    core.setFailed("Pipeline cancelled (SIGTERM)");
+    process.exit(1);
 });
 main();
 
@@ -32626,7 +32626,14 @@ function getPlatform() {
     }
     return { os: osName, arch: archName };
 }
+const SEMVER_RE = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
+function validateVersion(version) {
+    if (version !== "latest" && !SEMVER_RE.test(version)) {
+        throw new Error(`Invalid oven-version "${version}": must be "latest" or a valid semver (e.g. "1.2.3")`);
+    }
+}
 async function installOven(version) {
+    validateVersion(version);
     const platform = getPlatform();
     if (version === "latest") {
         core.info("Installing oven via cargo install (latest)");
@@ -32635,7 +32642,7 @@ async function installOven(version) {
     }
     // Try to download a pre-built binary from GitHub releases
     const target = `${platform.arch}-unknown-${platform.os}-gnu`;
-    const ext = platform.os === "linux" ? "tar.gz" : "tar.gz";
+    const ext = "tar.gz";
     const url = `https://github.com/clayharmon/oven-cli/releases/download/v${version}/oven-${target}.${ext}`;
     core.info(`Downloading oven v${version} from ${url}`);
     try {
@@ -32650,11 +32657,12 @@ async function installOven(version) {
         return version;
     }
 }
-async function installClaude() {
-    const platform = getPlatform();
-    // Claude CLI is installed via npm
-    core.info("Installing Claude CLI via npm");
-    await exec.exec("npm", ["install", "-g", "@anthropic-ai/claude-code"]);
+async function installClaude(claudeVersion) {
+    const pkg = claudeVersion
+        ? `@anthropic-ai/claude-code@${claudeVersion}`
+        : "@anthropic-ai/claude-code";
+    core.info(`Installing Claude CLI via npm: ${pkg}`);
+    await exec.exec("npm", ["install", "-g", pkg]);
 }
 async function verifyInstallation() {
     core.info("Verifying installation...");
@@ -32677,9 +32685,9 @@ async function verifyInstallation() {
     });
     core.info(`claude version: ${claudeOutput.trim()}`);
 }
-async function install(version) {
+async function install(version, claudeVersion) {
     const installedVersion = await installOven(version);
-    await installClaude();
+    await installClaude(claudeVersion);
     await verifyInstallation();
     const binDir = path.join(os.homedir(), ".cargo", "bin");
     core.addPath(binDir);
@@ -32737,7 +32745,7 @@ function getIssueNumber() {
     if (context.eventName === "workflow_dispatch") {
         const issueNumber = parseInt(context.payload.inputs?.["issue-number"] ??
             "", 10);
-        return isNaN(issueNumber) ? null : issueNumber;
+        return issueNumber > 0 ? issueNumber : null;
     }
     // issues event (labeled)
     if (context.eventName === "issues") {
@@ -32779,20 +32787,25 @@ async function run() {
     const autoMerge = core.getInput("auto-merge") === "true";
     const maxParallel = core.getInput("max-parallel");
     const costBudget = core.getInput("cost-budget");
-    // Set up environment -- mask secrets so they don't appear in logs
+    // Mask secrets so they don't appear in logs. Do NOT use core.exportVariable
+    // which persists secrets to $GITHUB_ENV, making them available to all
+    // subsequent steps (including third-party actions).
     const anthropicKey = core.getInput("anthropic-api-key");
     const ghToken = core.getInput("github-token");
     core.setSecret(anthropicKey);
     core.setSecret(ghToken);
-    core.exportVariable("ANTHROPIC_API_KEY", anthropicKey);
-    core.exportVariable("GH_TOKEN", ghToken);
+    const secretEnv = {
+        ...process.env,
+        ANTHROPIC_API_KEY: anthropicKey,
+        GH_TOKEN: ghToken,
+    };
     // Run oven prep if recipe.toml doesn't exist
     try {
         await exec.exec("test", ["-f", "recipe.toml"]);
     }
     catch {
         core.info("No recipe.toml found, running oven prep");
-        await exec.exec("oven", ["prep"]);
+        await exec.exec("oven", ["prep"], { env: secretEnv });
     }
     // Build oven on command
     const args = ["on", issueNumber.toString()];
@@ -32806,7 +32819,7 @@ async function run() {
     try {
         exitCode = await exec.exec("oven", args, {
             env: {
-                ...process.env,
+                ...secretEnv,
                 OVEN_MAX_PARALLEL: maxParallel,
                 OVEN_COST_BUDGET: costBudget,
             },

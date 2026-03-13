@@ -10,8 +10,11 @@ inputs:
     description: 'GitHub token (from github-app-token action or GITHUB_TOKEN)'
     required: true
   oven-version:
-    description: 'Version of oven to install (default: latest)'
+    description: 'Version of oven to install (must be "latest" or valid semver e.g. "1.2.3")'
     default: 'latest'
+  claude-version:
+    description: 'Version of @anthropic-ai/claude-code to install (default: latest)'
+    default: ''
   auto-merge:
     description: 'Auto-merge PRs after pipeline completes'
     default: 'false'

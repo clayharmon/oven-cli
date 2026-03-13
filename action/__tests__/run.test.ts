@@ -132,10 +132,7 @@ describe("run", () => {
 
     expect(core.setSecret).toHaveBeenCalledWith("sk-ant-test");
     expect(core.setSecret).toHaveBeenCalledWith("ghp_test");
-    expect(core.exportVariable).toHaveBeenCalledWith(
-      "ANTHROPIC_API_KEY",
-      "sk-ant-test",
-    );
-    expect(core.exportVariable).toHaveBeenCalledWith("GH_TOKEN", "ghp_test");
+    // Secrets should NOT be exported globally via core.exportVariable
+    expect(core.exportVariable).not.toHaveBeenCalled();
   });
 });
