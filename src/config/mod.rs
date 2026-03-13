@@ -6,6 +6,15 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+/// Where oven reads issues from: GitHub API or local `.oven/issues/` files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueSource {
+    #[default]
+    Github,
+    Local,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -36,6 +45,7 @@ pub struct ProjectConfig {
     pub name: Option<String>,
     pub test: Option<String>,
     pub lint: Option<String>,
+    pub issue_source: IssueSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,6 +101,7 @@ struct RawProjectConfig {
     name: Option<String>,
     test: Option<String>,
     lint: Option<String>,
+    issue_source: Option<IssueSource>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -184,6 +195,7 @@ impl Config {
 # name = "my-project"    # auto-detected from git remote
 # test = "cargo test"    # test command
 # lint = "cargo clippy"  # lint command
+# issue_source = "github"  # "github" (default) or "local"
 
 [pipeline]
 max_parallel = 2
@@ -212,6 +224,9 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
         }
         if project.lint.is_some() {
             config.project.lint.clone_from(&project.lint);
+        }
+        if let Some(ref source) = project.issue_source {
+            config.project.issue_source = source.clone();
         }
     }
 
@@ -449,6 +464,7 @@ api = "/home/user/dev/api"
                 name: Some("roundtrip".to_string()),
                 test: Some("make test".to_string()),
                 lint: None,
+                issue_source: IssueSource::Github,
             },
             pipeline: PipelineConfig { max_parallel: 5, cost_budget: 25.0, ..Default::default() },
             labels: LabelConfig::default(),
@@ -512,5 +528,56 @@ max_parallel = 1
         let result = config.resolve_repo("bad");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn issue_source_defaults_to_github() {
+        let config = Config::default();
+        assert_eq!(config.project.issue_source, IssueSource::Github);
+    }
+
+    #[test]
+    fn issue_source_local_parses() {
+        let toml_str = r#"
+[project]
+issue_source = "local"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.project.issue_source, IssueSource::Local);
+    }
+
+    #[test]
+    fn issue_source_github_parses() {
+        let toml_str = r#"
+[project]
+issue_source = "github"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.project.issue_source, IssueSource::Github);
+    }
+
+    #[test]
+    fn issue_source_invalid_errors() {
+        let toml_str = r#"
+[project]
+issue_source = "jira"
+"#;
+        let result = toml::from_str::<RawConfig>(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn issue_source_roundtrip() {
+        let config = Config {
+            project: ProjectConfig { issue_source: IssueSource::Local, ..Default::default() },
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.project.issue_source, IssueSource::Local);
     }
 }
