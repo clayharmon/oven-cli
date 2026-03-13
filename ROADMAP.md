@@ -42,7 +42,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 19. Skill Scaffolding in prep | done | Embed skills in binary, scaffold during oven prep |
 | 20. Continuous Polling | done | Non-blocking poll loop with shared semaphore, in-flight tracking, graceful shutdown |
 | 21. Multi-repo Support | done | Route issues to target repos via config + issue frontmatter |
-| 22. GitHub Action | todo | JS/TS action for running oven in CI |
+| 22. GitHub Action | done | JS/TS action with install, run, tests, ncc build, node>=23 |
 | 23. Local CI Script | done | justfile with `just ci` and `just check` |
 | 24. Local Issue Source | done | IssueProvider trait, local/GitHub providers, issue_source in DB, /cook skill updated |
 
