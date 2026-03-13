@@ -101,6 +101,104 @@ pub async fn invoke_agent<R: CommandRunner>(
         .await
 }
 
+/// Complexity classification from the planner agent.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Complexity {
+    Simple,
+    Full,
+}
+
+impl std::fmt::Display for Complexity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Simple => "simple",
+            Self::Full => "full",
+        })
+    }
+}
+
+impl std::str::FromStr for Complexity {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "simple" => Ok(Self::Simple),
+            "full" => Ok(Self::Full),
+            other => anyhow::bail!("unknown complexity: {other}"),
+        }
+    }
+}
+
+/// Structured output from the planner agent.
+#[derive(Debug, Deserialize)]
+pub struct PlannerOutput {
+    pub batches: Vec<Batch>,
+    #[serde(default)]
+    pub total_issues: u32,
+    #[serde(default)]
+    pub parallel_capacity: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Batch {
+    pub batch: u32,
+    pub issues: Vec<PlannedIssue>,
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlannedIssue {
+    pub number: u32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub area: String,
+    #[serde(default)]
+    pub predicted_files: Vec<String>,
+    #[serde(default)]
+    pub has_migration: bool,
+    #[serde(default = "default_full")]
+    pub complexity: Complexity,
+}
+
+fn default_full() -> Complexity {
+    Complexity::Full
+}
+
+/// Parse structured planner output from the planner's text response.
+///
+/// Uses the same JSON-in-text extraction approach as [`parse_review_output`].
+/// Falls back to `None` if the output is unparseable.
+pub fn parse_planner_output(text: &str) -> Option<PlannerOutput> {
+    // Try direct JSON parse
+    if let Ok(output) = serde_json::from_str::<PlannerOutput>(text) {
+        return Some(output);
+    }
+
+    // Try extracting JSON from code fences
+    if let Some(json_str) = extract_json_from_fences(text) {
+        if let Ok(output) = serde_json::from_str::<PlannerOutput>(json_str) {
+            return Some(output);
+        }
+    }
+
+    // Try finding JSON object in the text
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            if end > start {
+                let candidate = &text[start..=end];
+                if let Ok(output) = serde_json::from_str::<PlannerOutput>(candidate) {
+                    return Some(output);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Structured output from the reviewer agent.
 #[derive(Debug, Deserialize)]
 pub struct ReviewOutput {
@@ -313,5 +411,99 @@ That's it."#;
         let text = r#"{"findings": [{"broken json"#;
         let output = parse_review_output(text).unwrap();
         assert!(output.findings.is_empty());
+    }
+
+    // --- Planner output parsing tests ---
+
+    #[test]
+    fn parse_planner_output_valid_json() {
+        let json = r#"{
+            "batches": [{
+                "batch": 1,
+                "issues": [{
+                    "number": 42,
+                    "title": "Add login",
+                    "area": "auth",
+                    "predicted_files": ["src/auth.rs"],
+                    "has_migration": false,
+                    "complexity": "simple"
+                }],
+                "reasoning": "standalone issue"
+            }],
+            "total_issues": 1,
+            "parallel_capacity": 1
+        }"#;
+        let output = parse_planner_output(json).unwrap();
+        assert_eq!(output.batches.len(), 1);
+        assert_eq!(output.batches[0].issues.len(), 1);
+        assert_eq!(output.batches[0].issues[0].number, 42);
+        assert_eq!(output.batches[0].issues[0].complexity, Complexity::Simple);
+        assert!(!output.batches[0].issues[0].has_migration);
+    }
+
+    #[test]
+    fn parse_planner_output_in_code_fences() {
+        let text = r#"Here's the plan:
+
+```json
+{
+    "batches": [{"batch": 1, "issues": [{"number": 1, "complexity": "full"}], "reasoning": "ok"}],
+    "total_issues": 1,
+    "parallel_capacity": 1
+}
+```
+
+That's the plan."#;
+        let output = parse_planner_output(text).unwrap();
+        assert_eq!(output.batches.len(), 1);
+        assert_eq!(output.batches[0].issues[0].complexity, Complexity::Full);
+    }
+
+    #[test]
+    fn parse_planner_output_malformed_returns_none() {
+        assert!(parse_planner_output("not json at all").is_none());
+        assert!(parse_planner_output(r#"{"batches": "broken"}"#).is_none());
+        assert!(parse_planner_output("").is_none());
+    }
+
+    #[test]
+    fn complexity_deserializes_from_strings() {
+        let simple: Complexity = serde_json::from_str(r#""simple""#).unwrap();
+        assert_eq!(simple, Complexity::Simple);
+        let full: Complexity = serde_json::from_str(r#""full""#).unwrap();
+        assert_eq!(full, Complexity::Full);
+    }
+
+    #[test]
+    fn complexity_display_roundtrip() {
+        for c in [Complexity::Simple, Complexity::Full] {
+            let s = c.to_string();
+            let parsed: Complexity = s.parse().unwrap();
+            assert_eq!(c, parsed);
+        }
+    }
+
+    #[test]
+    fn planner_output_defaults_complexity_to_full() {
+        let json = r#"{"batches": [{"batch": 1, "issues": [{"number": 5}], "reasoning": ""}], "total_issues": 1, "parallel_capacity": 1}"#;
+        let output = parse_planner_output(json).unwrap();
+        assert_eq!(output.batches[0].issues[0].complexity, Complexity::Full);
+    }
+
+    #[test]
+    fn planner_output_with_multiple_batches() {
+        let json = r#"{
+            "batches": [
+                {"batch": 1, "issues": [{"number": 1, "complexity": "simple"}, {"number": 2, "complexity": "simple"}], "reasoning": "independent"},
+                {"batch": 2, "issues": [{"number": 3, "complexity": "full"}], "reasoning": "depends on batch 1"}
+            ],
+            "total_issues": 3,
+            "parallel_capacity": 2
+        }"#;
+        let output = parse_planner_output(json).unwrap();
+        assert_eq!(output.batches.len(), 2);
+        assert_eq!(output.batches[0].issues.len(), 2);
+        assert_eq!(output.batches[1].issues.len(), 1);
+        assert_eq!(output.total_issues, 3);
     }
 }
