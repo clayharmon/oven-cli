@@ -3,10 +3,10 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::executor::PipelineExecutor;
-use crate::{github::Issue, process::CommandRunner};
+use crate::{agents::Complexity, github::Issue, process::CommandRunner};
 
 /// Run the pipeline for a batch of issues, limiting parallelism with a semaphore.
 pub async fn run_batch<R: CommandRunner + 'static>(
@@ -28,6 +28,107 @@ pub async fn run_batch<R: CommandRunner + 'static>(
         tasks.spawn(async move {
             let number = issue.number;
             let result = exec.run_issue(&issue, auto_merge).await;
+            drop(permit);
+            (number, result)
+        });
+    }
+
+    let mut had_errors = false;
+    while let Some(join_result) = tasks.join_next().await {
+        match join_result {
+            Ok((number, Ok(()))) => {
+                info!(issue = number, "pipeline completed successfully");
+            }
+            Ok((number, Err(e))) => {
+                error!(issue = number, error = %e, "pipeline failed for issue");
+                had_errors = true;
+            }
+            Err(e) => {
+                error!(error = %e, "pipeline task panicked");
+                had_errors = true;
+            }
+        }
+    }
+
+    if had_errors {
+        anyhow::bail!("one or more pipelines failed");
+    }
+
+    Ok(())
+}
+
+/// Invoke the planner to decide batching, then execute batches sequentially.
+///
+/// Falls back to a single batch with `full` complexity if the planner fails.
+async fn plan_and_run<R: CommandRunner + 'static>(
+    executor: &Arc<PipelineExecutor<R>>,
+    issues: Vec<Issue>,
+    max_parallel: usize,
+    auto_merge: bool,
+) -> Result<()> {
+    match executor.plan_issues(&issues).await {
+        Some(plan) => {
+            info!(
+                batches = plan.batches.len(),
+                total = plan.total_issues,
+                "planner produced a plan"
+            );
+            for batch in &plan.batches {
+                let batch_issues: Vec<_> = batch
+                    .issues
+                    .iter()
+                    .filter_map(|planned| {
+                        issues.iter().find(|i| i.number == planned.number).cloned()
+                    })
+                    .collect();
+
+                // Build a complexity map for this batch
+                let complexity_map: std::collections::HashMap<u32, Complexity> = batch
+                    .issues
+                    .iter()
+                    .map(|pi| (pi.number, pi.complexity.clone()))
+                    .collect();
+
+                run_batch_with_complexity(
+                    executor,
+                    batch_issues,
+                    max_parallel,
+                    auto_merge,
+                    &complexity_map,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        None => {
+            warn!("planner unavailable, running all issues in a single batch");
+            run_batch(executor, issues, max_parallel, auto_merge).await
+        }
+    }
+}
+
+/// Run a batch of issues with per-issue complexity classification.
+async fn run_batch_with_complexity<R: CommandRunner + 'static>(
+    executor: &Arc<PipelineExecutor<R>>,
+    issues: Vec<Issue>,
+    max_parallel: usize,
+    auto_merge: bool,
+    complexity_map: &std::collections::HashMap<u32, Complexity>,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let mut tasks = JoinSet::new();
+
+    for issue in issues {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+        let exec = Arc::clone(executor);
+        let complexity = complexity_map.get(&issue.number).cloned();
+        tasks.spawn(async move {
+            let number = issue.number;
+            let result = exec.run_issue_with_complexity(&issue, auto_merge, complexity).await;
             drop(permit);
             (number, result)
         });
@@ -82,7 +183,7 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
                     }
                     Ok(issues) => {
                         info!(count = issues.len(), "found issues to process");
-                        if let Err(e) = run_batch(&executor, issues, max_parallel, auto_merge).await {
+                        if let Err(e) = plan_and_run(&executor, issues, max_parallel, auto_merge).await {
                             error!(error = %e, "batch failed");
                         }
                     }

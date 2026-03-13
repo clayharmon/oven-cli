@@ -8,7 +8,8 @@ use tracing::{info, warn};
 
 use crate::{
     agents::{
-        self, AgentContext, AgentInvocation, AgentRole, Severity, invoke_agent, parse_review_output,
+        self, AgentContext, AgentInvocation, AgentRole, Complexity, PlannerOutput, Severity,
+        invoke_agent, parse_planner_output, parse_review_output,
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
@@ -30,10 +31,23 @@ pub struct PipelineExecutor<R: CommandRunner> {
 impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     /// Run the full pipeline for a single issue.
     pub async fn run_issue(&self, issue: &Issue, auto_merge: bool) -> Result<()> {
+        self.run_issue_with_complexity(issue, auto_merge, None).await
+    }
+
+    /// Run the full pipeline for a single issue with an optional complexity classification.
+    pub async fn run_issue_with_complexity(
+        &self,
+        issue: &Issue,
+        auto_merge: bool,
+        complexity: Option<Complexity>,
+    ) -> Result<()> {
         let run_id = generate_run_id();
         let base_branch = git::default_branch(&self.repo_dir).await?;
 
-        let run = new_run(&run_id, issue, auto_merge);
+        let mut run = new_run(&run_id, issue, auto_merge);
+        if let Some(ref c) = complexity {
+            run.complexity = c.to_string();
+        }
         {
             let conn = self.db.lock().await;
             db::runs::insert_run(&conn, &run)?;
@@ -74,6 +88,32 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
 
         result
+    }
+
+    /// Invoke the planner agent to decide batching and complexity for a set of issues.
+    ///
+    /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
+    pub async fn plan_issues(&self, issues: &[Issue]) -> Option<PlannerOutput> {
+        let prompt = agents::planner::build_prompt(issues);
+        let invocation = AgentInvocation {
+            role: AgentRole::Planner,
+            prompt,
+            working_dir: self.repo_dir.clone(),
+        };
+
+        match invoke_agent(self.runner.as_ref(), &invocation).await {
+            Ok(result) => {
+                let parsed = parse_planner_output(&result.output);
+                if parsed.is_none() {
+                    warn!("planner returned unparseable output, falling back to single batch");
+                }
+                parsed
+            }
+            Err(e) => {
+                warn!(error = %e, "planner agent failed, falling back to single batch");
+                None
+            }
+        }
     }
 
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {
