@@ -147,9 +147,11 @@ pub fn parse_review_output(text: &str) -> Result<ReviewOutput> {
     // Try finding JSON object in the text
     if let Some(start) = text.find('{') {
         if let Some(end) = text.rfind('}') {
-            let candidate = &text[start..=end];
-            if let Ok(output) = serde_json::from_str::<ReviewOutput>(candidate) {
-                return Ok(output);
+            if end > start {
+                let candidate = &text[start..=end];
+                if let Ok(output) = serde_json::from_str::<ReviewOutput>(candidate) {
+                    return Ok(output);
+                }
             }
         }
     }
@@ -173,7 +175,69 @@ fn extract_json_from_fences(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    const ALL_ROLES: [AgentRole; 5] = [
+        AgentRole::Planner,
+        AgentRole::Implementer,
+        AgentRole::Reviewer,
+        AgentRole::Fixer,
+        AgentRole::Merger,
+    ];
+
+    proptest! {
+        #[test]
+        fn agent_role_display_fromstr_roundtrip(idx in 0..5usize) {
+            let role = ALL_ROLES[idx];
+            let s = role.to_string();
+            let parsed: AgentRole = s.parse().unwrap();
+            assert_eq!(role, parsed);
+        }
+
+        #[test]
+        fn arbitrary_strings_never_panic_on_role_parse(s in "\\PC{1,50}") {
+            let _ = s.parse::<AgentRole>();
+        }
+
+        #[test]
+        fn parse_review_output_never_panics(text in "\\PC{0,500}") {
+            // parse_review_output should never panic on any input
+            let result = parse_review_output(&text);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn valid_review_json_always_parses(
+            severity in prop_oneof!["critical", "warning", "info"],
+            category in "[a-z]{3,15}",
+            message in "[a-zA-Z0-9 ]{1,50}",
+        ) {
+            let json = format!(
+                r#"{{"findings":[{{"severity":"{severity}","category":"{category}","message":"{message}"}}],"summary":"test"}}"#
+            );
+            let output = parse_review_output(&json).unwrap();
+            assert_eq!(output.findings.len(), 1);
+            assert_eq!(output.findings[0].category, category);
+        }
+
+        #[test]
+        fn review_json_in_fences_parses(
+            severity in prop_oneof!["critical", "warning", "info"],
+            category in "[a-z]{3,15}",
+            message in "[a-zA-Z0-9 ]{1,50}",
+            prefix in "[a-zA-Z ]{0,30}",
+            suffix in "[a-zA-Z ]{0,30}",
+        ) {
+            let json = format!(
+                r#"{{"findings":[{{"severity":"{severity}","category":"{category}","message":"{message}"}}],"summary":"ok"}}"#
+            );
+            let text = format!("{prefix}\n```json\n{json}\n```\n{suffix}");
+            let output = parse_review_output(&text).unwrap();
+            assert_eq!(output.findings.len(), 1);
+        }
+    }
 
     #[test]
     fn tool_scoping_per_role() {
