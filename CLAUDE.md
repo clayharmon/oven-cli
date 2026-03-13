@@ -186,7 +186,7 @@ missing_panics_doc = "allow"
 - **Property tests**: proptest for config parsing, ID generation, serialization roundtrips.
 - **Filesystem tests**: assert_fs or tempfile for temp directories with auto-cleanup.
 - **Test runner**: cargo-nextest.
-- **Coverage**: cargo-llvm-cov, 80% line coverage minimum.
+- **Coverage**: cargo-llvm-cov, 85% line coverage minimum.
 - **Shared helpers**: `tests/common/mod.rs` for fixtures and builders.
 
 ## Database conventions
@@ -211,12 +211,12 @@ GitHub Actions with dtolnay/rust-toolchain + Swatinem/rust-cache. Jobs:
 - `fmt` - nightly rustfmt check
 - `clippy` - lint with -D warnings
 - `test` - cargo-nextest on stable + MSRV (1.85)
-- `coverage` - cargo-llvm-cov with 80% threshold
+- `coverage` - cargo-llvm-cov with 85% threshold
 - `deny` - cargo-deny for license/advisory/source audits
 
 ## Skills (Claude Code skills, not oven commands)
-- `/chop` - interactive issue design (scaffolded into .claude/skills/ by `oven prep`)
-- `/taste-test` - codebase audit (scaffolded into .claude/skills/ by `oven prep`)
+- `/cook` - interactive issue design (scaffolded into .claude/skills/ by `oven prep`)
+- `/refine` - codebase audit (scaffolded into .claude/skills/ by `oven prep`)
 
 ## GitHub Action
 JS/TS action (not Docker). GitHub App auth, SHA-pinned deps, per-issue concurrency groups. See DECISIONS.md for full details.

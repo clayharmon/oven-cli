@@ -57,8 +57,8 @@ Based on research across SWE-agent, OpenHands, Aider, Cursor, CodeRabbit, Devin,
 ## Skills
 | Skill | Purpose |
 |-------|---------|
-| `/chop` | Interactive issue design. Asks before adding `o-ready` label. |
-| `/taste-test` | Codebase audit (security, patterns, tests, data, deps) |
+| `/cook` | Interactive issue design. Asks before adding `o-ready` label. |
+| `/refine` | Codebase audit (security, patterns, tests, data, deps) |
 
 ## CLI API
 
@@ -222,7 +222,7 @@ Enterprise-grade approach based on research of Renovate, CodeRabbit, OpenHands, 
 - **Config:** TOML (`toml` crate)
 - **State:** SQLite (`rusqlite`)
 - **CLI framework:** `clap`
-- **Templating:** TBD for `oven prep`
+- **Templating:** askama for agent prompt templates
 - **GitHub:** `gh` CLI for all interactions
 - **Models:** All opus (implementer may move to sonnet later)
 
@@ -245,8 +245,10 @@ Enterprise-grade approach based on research of Renovate, CodeRabbit, OpenHands, 
 - Heavy configurability
 - `allowed_authors` / `require_comment` safety config - revisit later
 
-## Open Questions
-- Default cost budget per pipeline run? ($10? $15? $20?)
-- `oven prep` template engine choice (askama? tera?)
-- Exact PR comment format / structure
-- How planner communicates parallelization decisions to the runtime
+## Resolved Questions
+- **Default cost budget:** $10 per pipeline run (configurable via `pipeline.cost_budget`)
+- **Template engine:** askama (compile-time templates, `.txt` files in `templates/`)
+- **PR comment format:** Agent output summary posted as PR comment after each agent step
+- **Planner communication:** Planner outputs JSON with `batches` array. Each batch has `issues` with `complexity` classification (`simple`/`full`). Parser extracts JSON from agent text output (same approach as reviewer parser). Batches run sequentially, issues within a batch in parallel via semaphore.
+- **Continuous polling:** Polling loop spawns tasks non-blocking with a shared `JoinSet` and `Semaphore` across poll cycles. In-flight `HashSet` prevents double-spawning. Labels (`o-ready` -> `o-cooking`) provide GitHub-level dedup.
+- **Multi-repo:** YAML frontmatter in issue body (`target_repo: name`). Repo name -> local path mappings in user config only. PRs created in target repo, labels/comments stay on god repo.
