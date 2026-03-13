@@ -723,3 +723,165 @@ async fn e2e_default_complexity_is_full() {
     drop(conn);
     assert_eq!(run.complexity, "full");
 }
+
+// -- Continuous polling tests --
+
+#[tokio::test]
+async fn e2e_continuous_polling_processes_issues() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let issue_list_count = Arc::new(AtomicU32::new(0));
+    let ilc = Arc::clone(&issue_list_count);
+
+    // GH runner: returns 1 issue on first poll, empty on subsequent polls
+    let gh_runner = TestRunner {
+        claude_handler: Box::new(|_, _, _| AgentResult {
+            cost_usd: 0.0,
+            duration: Duration::from_secs(0),
+            turns: 0,
+            output: String::new(),
+            session_id: String::new(),
+            success: true,
+        }),
+        gh_handler: Box::new(move |args, _dir| {
+            if args.iter().any(|a| a == "list") {
+                let count = ilc.fetch_add(1, Ordering::SeqCst);
+                let stdout = if count == 0 {
+                    r#"[{"number":201,"title":"Polling test","body":"test body","labels":[{"name":"o-ready"}]}]"#.to_string()
+                } else {
+                    "[]".to_string()
+                };
+                CommandOutput { stdout, stderr: String::new(), success: true }
+            } else if args.iter().any(|a| a == "create") {
+                CommandOutput {
+                    stdout: "https://github.com/test/repo/pull/77\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            } else {
+                CommandOutput { stdout: String::new(), stderr: String::new(), success: true }
+            }
+        }),
+    };
+
+    let cancel = CancellationToken::new();
+    let mut config = Config::default();
+    config.pipeline.poll_interval = 1;
+
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner: Arc::new(test_runner_clean_review()),
+        github: Arc::new(GhClient::new(gh_runner, &repo_dir)),
+        db: Arc::clone(&db),
+        config,
+        cancel_token: cancel.clone(),
+        repo_dir,
+    });
+
+    let cancel_clone = cancel.clone();
+    let handle =
+        tokio::spawn(async move { runner::polling_loop(executor, false, cancel_clone).await });
+
+    // Wait for first poll to fire and issue to be processed
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("polling loop should exit within timeout")
+        .unwrap();
+    assert!(result.is_ok());
+
+    // Verify issue was picked up and processed
+    let conn = db.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    drop(conn);
+
+    assert_eq!(runs.len(), 1, "continuous polling should have processed 1 issue");
+    assert_eq!(runs[0].issue_number, 201);
+    assert_eq!(runs[0].status, RunStatus::Complete);
+}
+
+#[tokio::test]
+async fn e2e_continuous_polling_multiple_issues() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let issue_list_count = Arc::new(AtomicU32::new(0));
+    let ilc = Arc::clone(&issue_list_count);
+
+    // GH runner: returns 2 issues on first poll, empty after
+    let gh_runner = TestRunner {
+        claude_handler: Box::new(|_, _, _| AgentResult {
+            cost_usd: 0.0,
+            duration: Duration::from_secs(0),
+            turns: 0,
+            output: String::new(),
+            session_id: String::new(),
+            success: true,
+        }),
+        gh_handler: Box::new(move |args, _dir| {
+            if args.iter().any(|a| a == "list") {
+                let count = ilc.fetch_add(1, Ordering::SeqCst);
+                let stdout = if count == 0 {
+                    r#"[{"number":301,"title":"Issue A","body":"a","labels":[]},{"number":302,"title":"Issue B","body":"b","labels":[]}]"#.to_string()
+                } else {
+                    "[]".to_string()
+                };
+                CommandOutput { stdout, stderr: String::new(), success: true }
+            } else if args.iter().any(|a| a == "create") {
+                CommandOutput {
+                    stdout: "https://github.com/test/repo/pull/88\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            } else {
+                CommandOutput { stdout: String::new(), stderr: String::new(), success: true }
+            }
+        }),
+    };
+
+    let cancel = CancellationToken::new();
+    let mut config = Config::default();
+    config.pipeline.poll_interval = 1;
+    config.pipeline.max_parallel = 1; // Serial to avoid worktree conflicts
+
+    let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner: Arc::new(test_runner_clean_review()),
+        github: Arc::new(GhClient::new(gh_runner, &repo_dir)),
+        db: Arc::clone(&db),
+        config,
+        cancel_token: cancel.clone(),
+        repo_dir,
+    });
+
+    let cancel_clone = cancel.clone();
+    let handle =
+        tokio::spawn(async move { runner::polling_loop(executor, false, cancel_clone).await });
+
+    // Wait for both issues to be processed (serial, so ~2x time)
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("polling loop should exit within timeout")
+        .unwrap();
+    assert!(result.is_ok());
+
+    let conn = db.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    drop(conn);
+
+    assert_eq!(runs.len(), 2, "should have processed both issues");
+    let issue_numbers: Vec<u32> = runs.iter().map(|r| r.issue_number).collect();
+    assert!(issue_numbers.contains(&301));
+    assert!(issue_numbers.contains(&302));
+    for run in &runs {
+        assert_eq!(run.status, RunStatus::Complete);
+    }
+}

@@ -40,7 +40,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 17. /refine Skill | done | Codebase audit skill with 6 analysis dimensions |
 | 18. Planner Intelligence | done | Planner invoked during polling, batch execution, complexity in DB |
 | 19. Skill Scaffolding in prep | done | Embed skills in binary, scaffold during oven prep |
-| 20. Continuous Polling | todo | Pick up new issues mid-run, don't block on batch completion |
+| 20. Continuous Polling | done | Non-blocking poll loop with shared semaphore, in-flight tracking, graceful shutdown |
 | 21. Multi-repo Support | todo | Route issues to target repos via config + issue frontmatter |
 | 22. GitHub Action | todo | JS/TS action for running oven in CI |
 | 23. Local CI Script | done | justfile with `just ci` and `just check` |
