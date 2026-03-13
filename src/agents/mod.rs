@@ -233,6 +233,22 @@ pub enum Severity {
     Info,
 }
 
+impl Severity {
+    pub const fn as_str(&self) -> &str {
+        match self {
+            Self::Critical => "critical",
+            Self::Warning => "warning",
+            Self::Info => "info",
+        }
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Parse structured review output from the reviewer's text response.
 ///
 /// The JSON may be wrapped in markdown code fences.

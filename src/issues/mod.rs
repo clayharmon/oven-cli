@@ -24,6 +24,21 @@ pub enum IssueOrigin {
     Local,
 }
 
+impl IssueOrigin {
+    pub const fn as_str(&self) -> &str {
+        match self {
+            Self::Github => "github",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl std::fmt::Display for IssueOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Trait for fetching and transitioning issues regardless of source.
 #[async_trait]
 pub trait IssueProvider: Send + Sync {

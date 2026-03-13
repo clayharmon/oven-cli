@@ -487,10 +487,6 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
 }
 
 fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
-    let issue_source = match issue.source {
-        IssueOrigin::Github => "github",
-        IssueOrigin::Local => "local",
-    };
     Run {
         id: run_id.to_string(),
         issue_number: issue.number,
@@ -504,7 +500,7 @@ fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
         finished_at: None,
         error_message: None,
         complexity: "full".to_string(),
-        issue_source: issue_source.to_string(),
+        issue_source: issue.source.to_string(),
     }
 }
 
