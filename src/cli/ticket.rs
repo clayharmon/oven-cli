@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -145,7 +145,7 @@ fn next_ticket_id(issues_dir: &Path) -> Result<u32> {
     Ok(max_id + 1)
 }
 
-fn read_all_tickets(issues_dir: &PathBuf) -> Result<Vec<Ticket>> {
+fn read_all_tickets(issues_dir: &Path) -> Result<Vec<Ticket>> {
     let mut tickets = Vec::new();
 
     for entry in std::fs::read_dir(issues_dir).context("reading issues directory")? {
@@ -346,7 +346,7 @@ mod tests {
         )
         .unwrap();
 
-        let tickets = read_all_tickets(&dir.path().to_path_buf()).unwrap();
+        let tickets = read_all_tickets(dir.path()).unwrap();
         let open: Vec<_> = tickets.iter().filter(|t| t.status == "open").collect();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, 1);
@@ -370,7 +370,7 @@ mod tests {
         )
         .unwrap();
 
-        let tickets = read_all_tickets(&dir.path().to_path_buf()).unwrap();
+        let tickets = read_all_tickets(dir.path()).unwrap();
         assert_eq!(tickets.len(), 2);
         assert_eq!(tickets[0].id, 1);
         assert_eq!(tickets[1].id, 3);
