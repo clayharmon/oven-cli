@@ -7,7 +7,7 @@ pub mod reviewer;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{db::ReviewFinding, process::CommandRunner};
 
@@ -176,34 +176,9 @@ const fn default_full() -> Complexity {
 
 /// Parse structured planner output from the planner's text response.
 ///
-/// Uses the same JSON-in-text extraction approach as [`parse_review_output`].
 /// Falls back to `None` if the output is unparseable.
 pub fn parse_planner_output(text: &str) -> Option<PlannerOutput> {
-    // Try direct JSON parse
-    if let Ok(output) = serde_json::from_str::<PlannerOutput>(text) {
-        return Some(output);
-    }
-
-    // Try extracting JSON from code fences
-    if let Some(json_str) = extract_json_from_fences(text) {
-        if let Ok(output) = serde_json::from_str::<PlannerOutput>(json_str) {
-            return Some(output);
-        }
-    }
-
-    // Try finding JSON object in the text
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            if end > start {
-                let candidate = &text[start..=end];
-                if let Ok(output) = serde_json::from_str::<PlannerOutput>(candidate) {
-                    return Some(output);
-                }
-            }
-        }
-    }
-
-    None
+    extract_json(text)
 }
 
 /// Structured output from the reviewer agent.
@@ -251,34 +226,33 @@ impl std::fmt::Display for Severity {
 
 /// Parse structured review output from the reviewer's text response.
 ///
-/// The JSON may be wrapped in markdown code fences.
+/// The JSON may be wrapped in markdown code fences. Returns empty findings
+/// if the output is unparseable.
 pub fn parse_review_output(text: &str) -> Result<ReviewOutput> {
-    // Try direct JSON parse first
-    if let Ok(output) = serde_json::from_str::<ReviewOutput>(text) {
-        return Ok(output);
+    Ok(extract_json(text).unwrap_or(ReviewOutput { findings: Vec::new(), summary: String::new() }))
+}
+
+/// Try to extract a JSON object of type `T` from text that may contain prose,
+/// code fences, or raw JSON.
+///
+/// Attempts three strategies in order:
+/// 1. Direct `serde_json::from_str`
+/// 2. JSON inside markdown code fences
+/// 3. First `{` to last `}` in the text
+fn extract_json<T: DeserializeOwned>(text: &str) -> Option<T> {
+    if let Ok(val) = serde_json::from_str::<T>(text) {
+        return Some(val);
     }
 
-    // Try extracting JSON from code fences
     if let Some(json_str) = extract_json_from_fences(text) {
-        if let Ok(output) = serde_json::from_str::<ReviewOutput>(json_str) {
-            return Ok(output);
+        if let Ok(val) = serde_json::from_str::<T>(json_str) {
+            return Some(val);
         }
     }
 
-    // Try finding JSON object in the text
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            if end > start {
-                let candidate = &text[start..=end];
-                if let Ok(output) = serde_json::from_str::<ReviewOutput>(candidate) {
-                    return Ok(output);
-                }
-            }
-        }
-    }
-
-    // No findings found - return empty
-    Ok(ReviewOutput { findings: Vec::new(), summary: String::new() })
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end > start { serde_json::from_str::<T>(&text[start..=end]).ok() } else { None }
 }
 
 fn extract_json_from_fences(text: &str) -> Option<&str> {
