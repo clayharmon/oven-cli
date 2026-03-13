@@ -161,6 +161,7 @@ impl Config {
             apply_raw(&mut config, &raw, false);
         }
 
+        config.validate()?;
         Ok(config)
     }
 
@@ -187,6 +188,26 @@ impl Config {
         }
 
         Ok(expanded)
+    }
+
+    /// Validate config values that could cause hangs or resource exhaustion.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.pipeline.max_parallel == 0 {
+            anyhow::bail!("pipeline.max_parallel must be >= 1 (got 0, which would deadlock)");
+        }
+        if self.pipeline.poll_interval < 10 {
+            anyhow::bail!(
+                "pipeline.poll_interval must be >= 10 (got {}, which would hammer the API)",
+                self.pipeline.poll_interval
+            );
+        }
+        if self.pipeline.cost_budget <= 0.0 {
+            anyhow::bail!("pipeline.cost_budget must be > 0 (got {})", self.pipeline.cost_budget);
+        }
+        if self.pipeline.turn_limit == 0 {
+            anyhow::bail!("pipeline.turn_limit must be >= 1 (got 0)");
+        }
+        Ok(())
     }
 
     /// Generate a starter project TOML for `oven prep`.
@@ -558,6 +579,43 @@ issue_source = "github"
         let mut config = Config::default();
         apply_raw(&mut config, &raw, false);
         assert_eq!(config.project.issue_source, IssueSource::Github);
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_parallel() {
+        let mut config = Config::default();
+        config.pipeline.max_parallel = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_parallel"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_low_poll_interval() {
+        let mut config = Config::default();
+        config.pipeline.poll_interval = 5;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("poll_interval"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_cost_budget() {
+        let mut config = Config::default();
+        config.pipeline.cost_budget = 0.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cost_budget"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_turn_limit() {
+        let mut config = Config::default();
+        config.pipeline.turn_limit = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("turn_limit"), "error was: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        Config::default().validate().unwrap();
     }
 
     #[test]
