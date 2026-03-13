@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 
 use super::GhClient;
@@ -6,13 +8,26 @@ use crate::process::CommandRunner;
 impl<R: CommandRunner> GhClient<R> {
     /// Create a draft pull request and return its number.
     pub async fn create_draft_pr(&self, title: &str, branch: &str, body: &str) -> Result<u32> {
+        self.create_draft_pr_in(title, branch, body, &self.repo_dir).await
+    }
+
+    /// Create a draft pull request in a specific repo directory and return its number.
+    ///
+    /// Used in multi-repo mode where the PR belongs in the target repo, not the god repo.
+    pub async fn create_draft_pr_in(
+        &self,
+        title: &str,
+        branch: &str,
+        body: &str,
+        repo_dir: &Path,
+    ) -> Result<u32> {
         let output = self
             .runner
             .run_gh(
                 &Self::s(&[
                     "pr", "create", "--title", title, "--body", body, "--head", branch, "--draft",
                 ]),
-                &self.repo_dir,
+                repo_dir,
             )
             .await
             .context("creating draft PR")?;

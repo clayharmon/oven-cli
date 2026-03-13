@@ -14,7 +14,7 @@ use crate::{
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
     git,
-    github::{self, GhClient, Issue},
+    github::{self, GhClient, Issue, issues::parse_issue_frontmatter},
     process::CommandRunner,
 };
 
@@ -42,7 +42,17 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         complexity: Option<Complexity>,
     ) -> Result<()> {
         let run_id = generate_run_id();
-        let base_branch = git::default_branch(&self.repo_dir).await?;
+
+        // Determine target repo for worktrees and PRs (multi-repo routing)
+        let parsed = parse_issue_frontmatter(issue, &self.config.multi_repo.target_field);
+        let (target_dir, is_multi_repo) = self.resolve_target_dir(parsed.target_repo.as_ref())?;
+        let agent_body = if is_multi_repo {
+            parsed.body_without_frontmatter.clone()
+        } else {
+            issue.body.clone()
+        };
+
+        let base_branch = git::default_branch(&target_dir).await?;
 
         let mut run = new_run(&run_id, issue, auto_merge);
         if let Some(ref c) = complexity {
@@ -61,17 +71,23 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         )
         .await?;
 
-        let worktree = git::create_worktree(&self.repo_dir, issue.number, &base_branch).await?;
+        let worktree = git::create_worktree(&target_dir, issue.number, &base_branch).await?;
         self.record_worktree(&run_id, &worktree).await?;
 
-        info!(run_id = %run_id, issue = issue.number, branch = %worktree.branch, "starting pipeline");
+        info!(
+            run_id = %run_id,
+            issue = issue.number,
+            branch = %worktree.branch,
+            target_repo = ?parsed.target_repo,
+            "starting pipeline"
+        );
 
-        let pr_number = self.create_pr(&run_id, issue, &worktree.branch).await?;
+        let pr_number = self.create_pr_in(&run_id, issue, &worktree.branch, &target_dir).await?;
 
         let ctx = AgentContext {
             issue_number: issue.number,
             issue_title: issue.title.clone(),
-            issue_body: issue.body.clone(),
+            issue_body: agent_body,
             branch: worktree.branch.clone(),
             pr_number: Some(pr_number),
             test_command: self.config.project.test.clone(),
@@ -83,7 +99,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge).await;
         self.finalize_run(&run_id, issue, pr_number, &result).await?;
 
-        if let Err(e) = git::remove_worktree(&self.repo_dir, &worktree.path).await {
+        if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
             warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
         }
 
@@ -116,6 +132,23 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
     }
 
+    /// Determine the effective repo directory for worktrees and PRs.
+    ///
+    /// Returns `(target_dir, is_multi_repo)`. When multi-repo is disabled or no target
+    /// is specified, falls back to `self.repo_dir`.
+    fn resolve_target_dir(&self, target_repo: Option<&String>) -> Result<(PathBuf, bool)> {
+        if !self.config.multi_repo.enabled {
+            return Ok((self.repo_dir.clone(), false));
+        }
+        match target_repo {
+            Some(name) => {
+                let path = self.config.resolve_repo(name)?;
+                Ok((path, true))
+            }
+            None => Ok((self.repo_dir.clone(), false)),
+        }
+    }
+
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {
         let conn = self.db.lock().await;
         conn.execute(
@@ -126,15 +159,22 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
-    async fn create_pr(&self, run_id: &str, issue: &Issue, branch: &str) -> Result<u32> {
+    async fn create_pr_in(
+        &self,
+        run_id: &str,
+        issue: &Issue,
+        branch: &str,
+        repo_dir: &std::path::Path,
+    ) -> Result<u32> {
         let pr_title = format!("fix(#{}): {}", issue.number, issue.title);
         let pr_body = format!(
             "Resolves #{}\n\nAutomated by [oven](https://github.com/clayharmon/oven-cli).",
             issue.number
         );
 
-        git::push_branch(&self.repo_dir, branch).await?;
-        let pr_number = self.github.create_draft_pr(&pr_title, branch, &pr_body).await?;
+        git::push_branch(repo_dir, branch).await?;
+        let pr_number =
+            self.github.create_draft_pr_in(&pr_title, branch, &pr_body, repo_dir).await?;
 
         {
             let conn = self.db.lock().await;
