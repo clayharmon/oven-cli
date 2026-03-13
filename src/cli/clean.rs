@@ -50,11 +50,14 @@ fn remove_dir_contents(dir: &std::path::Path) -> Result<u32> {
     for entry in std::fs::read_dir(dir).context("reading directory")? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type().with_context(|| format!("stat {}", path.display()))?;
+        // Remove symlinks directly without following them to avoid deleting
+        // targets outside the project directory.
+        if file_type.is_symlink() || file_type.is_file() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        } else if file_type.is_dir() {
             std::fs::remove_dir_all(&path)
                 .with_context(|| format!("removing {}", path.display()))?;
-        } else {
-            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
         count += 1;
     }
@@ -91,6 +94,27 @@ mod tests {
         let removed = remove_dir_contents(dir.path()).unwrap();
         assert_eq!(removed, 3);
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn remove_dir_contents_removes_symlink_not_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        std::fs::write(target_dir.path().join("important.txt"), "keep me").unwrap();
+
+        // Create a symlink inside dir pointing to target_dir
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target_dir.path(), dir.path().join("link")).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Skip this test on non-Unix platforms
+            return;
+        }
+
+        let removed = remove_dir_contents(dir.path()).unwrap();
+        assert_eq!(removed, 1);
+        // The symlink is removed but the target's contents survive
+        assert!(target_dir.path().join("important.txt").exists());
     }
 
     #[test]
