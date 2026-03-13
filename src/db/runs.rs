@@ -136,6 +136,15 @@ pub fn finish_run(
     Ok(())
 }
 
+pub fn update_run_worktree(conn: &Connection, id: &str, branch: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE runs SET branch = ?1, worktree_path = ?2 WHERE id = ?3",
+        params![branch, path, id],
+    )
+    .context("updating run worktree")?;
+    Ok(())
+}
+
 pub fn update_run_complexity(conn: &Connection, id: &str, complexity: &str) -> Result<()> {
     conn.execute("UPDATE runs SET complexity = ?1 WHERE id = ?2", params![complexity, id])
         .context("updating run complexity")?;

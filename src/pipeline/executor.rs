@@ -151,9 +151,11 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {
         let conn = self.db.lock().await;
-        conn.execute(
-            "UPDATE runs SET branch = ?1, worktree_path = ?2 WHERE id = ?3",
-            rusqlite::params![worktree.branch, worktree.path.to_string_lossy().as_ref(), run_id],
+        db::runs::update_run_worktree(
+            &conn,
+            run_id,
+            &worktree.branch,
+            &worktree.path.to_string_lossy(),
         )?;
         drop(conn);
         Ok(())
