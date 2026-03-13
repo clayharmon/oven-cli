@@ -40,7 +40,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 20. Continuous Polling | todo | Pick up new issues mid-run, don't block on batch completion |
 | 21. Multi-repo Support | todo | Route issues to target repos via config + issue frontmatter |
 | 22. GitHub Action | todo | JS/TS action for running oven in CI |
-| 23. Local CI Script | todo | justfile for running full CI locally |
+| 23. Local CI Script | done | justfile with `just ci` and `just check` |
 
 ---
 

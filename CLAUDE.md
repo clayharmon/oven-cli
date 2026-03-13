@@ -207,7 +207,7 @@ Migrations via rusqlite_migration (user_version based, no migration table). Test
 - Always `wait()` on child processes to prevent zombies.
 
 ## CI pipeline
-GitHub Actions with dtolnay/rust-toolchain + Swatinem/rust-cache. Jobs:
+GitHub Actions with dtolnay/rust-toolchain + Swatinem/rust-cache. Run locally with `just ci` (or `just check` for the quick subset without coverage/deny). Jobs:
 - `fmt` - nightly rustfmt check
 - `clippy` - lint with -D warnings
 - `test` - cargo-nextest on stable + MSRV (1.85)
