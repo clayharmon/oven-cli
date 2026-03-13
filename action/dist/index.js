@@ -32779,9 +32779,13 @@ async function run() {
     const autoMerge = core.getInput("auto-merge") === "true";
     const maxParallel = core.getInput("max-parallel");
     const costBudget = core.getInput("cost-budget");
-    // Set up environment
-    core.exportVariable("ANTHROPIC_API_KEY", core.getInput("anthropic-api-key"));
-    core.exportVariable("GH_TOKEN", core.getInput("github-token"));
+    // Set up environment -- mask secrets so they don't appear in logs
+    const anthropicKey = core.getInput("anthropic-api-key");
+    const ghToken = core.getInput("github-token");
+    core.setSecret(anthropicKey);
+    core.setSecret(ghToken);
+    core.exportVariable("ANTHROPIC_API_KEY", anthropicKey);
+    core.exportVariable("GH_TOKEN", ghToken);
     // Run oven prep if recipe.toml doesn't exist
     try {
         await exec.exec("test", ["-f", "recipe.toml"]);
@@ -32836,7 +32840,7 @@ async function run() {
     const { owner, repo } = github.context.repo;
     const body = status === "complete"
         ? `Oven pipeline completed successfully.\n\n- Run ID: \`${result.runId}\`\n- Cost: $${result.cost}\n- PR: #${result.prNumber}`
-        : `Oven pipeline failed.\n\n- Run ID: \`${result.runId}\`\n- Cost: $${result.cost}\n\n<details><summary>Error output</summary>\n\n\`\`\`\n${stderr.slice(0, 2000)}\n\`\`\`\n</details>`;
+        : `Oven pipeline failed.\n\n- Run ID: \`${result.runId}\`\n- Cost: $${result.cost}\n\nCheck the [workflow run logs](${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}) for error details.`;
     await octokit.rest.issues.createComment({
         owner,
         repo,

@@ -7,6 +7,7 @@ vi.mock("@actions/core", () => ({
   getInput: vi.fn(),
   setOutput: vi.fn(),
   setFailed: vi.fn(),
+  setSecret: vi.fn(),
   exportVariable: vi.fn(),
 }));
 
@@ -129,6 +130,8 @@ describe("run", () => {
     const { run } = await import("../src/run");
     await run();
 
+    expect(core.setSecret).toHaveBeenCalledWith("sk-ant-test");
+    expect(core.setSecret).toHaveBeenCalledWith("ghp_test");
     expect(core.exportVariable).toHaveBeenCalledWith(
       "ANTHROPIC_API_KEY",
       "sk-ant-test",
