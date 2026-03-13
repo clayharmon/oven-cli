@@ -35,7 +35,7 @@ Phases 15-17 can be worked in parallel. Phase 18 and 19 can be worked in paralle
 | 15. Agent Templates | done | Upgraded all 5 templates with scope discipline, verification checklists, structured output |
 | 16. /cook Skill | done | Interactive issue design skill with 4-phase workflow |
 | 17. /refine Skill | done | Codebase audit skill with 6 analysis dimensions |
-| 18. Planner Intelligence | todo | Actually invoke planner, smarter batching, complexity classification |
+| 18. Planner Intelligence | done | Planner invoked during polling, batch execution, complexity in DB |
 | 19. Skill Scaffolding in prep | done | Embed skills in binary, scaffold during oven prep |
 | 20. Continuous Polling | todo | Pick up new issues mid-run, don't block on batch completion |
 | 21. Multi-repo Support | todo | Route issues to target repos via config + issue frontmatter |
