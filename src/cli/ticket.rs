@@ -68,7 +68,7 @@ pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
             let path = issues_dir.join(format!("{}.md", close_args.id));
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("ticket #{} not found", close_args.id))?;
-            let updated = content.replace("status: open", "status: closed");
+            let updated = replace_frontmatter_status(&content, "open", "closed");
             std::fs::write(&path, updated).context("updating ticket")?;
             println!("closed ticket #{}", close_args.id);
         }
@@ -197,6 +197,25 @@ fn parse_ticket_frontmatter(content: &str) -> Option<Ticket> {
     if id > 0 { Some(Ticket { id, title, status, labels }) } else { None }
 }
 
+/// Replace `status: <from>` with `status: <to>` only within the frontmatter block,
+/// leaving the body untouched so example text like "status: open" isn't corrupted.
+fn replace_frontmatter_status(content: &str, from: &str, to: &str) -> String {
+    let old = format!("status: {from}");
+    let new = format!("status: {to}");
+
+    // Find the frontmatter region (between first and second "---")
+    if let Some(rest) = content.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---") {
+            let frontmatter = &rest[..end];
+            let after = &rest[end..];
+            let replaced = frontmatter.replace(&old, &new);
+            return format!("---\n{replaced}{after}");
+        }
+    }
+    // Fallback: no valid frontmatter, do nothing
+    content.to_string()
+}
+
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
@@ -286,9 +305,18 @@ mod tests {
     #[test]
     fn close_ticket_updates_status() {
         let content = "---\nid: 1\ntitle: Test\nstatus: open\nlabels: []\n---\n\nbody\n";
-        let updated = content.replace("status: open", "status: closed");
+        let updated = replace_frontmatter_status(content, "open", "closed");
         assert!(updated.contains("status: closed"));
-        assert!(!updated.contains("status: open"));
+        assert!(!updated.contains("\nstatus: open"));
+    }
+
+    #[test]
+    fn close_ticket_does_not_corrupt_body() {
+        let content = "---\nid: 1\ntitle: Test\nstatus: open\nlabels: []\n---\n\nThe status: open field is an example.\n";
+        let updated = replace_frontmatter_status(content, "open", "closed");
+        assert!(updated.contains("status: closed"));
+        // Body text should be untouched
+        assert!(updated.contains("The status: open field is an example."));
     }
 
     #[test]

@@ -73,6 +73,22 @@ fn parse_local_issue(content: &str) -> Result<LocalTicket> {
     Ok(LocalTicket { id, title, status, labels, target_repo, body })
 }
 
+/// Replace `status: <from>` with `status: <to>` only within the frontmatter block.
+fn replace_frontmatter_status(content: &str, from: &str, to: &str) -> String {
+    let old = format!("status: {from}");
+    let new = format!("status: {to}");
+
+    if let Some(rest) = content.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---") {
+            let frontmatter = &rest[..end];
+            let after = &rest[end..];
+            let replaced = frontmatter.replace(&old, &new);
+            return format!("---\n{replaced}{after}");
+        }
+    }
+    content.to_string()
+}
+
 /// Rewrite the labels line in a frontmatter block.
 pub fn rewrite_frontmatter_labels(content: &str, labels: &[String]) -> String {
     let labels_str = labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
@@ -168,7 +184,7 @@ impl IssueProvider for LocalIssueProvider {
         let path = self.issues_dir.join(format!("{number}.md"));
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("ticket #{number} not found"))?;
-        let updated = content.replace("status: open", "status: closed");
+        let updated = replace_frontmatter_status(&content, "open", "closed");
         std::fs::write(&path, &updated).context("writing closed ticket")?;
 
         if let Some(body) = comment {
