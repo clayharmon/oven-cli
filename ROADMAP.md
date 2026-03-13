@@ -42,7 +42,7 @@ Phases on the same level can be worked in parallel if desired (e.g., 6, 7 can ha
 | 7. Process Runner | done | CommandRunner trait, stream-json parser, 8 tests |
 | 8. GitHub | done | GhClient for labels/issues/PRs, 11 mock tests |
 | 9. Agents | done | 5 roles with askama templates, review parser, 15 tests |
-| 10. Pipeline | not started | |
+| 10. Pipeline | done | State machine, executor with review-fix loop, parallel runner, polling loop, 15 tests |
 | 11. prep + on + off | not started | |
 | 12. look + report + clean + ticket | not started | |
 | 13. Integration Tests | not started | |
