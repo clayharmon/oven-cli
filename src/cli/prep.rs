@@ -177,4 +177,22 @@ mod tests {
         assert!(content.contains("Out of Scope"));
         assert!(content.contains("Dependencies"));
     }
+
+    #[test]
+    fn refine_skill_template_is_embeddable() {
+        let content = include_str!("../../templates/skills/refine.md");
+        assert!(!content.is_empty());
+        assert!(content.contains("name: refine"));
+        // All six analysis dimensions
+        assert!(content.contains("### Security"));
+        assert!(content.contains("### Error Handling"));
+        assert!(content.contains("### Bad Patterns"));
+        assert!(content.contains("### Test Gaps"));
+        assert!(content.contains("### Data Issues"));
+        assert!(content.contains("### Dependencies"));
+        // Report format with severity table
+        assert!(content.contains("| Category | Critical | High | Medium | Low |"));
+        // Phase 5 connects to /cook
+        assert!(content.contains("/cook"));
+    }
 }
