@@ -163,7 +163,7 @@ pub struct PlannedIssue {
     pub complexity: Complexity,
 }
 
-fn default_full() -> Complexity {
+const fn default_full() -> Complexity {
     Complexity::Full
 }
 

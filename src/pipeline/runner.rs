@@ -66,44 +66,32 @@ async fn plan_and_run<R: CommandRunner + 'static>(
     max_parallel: usize,
     auto_merge: bool,
 ) -> Result<()> {
-    match executor.plan_issues(&issues).await {
-        Some(plan) => {
-            info!(
-                batches = plan.batches.len(),
-                total = plan.total_issues,
-                "planner produced a plan"
-            );
-            for batch in &plan.batches {
-                let batch_issues: Vec<_> = batch
-                    .issues
-                    .iter()
-                    .filter_map(|planned| {
-                        issues.iter().find(|i| i.number == planned.number).cloned()
-                    })
-                    .collect();
+    if let Some(plan) = executor.plan_issues(&issues).await {
+        info!(batches = plan.batches.len(), total = plan.total_issues, "planner produced a plan");
+        for batch in &plan.batches {
+            let batch_issues: Vec<_> = batch
+                .issues
+                .iter()
+                .filter_map(|planned| issues.iter().find(|i| i.number == planned.number).cloned())
+                .collect();
 
-                // Build a complexity map for this batch
-                let complexity_map: std::collections::HashMap<u32, Complexity> = batch
-                    .issues
-                    .iter()
-                    .map(|pi| (pi.number, pi.complexity.clone()))
-                    .collect();
+            // Build a complexity map for this batch
+            let complexity_map: std::collections::HashMap<u32, Complexity> =
+                batch.issues.iter().map(|pi| (pi.number, pi.complexity.clone())).collect();
 
-                run_batch_with_complexity(
-                    executor,
-                    batch_issues,
-                    max_parallel,
-                    auto_merge,
-                    &complexity_map,
-                )
-                .await?;
-            }
-            Ok(())
+            run_batch_with_complexity(
+                executor,
+                batch_issues,
+                max_parallel,
+                auto_merge,
+                &complexity_map,
+            )
+            .await?;
         }
-        None => {
-            warn!("planner unavailable, running all issues in a single batch");
-            run_batch(executor, issues, max_parallel, auto_merge).await
-        }
+        Ok(())
+    } else {
+        warn!("planner unavailable, running all issues in a single batch");
+        run_batch(executor, issues, max_parallel, auto_merge).await
     }
 }
 

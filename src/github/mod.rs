@@ -73,7 +73,7 @@ pub async fn safe_comment<R: CommandRunner>(client: &GhClient<R>, pr_number: u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::{AgentResult, CommandOutput, MockCommandRunner};
+    use crate::process::{CommandOutput, MockCommandRunner};
 
     fn mock_gh_success() -> MockCommandRunner {
         let mut mock = MockCommandRunner::new();
