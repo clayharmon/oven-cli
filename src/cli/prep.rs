@@ -24,6 +24,21 @@ const SKILL_TEMPLATES: &[(&str, &str, &str)] = &[
 pub async fn run(args: PrepArgs, _global: &GlobalOpts) -> Result<()> {
     let project_dir = std::env::current_dir().context("getting current directory")?;
 
+    // User-level config (~/.config/oven/recipe.toml) - never overwritten, even with --force
+    if let Some(config_dir) = dirs::config_dir() {
+        let user_config_dir = config_dir.join("oven");
+        let user_config_path = user_config_dir.join("recipe.toml");
+        if user_config_path.exists() {
+            println!("  ~/.config/oven/recipe.toml (exists, skipped)");
+        } else {
+            std::fs::create_dir_all(&user_config_dir)
+                .with_context(|| format!("creating {}", user_config_dir.display()))?;
+            std::fs::write(&user_config_path, Config::default_user_toml())
+                .with_context(|| format!("writing {}", user_config_path.display()))?;
+            println!("  ~/.config/oven/recipe.toml");
+        }
+    }
+
     // recipe.toml
     write_if_new_or_forced(
         &project_dir.join("recipe.toml"),
@@ -169,6 +184,19 @@ mod tests {
         ensure_gitignore(dir.path()).unwrap();
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(content.matches(".oven/").count(), 1);
+    }
+
+    #[test]
+    fn user_config_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let oven_dir = dir.path().join("oven");
+        std::fs::create_dir_all(&oven_dir).unwrap();
+        let config_path = oven_dir.join("recipe.toml");
+        std::fs::write(&config_path, "# my custom config\n").unwrap();
+
+        // User config uses direct exists() check, ignoring --force.
+        assert!(config_path.exists());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "# my custom config\n");
     }
 
     #[test]
