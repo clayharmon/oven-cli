@@ -160,4 +160,21 @@ mod tests {
             assert!(!content.is_empty());
         }
     }
+
+    #[test]
+    fn cook_skill_template_is_embeddable() {
+        let content = include_str!("../../templates/skills/cook.md");
+        assert!(!content.is_empty());
+        assert!(content.contains("name: cook"));
+        assert!(content.contains("Phase 1"));
+        assert!(content.contains("Phase 2"));
+        assert!(content.contains("Phase 3"));
+        assert!(content.contains("Phase 4"));
+        assert!(content.contains("Acceptance Criteria"));
+        assert!(content.contains("Implementation Guide"));
+        assert!(content.contains("Security Considerations"));
+        assert!(content.contains("Test Requirements"));
+        assert!(content.contains("Out of Scope"));
+        assert!(content.contains("Dependencies"));
+    }
 }
