@@ -115,6 +115,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             role: AgentRole::Planner,
             prompt,
             working_dir: self.repo_dir.clone(),
+            max_turns: Some(self.config.pipeline.turn_limit),
         };
 
         match invoke_agent(self.runner.as_ref(), &invocation).await {
@@ -402,6 +403,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             role,
             prompt: prompt.to_string(),
             working_dir: working_dir.to_path_buf(),
+            max_turns: Some(self.config.pipeline.turn_limit),
         };
 
         let result = invoke_agent(self.runner.as_ref(), &invocation).await;

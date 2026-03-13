@@ -222,7 +222,7 @@ mod tests {
                 })
             })
         });
-        mock.expect_run_claude().returning(|_, _, _| {
+        mock.expect_run_claude().returning(|_, _, _, _| {
             Box::pin(async {
                 Ok(AgentResult {
                     cost_usd: 1.0,
@@ -364,7 +364,7 @@ mod tests {
                 Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
             })
         });
-        mock.expect_run_claude().returning(|_, _, _| {
+        mock.expect_run_claude().returning(|_, _, _, _| {
             Box::pin(async {
                 Ok(AgentResult {
                     cost_usd: 0.5,
@@ -412,7 +412,7 @@ mod tests {
                 Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
             })
         });
-        mock.expect_run_claude().returning(|_, _, _| {
+        mock.expect_run_claude().returning(|_, _, _, _| {
             Box::pin(async {
                 Ok(AgentResult {
                     cost_usd: 0.5,
