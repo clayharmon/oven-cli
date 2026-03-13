@@ -112,12 +112,17 @@ pub fn update_run_cost(conn: &Connection, id: &str, cost_usd: f64) -> Result<()>
 }
 
 /// Atomically add `delta` to the run's cost and return the new total.
+///
+/// Uses an explicit transaction to ensure the UPDATE and SELECT are atomic,
+/// preventing incorrect cost readings under concurrent access.
 pub fn increment_run_cost(conn: &Connection, id: &str, delta: f64) -> Result<f64> {
-    conn.execute("UPDATE runs SET cost_usd = cost_usd + ?1 WHERE id = ?2", params![delta, id])
+    let tx = conn.unchecked_transaction().context("starting cost transaction")?;
+    tx.execute("UPDATE runs SET cost_usd = cost_usd + ?1 WHERE id = ?2", params![delta, id])
         .context("incrementing run cost")?;
-    let new_cost: f64 = conn
+    let new_cost: f64 = tx
         .query_row("SELECT cost_usd FROM runs WHERE id = ?1", params![id], |row| row.get(0))
         .context("reading updated cost")?;
+    tx.commit().context("committing cost transaction")?;
     Ok(new_cost)
 }
 
