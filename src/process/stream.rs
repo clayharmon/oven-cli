@@ -113,7 +113,57 @@ pub async fn parse_stream<R: AsyncRead + Unpin>(reader: R) -> Result<StreamResul
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn parse_stream_never_panics_on_arbitrary_input(data in proptest::collection::vec(any::<u8>(), 0..500)) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let _ = parse_stream(data.as_slice()).await;
+            });
+        }
+
+        #[test]
+        fn valid_result_event_extracts_cost(
+            cost in 0.0..1000.0f64,
+            duration_ms in 0..600_000u64,
+            turns in 0..100u32,
+        ) {
+            let data = format!(
+                r#"{{"type":"result","result":{{"cost_usd":{cost},"duration_ms":{duration_ms},"num_turns":{turns},"session_id":"s1"}}}}"#
+            );
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let result = parse_stream(data.as_bytes()).await.unwrap();
+                assert!((result.cost_usd - cost).abs() < 1e-6);
+                assert_eq!(result.duration, std::time::Duration::from_millis(duration_ms));
+                assert_eq!(result.turns, turns);
+            });
+        }
+
+        #[test]
+        fn multiple_text_blocks_concatenate(
+            texts in proptest::collection::vec("[a-zA-Z0-9 ]{1,20}", 1..5),
+        ) {
+            let content_blocks: Vec<String> = texts.iter()
+                .map(|t| format!(r#"{{"type":"text","text":"{t}"}}"#))
+                .collect();
+            let content_json = content_blocks.join(",");
+            let data = format!(
+                r#"{{"type":"assistant","message":{{"content":[{content_json}]}}}}
+    {{"type":"result","result":{{"session_id":"s1"}}}}"#
+            );
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let result = parse_stream(data.as_bytes()).await.unwrap();
+                let expected: String = texts.into_iter().collect();
+                assert_eq!(result.output, expected);
+            });
+        }
+    }
 
     fn stream_fixture() -> &'static str {
         r#"{"type":"system","subtype":"init","session_id":"sess-123"}

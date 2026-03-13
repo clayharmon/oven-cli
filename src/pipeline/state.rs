@@ -29,7 +29,44 @@ impl RunStatus {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    const ALL_STATUSES: [RunStatus; 7] = [
+        RunStatus::Pending,
+        RunStatus::Implementing,
+        RunStatus::Reviewing,
+        RunStatus::Fixing,
+        RunStatus::Merging,
+        RunStatus::Complete,
+        RunStatus::Failed,
+    ];
+
+    proptest! {
+        #[test]
+        fn next_never_panics(idx in 0..7usize, has_findings: bool, cycle in 0..50u32) {
+            let status = ALL_STATUSES[idx];
+            // Should never panic regardless of inputs
+            let _ = status.next(has_findings, cycle);
+        }
+
+        #[test]
+        fn terminal_states_stay_terminal(has_findings: bool, cycle in 0..50u32) {
+            assert!(RunStatus::Complete.next(has_findings, cycle).is_terminal());
+            assert!(RunStatus::Failed.next(has_findings, cycle).is_terminal());
+        }
+
+        #[test]
+        fn reviewing_with_findings_past_max_always_fails(cycle in 2..50u32) {
+            assert_eq!(RunStatus::Reviewing.next(true, cycle), RunStatus::Failed);
+        }
+
+        #[test]
+        fn reviewing_clean_always_merges(cycle in 0..50u32) {
+            assert_eq!(RunStatus::Reviewing.next(false, cycle), RunStatus::Merging);
+        }
+    }
 
     #[test]
     fn pending_to_implementing() {

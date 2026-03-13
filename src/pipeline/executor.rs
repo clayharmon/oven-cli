@@ -398,7 +398,18 @@ fn truncate(s: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn run_ids_always_8_hex_chars(_seed in any::<u64>()) {
+            let id = generate_run_id();
+            prop_assert_eq!(id.len(), 8);
+            prop_assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
 
     #[test]
     fn run_id_is_8_hex_chars() {

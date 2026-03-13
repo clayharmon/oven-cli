@@ -35,11 +35,7 @@ fn prep_creates_project_structure() {
     let dir = assert_fs::TempDir::new().unwrap();
 
     // git init
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().unwrap();
 
     Command::cargo_bin("oven")
         .unwrap()
@@ -55,28 +51,17 @@ fn prep_creates_project_structure() {
     dir.child(".oven/logs").assert(predicate::path::is_dir());
     dir.child(".oven/worktrees").assert(predicate::path::is_dir());
     dir.child(".oven/issues").assert(predicate::path::is_dir());
-    dir.child(".claude/agents/implementer.md")
-        .assert(predicate::path::exists());
-    dir.child(".claude/agents/reviewer.md")
-        .assert(predicate::path::exists());
+    dir.child(".claude/agents/implementer.md").assert(predicate::path::exists());
+    dir.child(".claude/agents/reviewer.md").assert(predicate::path::exists());
 }
 
 #[test]
 fn prep_skips_existing_files() {
     let dir = assert_fs::TempDir::new().unwrap();
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().unwrap();
 
     // First run
-    Command::cargo_bin("oven")
-        .unwrap()
-        .current_dir(dir.path())
-        .arg("prep")
-        .assert()
-        .success();
+    Command::cargo_bin("oven").unwrap().current_dir(dir.path()).arg("prep").assert().success();
 
     // Second run should say "exists, skipped"
     Command::cargo_bin("oven")
@@ -91,19 +76,10 @@ fn prep_skips_existing_files() {
 #[test]
 fn prep_force_overwrites() {
     let dir = assert_fs::TempDir::new().unwrap();
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().unwrap();
 
     // First run
-    Command::cargo_bin("oven")
-        .unwrap()
-        .current_dir(dir.path())
-        .arg("prep")
-        .assert()
-        .success();
+    Command::cargo_bin("oven").unwrap().current_dir(dir.path()).arg("prep").assert().success();
 
     // Force run should say "overwritten"
     Command::cargo_bin("oven")

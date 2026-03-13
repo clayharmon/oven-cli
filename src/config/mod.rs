@@ -209,7 +209,58 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn config_toml_roundtrip(
+            max_parallel in 1..100u32,
+            cost_budget in 0.0..1000.0f64,
+            poll_interval in 1..3600u64,
+            turn_limit in 1..200u32,
+            ready in "[a-z][a-z0-9-]{1,20}",
+            cooking in "[a-z][a-z0-9-]{1,20}",
+            complete in "[a-z][a-z0-9-]{1,20}",
+            failed in "[a-z][a-z0-9-]{1,20}",
+        ) {
+            let config = Config {
+                project: ProjectConfig::default(),
+                pipeline: PipelineConfig { max_parallel, cost_budget, poll_interval, turn_limit },
+                labels: LabelConfig { ready, cooking, complete, failed },
+                repos: HashMap::new(),
+            };
+            let serialized = toml::to_string(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(config.pipeline.max_parallel, deserialized.pipeline.max_parallel);
+            assert!((config.pipeline.cost_budget - deserialized.pipeline.cost_budget).abs() < 1e-6);
+            assert_eq!(config.pipeline.poll_interval, deserialized.pipeline.poll_interval);
+            assert_eq!(config.pipeline.turn_limit, deserialized.pipeline.turn_limit);
+            assert_eq!(config.labels, deserialized.labels);
+        }
+
+        #[test]
+        fn partial_toml_always_parses(
+            max_parallel in proptest::option::of(1..100u32),
+            cost_budget in proptest::option::of(0.0..1000.0f64),
+        ) {
+            let mut parts = vec!["[pipeline]".to_string()];
+            if let Some(mp) = max_parallel {
+                parts.push(format!("max_parallel = {mp}"));
+            }
+            if let Some(cb) = cost_budget {
+                parts.push(format!("cost_budget = {cb}"));
+            }
+            let toml_str = parts.join("\n");
+            let raw: RawConfig = toml::from_str(&toml_str).unwrap();
+            let mut config = Config::default();
+            apply_raw(&mut config, &raw, false);
+            if let Some(mp) = max_parallel {
+                assert_eq!(config.pipeline.max_parallel, mp);
+            }
+        }
+    }
 
     #[test]
     fn defaults_are_correct() {

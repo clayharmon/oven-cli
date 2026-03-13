@@ -168,7 +168,35 @@ pub struct ReviewFinding {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    const ALL_STATUSES: [RunStatus; 7] = [
+        RunStatus::Pending,
+        RunStatus::Implementing,
+        RunStatus::Reviewing,
+        RunStatus::Fixing,
+        RunStatus::Merging,
+        RunStatus::Complete,
+        RunStatus::Failed,
+    ];
+
+    proptest! {
+        #[test]
+        fn run_status_display_fromstr_roundtrip(idx in 0..7usize) {
+            let status = ALL_STATUSES[idx];
+            let s = status.to_string();
+            let parsed: RunStatus = s.parse().unwrap();
+            assert_eq!(status, parsed);
+        }
+
+        #[test]
+        fn arbitrary_strings_never_panic_on_parse(s in "\\PC{1,50}") {
+            // Parsing arbitrary strings should never panic, only return Ok or Err
+            let _ = s.parse::<RunStatus>();
+        }
+    }
 
     #[test]
     fn migrations_validate() {
