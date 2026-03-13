@@ -42,6 +42,20 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_scope_discipline() {
+        let prompt = build_prompt(&sample_context());
+        assert!(prompt.contains("Scope Discipline"));
+        assert!(prompt.contains("MUST NOT modify code outside the issue"));
+    }
+
+    #[test]
+    fn prompt_includes_verification_checklist() {
+        let prompt = build_prompt(&sample_context());
+        assert!(prompt.contains("Verification Checklist"));
+        assert!(prompt.contains("git diff main --stat"));
+    }
+
+    #[test]
     fn prompt_includes_test_and_lint_commands() {
         let prompt = build_prompt(&sample_context());
         assert!(prompt.contains("cargo test"));
@@ -54,5 +68,19 @@ mod tests {
         ctx.test_command = None;
         let prompt = build_prompt(&ctx);
         assert!(!prompt.contains("cargo test"));
+    }
+
+    #[test]
+    fn prompt_includes_when_stuck_guidance() {
+        let prompt = build_prompt(&sample_context());
+        assert!(prompt.contains("When Stuck"));
+        assert!(prompt.contains("switch to a different strategy"));
+    }
+
+    #[test]
+    fn prompt_includes_commit_workflow() {
+        let prompt = build_prompt(&sample_context());
+        assert!(prompt.contains("Commit Workflow"));
+        assert!(prompt.contains("atomic conventional commits"));
     }
 }
