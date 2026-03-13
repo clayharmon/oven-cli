@@ -210,6 +210,30 @@ impl Config {
         Ok(())
     }
 
+    /// Generate a starter user TOML for `~/.config/oven/recipe.toml`.
+    pub fn default_user_toml() -> String {
+        r#"# Global oven defaults (all projects inherit these)
+
+[pipeline]
+# max_parallel = 2
+# cost_budget = 15.0
+# poll_interval = 60
+# turn_limit = 50
+
+# [labels]
+# ready = "o-ready"
+# cooking = "o-cooking"
+# complete = "o-complete"
+# failed = "o-failed"
+
+# Multi-repo path mappings (only honored from user config)
+# [repos]
+# api = "~/dev/api"
+# web = "~/dev/web"
+"#
+        .to_string()
+    }
+
     /// Generate a starter project TOML for `oven prep`.
     pub fn default_project_toml() -> String {
         r#"[project]
@@ -466,6 +490,17 @@ api = "/home/user/dev/api"
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("parsing project config"), "error was: {err}");
+    }
+
+    #[test]
+    fn default_user_toml_parses() {
+        let toml_str = Config::default_user_toml();
+        let raw: RawConfig = toml::from_str(&toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, true);
+        // All commented out, so defaults remain
+        assert_eq!(config.pipeline.max_parallel, 2);
+        assert!(config.repos.is_empty());
     }
 
     #[test]
