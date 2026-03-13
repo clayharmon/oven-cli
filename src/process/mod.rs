@@ -3,7 +3,7 @@ pub mod stream;
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 
 use self::stream::parse_stream;
 
@@ -68,14 +68,19 @@ impl CommandRunner for RealCommandRunner {
         }
 
         let mut child = cmd
-            .arg("--")
-            .arg(prompt)
             .current_dir(working_dir)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning claude")?;
+
+        // Pass prompt via stdin to avoid leaking it in process listings (ps aux).
+        let mut stdin = child.stdin.take().context("capturing claude stdin")?;
+        stdin.write_all(prompt.as_bytes()).await.context("writing prompt to claude stdin")?;
+        stdin.shutdown().await.context("closing claude stdin")?;
+        drop(stdin);
 
         let stdout = child.stdout.take().context("capturing claude stdout")?;
         let result = parse_stream(stdout).await?;
