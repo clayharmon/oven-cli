@@ -1,0 +1,59 @@
+[package]
+name = "oven-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "CLI that runs Claude Code agent pipelines against GitHub issues"
+license = "MIT"
+repository = "https://github.com/clayharmon/oven-cli"
+
+[[bin]]
+name = "oven"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite_migration = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+assert_fs = "1"
+tempfile = "3"
+rstest = "0.23"
+mockall = "0.13"
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
