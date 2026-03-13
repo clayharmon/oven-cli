@@ -19,14 +19,14 @@ pub async fn run(args: ReportArgs, _global: &GlobalOpts) -> Result<()> {
             return Ok(());
         }
         if args.json {
-            let reports: Vec<_> = runs
+            let reports = runs
                 .iter()
-                .map(|r| {
-                    let agents =
-                        db::agent_runs::get_agent_runs_for_run(&conn, &r.id).unwrap_or_default();
-                    RunReport::from_run(r, &agents)
+                .map(|r| -> Result<_> {
+                    let agents = db::agent_runs::get_agent_runs_for_run(&conn, &r.id)
+                        .context("fetching agent runs")?;
+                    Ok(RunReport::from_run(r, &agents))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             println!("{}", serde_json::to_string_pretty(&reports)?);
         } else {
             print_runs_table(&runs);
