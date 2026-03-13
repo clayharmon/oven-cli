@@ -238,7 +238,7 @@ Migrations via rusqlite_migration (user_version based, no migration table). Test
 ## Process management
 - `tokio::process::Command` with `kill_on_drop(true)` for all subprocesses.
 - Graceful shutdown: `CancellationToken` from tokio-util combined with `tokio::signal::ctrl_c()`.
-- Agent invocation: `claude -p --output-format stream-json --allowedTools <TOOLS>`.
+- Agent invocation: `claude -p --verbose --output-format stream-json --allowedTools <TOOLS>`.
 - Detached mode: spawn new process with `std::process::Command` (not fork). Write PID to `.oven/oven.pid`.
 - Always `wait()` on child processes to prevent zombies.
 
