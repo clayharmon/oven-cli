@@ -66,7 +66,7 @@ oven off               Stop a detached run
 oven look [RUN_ID]     View logs (--agent <name> to filter)
 oven report [RUN_ID]   Costs, runtime, summary (--all, --json)
 oven clean             Remove worktrees, logs, merged branches
-oven ticket            Local issue management (create, list, view, close)
+oven ticket            Local issue management (create, list, view, close, label, edit)
 ```
 
 ## Config
@@ -77,6 +77,7 @@ Project config lives in `recipe.toml` at your repo root. User defaults go in `~/
 [project]
 test = "cargo test"
 lint = "cargo clippy"
+# issue_source = "local"  # use local tickets instead of GitHub issues
 
 [pipeline]
 max_parallel = 2
@@ -92,7 +93,7 @@ api = "/home/you/dev/api"
 frontend = "/home/you/dev/frontend"
 ```
 
-Issues in your main repo can target other repos. Oven handles the worktree routing.
+Issues in your main repo can target other repos via `target_repo` frontmatter. Oven handles the worktree routing.
 
 ## Labels
 
@@ -103,22 +104,24 @@ Issues in your main repo can target other repos. Oven handles the worktree routi
 | `o-complete` | Done |
 | `o-failed` | Something went wrong |
 
-## GitHub Actions
+## GitHub Action
 
-Oven ships a GitHub Action so you can run pipelines in CI. Uses GitHub App auth, pinned dependencies, and per-issue concurrency. See the action docs for setup.
+Oven ships a GitHub Action so you can run pipelines in CI. Triggers on issue labeling, uses GitHub App auth, and sets up per-issue concurrency groups. See [`action/README.md`](action/README.md) for setup.
 
 ## Local issues
 
-Don't want to use GitHub issues? Use tickets:
+Don't want to use GitHub issues? Set `issue_source = "local"` in your `recipe.toml` and use tickets:
 
 ```bash
 oven ticket create "Add retry logic" --ready
-oven ticket list
-oven ticket view 1
+oven ticket create "Fix auth" --ready --repo backend
+oven ticket list --status open
+oven ticket label 1 o-cooking
+oven ticket edit 1
 oven ticket close 1
 ```
 
-Tickets are markdown files in `.oven/issues/`. Oven picks them up the same way.
+Tickets are markdown files in `.oven/issues/`. Oven picks them up the same way it picks up GitHub issues. PRs still go to GitHub.
 
 ---
 

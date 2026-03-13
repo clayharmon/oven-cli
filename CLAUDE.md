@@ -1,12 +1,12 @@
 # Oven CLI
 
-Oven (`oven-cli` on crates.io, `oven` binary) is a Rust CLI that orchestrates Claude Code agent pipelines against GitHub issues. Kitchen theme throughout.
-
-Read DECISIONS.md for the full design document. Read ROADMAP.md for the phased implementation plan.
+Oven (`oven-cli` on crates.io, `oven` binary) is a Rust CLI that orchestrates Claude Code agent pipelines against GitHub issues. Kitchen theme throughout. Inspired by [ocak](~/dev/ocak), rewritten with cleaner design.
 
 ## What this project does
 
-Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent picks them up (oldest first), creates a draft PR, and runs a pipeline of Claude Code agents against that PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The planner continuously polls for new issues and can parallelize work mid-run. Issue source is configurable: GitHub (default) or local `.oven/issues/` files. PRs are always created on GitHub regardless of issue source.
+Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent picks them up (oldest first), creates a draft PR, and runs a pipeline of Claude Code agents against that PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The planner continuously polls for new issues and can parallelize work mid-run.
+
+Issue source is configurable: GitHub (default) or local `.oven/issues/` files. PRs are always created on GitHub regardless of issue source. Local issue PRs say "From local issue #N" instead of "Resolves #N".
 
 ## Architecture
 
@@ -20,7 +20,7 @@ Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent
 - `oven ticket create|list|view|close|label|edit` - local issue management in .oven/issues/
 
 ### Agents (5, all invoked via `claude -p --output-format stream-json`)
-1. **Planner** - read-only. Decides batching/parallelization, creates draft PRs, continuously re-evaluates.
+1. **Planner** - read-only. Decides batching/parallelization, creates draft PRs, continuously re-evaluates. Outputs JSON with `batches` array, each with `issues` and `complexity` (simple/full).
 2. **Implementer** - full access. Writes code + tests in a worktree.
 3. **Reviewer** - read-only. Code quality + security + simplify in one pass. Outputs structured findings (critical/warning/info).
 4. **Fixer** - full access. Addresses critical + warning findings from reviewer.
@@ -36,14 +36,22 @@ Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent
 | Merger | Bash |
 
 ### Review-fix loop
-Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. If still broken, stop and comment on PR with what's unresolved. No resume - clean and start over.
+Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. If still broken, stop and comment on PR with what's unresolved. No resume, no retry on format/parse errors. Clean and start over.
+
+Hard caps: per-cycle cap (2 fix rounds), cost cap (configurable per-pipeline budget), turn cap (max turns per agent invocation).
+
+### Issue source abstraction
+`IssueProvider` trait abstracts over GitHub and local issue sources. Both produce `PipelineIssue` structs. The pipeline doesn't care which source is active. The `/cook` skill reads `recipe.toml` and creates issues via `oven ticket create` or `gh issue create` accordingly.
 
 ### Config (TOML, two levels)
-- User: `~/.config/oven/recipe.toml` - defaults, multi-repo mappings
+- User: `~/.config/oven/recipe.toml` - defaults, multi-repo repo path mappings (only user config can set `[repos]` for security)
 - Project: `recipe.toml` in repo root - overrides user config
 
+### Multi-repo
+Issues in a "god repo" can target other repos via `target_repo` frontmatter (in issue body for GitHub, in YAML frontmatter for local). Repo name -> local path mappings live in user config. PRs and worktrees go to the target repo; labels and comments stay on the god repo.
+
 ### State
-- `.oven/oven.db` - SQLite. Pipeline state, cost tracking, agent run history.
+- `.oven/oven.db` - SQLite. Pipeline state, cost tracking, agent run history, issue_source per run.
 - `.oven/logs/<run_id>/` - per-run log files
 - `.oven/worktrees/` - git worktrees per issue
 - `.oven/issues/` - local issue markdown files
@@ -52,12 +60,17 @@ Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. If st
 ### Labels
 `o-ready`, `o-cooking`, `o-complete`, `o-failed`
 
+### Continuous polling
+Polling loop spawns tasks non-blocking with a shared `JoinSet` and `Semaphore` across poll cycles. In-flight `HashSet` prevents double-spawning. Labels (`o-ready` -> `o-cooking`) provide GitHub-level dedup.
+
 ## Tech stack
 - Rust (edition 2024), tokio async runtime
 - clap 4 derive API (CLI), rusqlite with bundled SQLite (state), toml (config)
+- askama for compile-time agent prompt templates (`.txt` files in `templates/`)
+- async-trait for `IssueProvider` dyn dispatch
 - tracing + tracing-subscriber + tracing-appender (logging)
 - gh CLI for all GitHub operations
-- claude CLI for all agent invocations
+- claude CLI for all agent invocations (`claude -p --output-format stream-json`)
 - Git worktrees for isolation
 
 ## Project structure
@@ -107,6 +120,23 @@ src/
     executor.rs             step execution, review-fix loop
   logging.rs                tracing setup (file + stderr)
   errors.rs                 thiserror types
+templates/
+  planner.txt               askama prompt templates per agent
+  implementer.txt
+  reviewer.txt
+  fixer.txt
+  merger.txt
+  skills/
+    cook.md                 /cook skill template (scaffolded by oven prep)
+    refine.md               /refine skill template
+action/
+  action.yml                GitHub Action metadata (node20 runtime)
+  src/
+    index.ts                action entry point
+    install.ts              oven + claude CLI installer
+    run.ts                  pipeline runner, issue comment posting
+  __tests__/                vitest unit tests
+  dist/                     ncc-compiled bundle (committed)
 tests/
   common/
     mod.rs                  shared test helpers, fixtures
@@ -134,6 +164,8 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = "0.7"
+async-trait = "0.1"
+askama = "0.14.0"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -219,8 +251,17 @@ GitHub Actions with dtolnay/rust-toolchain + Swatinem/rust-cache. Run locally wi
 - `deny` - cargo-deny for license/advisory/source audits
 
 ## Skills (Claude Code skills, not oven commands)
-- `/cook` - interactive issue design (scaffolded into .claude/skills/ by `oven prep`)
-- `/refine` - codebase audit (scaffolded into .claude/skills/ by `oven prep`)
+- `/cook` - interactive issue design. Researches the codebase, asks targeted questions, drafts an implementation-ready issue, creates it via `gh issue create` or `oven ticket create` depending on `issue_source` config. Scaffolded into `.claude/skills/` by `oven prep`.
+- `/refine` - codebase audit across 6 dimensions (security, errors, patterns, tests, data, dependencies). Produces a prioritized findings report and offers to create issues from critical/high findings. Scaffolded by `oven prep`.
 
 ## GitHub Action
-JS/TS action (not Docker). GitHub App auth, SHA-pinned deps, per-issue concurrency groups. See DECISIONS.md for full details.
+JS/TS action in `action/` directory, compiled to a single `dist/index.js` via `@vercel/ncc`. Node 20 runtime (action.yml), Node >= 23 for development (engines in package.json).
+
+- Triggers on `issues: [labeled]` (filters to `o-ready` only) and `workflow_dispatch` with issue number input
+- Per-issue concurrency groups prevent duplicate runs
+- GitHub App auth via `actions/create-github-app-token` (short-lived tokens, bot identity)
+- Installs oven (cargo install or pre-built binary) and claude CLI (npm)
+- Runs `oven on <issue-number>`, posts summary comment on the issue
+- Outputs: `run-id`, `status`, `cost`, `pr-number`
+- SIGTERM handler for graceful shutdown
+- See `action/README.md` for consumer setup
