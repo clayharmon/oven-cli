@@ -32799,6 +32799,21 @@ async function run() {
         ANTHROPIC_API_KEY: anthropicKey,
         GH_TOKEN: ghToken,
     };
+    // Configure git identity from the authenticated token so oven can make
+    // commits (e.g. the seed empty commit before PR creation). Works for both
+    // GitHub App tokens (bot identity) and PATs (user identity).
+    const octokit = github.getOctokit(ghToken);
+    const { data: authUser } = await octokit.rest.users.getAuthenticated();
+    await exec.exec("git", [
+        "config",
+        "user.name",
+        authUser.login,
+    ]);
+    await exec.exec("git", [
+        "config",
+        "user.email",
+        `${authUser.id}+${authUser.login}@users.noreply.github.com`,
+    ]);
     // Run oven prep if recipe.toml doesn't exist
     try {
         await exec.exec("test", ["-f", "recipe.toml"]);
@@ -32848,8 +32863,6 @@ async function run() {
         prNumber: parsed.prNumber ?? "",
     };
     // Post summary comment on the issue
-    const token = core.getInput("github-token");
-    const octokit = github.getOctokit(token);
     const { owner, repo } = github.context.repo;
     const body = status === "complete"
         ? `Oven pipeline completed successfully.\n\n- Run ID: \`${result.runId}\`\n- Cost: $${result.cost}\n- PR: #${result.prNumber}`
