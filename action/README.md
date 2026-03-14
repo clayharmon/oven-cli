@@ -51,9 +51,11 @@ jobs:
 | `anthropic-api-key` | yes | | Anthropic API key |
 | `github-token` | yes | | GitHub token (from github-app-token action or GITHUB_TOKEN) |
 | `oven-version` | no | `latest` | Version of oven to install |
+| `claude-version` | no | `latest` | Version of @anthropic-ai/claude-code to install |
 | `auto-merge` | no | `false` | Auto-merge PRs after pipeline completes |
-| `max-parallel` | no | `2` | Maximum parallel pipelines |
-| `cost-budget` | no | `10.0` | Maximum cost in USD per issue |
+| `max-parallel` | no | `2` | Maximum parallel pipelines (positive integer) |
+| `cost-budget` | no | `10.0` | Maximum cost in USD per issue (positive number) |
+| `allowed-associations` | no | `OWNER,MEMBER,COLLABORATOR` | Comma-separated author_association values allowed to trigger the pipeline |
 
 ## Outputs
 

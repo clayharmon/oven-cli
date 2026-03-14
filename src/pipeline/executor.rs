@@ -316,12 +316,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
         git::force_push_branch(worktree_path, &ctx.branch).await?;
 
-        // 4. Merge
-        self.check_cancelled()?;
-        ctx.pr_number.context("no PR number for merge step")?;
-        self.update_status(run_id, RunStatus::Merging).await?;
-        let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
-        self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
+        // 4. Merge (only when auto-merge is enabled)
+        if auto_merge {
+            self.check_cancelled()?;
+            ctx.pr_number.context("no PR number for merge step")?;
+            self.update_status(run_id, RunStatus::Merging).await?;
+            let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
+            self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
+        }
 
         Ok(())
     }
@@ -332,7 +334,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
     ) -> Result<bool> {
-        for cycle in 1..=2 {
+        for cycle in 1..=3 {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
@@ -368,7 +370,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
             info!(run_id = %run_id, cycle, findings = actionable.len(), "review found issues");
 
-            if cycle == 2 {
+            if cycle == 3 {
                 if let Some(pr_number) = ctx.pr_number {
                     let comment = format_unresolved_comment(&actionable);
                     github::safe_comment(&self.github, pr_number, &comment).await;
@@ -529,7 +531,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 }
 
 fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
-    let mut comment = String::from("## Unresolved findings after 2 review cycles\n\n");
+    let mut comment = String::from("## Unresolved findings after max review cycles\n\n");
     for f in actionable {
         let loc = match (&f.file_path, f.line_number) {
             (Some(path), Some(line)) => format!(" at `{path}:{line}`"),

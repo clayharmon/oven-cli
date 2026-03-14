@@ -20,7 +20,7 @@ vi.mock("@actions/github", () => ({
     eventName: "issues",
     payload: {
       label: { name: "o-ready" },
-      issue: { number: 42 },
+      issue: { number: 42, author_association: "OWNER" },
     },
     repo: { owner: "test-owner", repo: "test-repo" },
   },
@@ -90,6 +90,7 @@ describe("run", () => {
         "auto-merge": "false",
         "max-parallel": "2",
         "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
       };
       return inputs[name] ?? "";
     });
@@ -111,7 +112,7 @@ describe("run", () => {
         eventName: "issues",
         payload: {
           label: { name: "o-ready" },
-          issue: { number: 10 },
+          issue: { number: 10, author_association: "OWNER" },
         },
         repo: { owner: "test", repo: "test" },
       },
@@ -125,6 +126,7 @@ describe("run", () => {
         "auto-merge": "false",
         "max-parallel": "2",
         "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
       };
       return inputs[name] ?? "";
     });
@@ -139,5 +141,236 @@ describe("run", () => {
     expect(core.setSecret).toHaveBeenCalledWith("ghp_test");
     // Secrets should NOT be exported globally via core.exportVariable
     expect(core.exportVariable).not.toHaveBeenCalled();
+  });
+
+  it("rejects issues from untrusted authors", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "NONE" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "allowed-associations") return "OWNER,MEMBER,COLLABORATOR";
+      return "";
+    });
+
+    const { run } = await import("../src/run");
+    const result = await run();
+    expect(result.status).toBe("skipped");
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining("not in allowed list"),
+    );
+  });
+
+  it("accepts issues from collaborators", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "COLLABORATOR" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "2",
+        "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const exec = await import("@actions/exec");
+    vi.mocked(exec.exec).mockResolvedValue(0);
+
+    const { run } = await import("../src/run");
+    const result = await run();
+    expect(result.status).toBe("complete");
+  });
+
+  it("accepts custom allowed-associations including CONTRIBUTOR", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "CONTRIBUTOR" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "2",
+        "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const exec = await import("@actions/exec");
+    vi.mocked(exec.exec).mockResolvedValue(0);
+
+    const { run } = await import("../src/run");
+    const result = await run();
+    expect(result.status).toBe("complete");
+  });
+
+  it("skips author check for workflow_dispatch events", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "workflow_dispatch",
+        payload: {
+          inputs: { "issue-number": "99" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "2",
+        "cost-budget": "10.0",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const exec = await import("@actions/exec");
+    vi.mocked(exec.exec).mockResolvedValue(0);
+
+    const { run } = await import("../src/run");
+    const result = await run();
+    expect(result.status).toBe("complete");
+  });
+
+  it("rejects non-numeric max-parallel", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "OWNER" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "abc",
+        "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const { run } = await import("../src/run");
+    await expect(run()).rejects.toThrow("Invalid max-parallel");
+  });
+
+  it("rejects zero max-parallel", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "OWNER" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "0",
+        "cost-budget": "10.0",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const { run } = await import("../src/run");
+    await expect(run()).rejects.toThrow("Invalid max-parallel");
+  });
+
+  it("rejects non-numeric cost-budget", async () => {
+    const github = await import("@actions/github");
+    const core = await import("@actions/core");
+
+    Object.defineProperty(github, "context", {
+      value: {
+        eventName: "issues",
+        payload: {
+          label: { name: "o-ready" },
+          issue: { number: 42, author_association: "OWNER" },
+        },
+        repo: { owner: "test", repo: "test" },
+      },
+      writable: true,
+    });
+
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        "anthropic-api-key": "test-key",
+        "github-token": "test-token",
+        "auto-merge": "false",
+        "max-parallel": "2",
+        "cost-budget": "abc",
+        "allowed-associations": "OWNER,MEMBER,COLLABORATOR",
+      };
+      return inputs[name] ?? "";
+    });
+
+    const { run } = await import("../src/run");
+    await expect(run()).rejects.toThrow("Invalid cost-budget");
   });
 });

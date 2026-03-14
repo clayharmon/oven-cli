@@ -18,7 +18,7 @@ struct MergerPrompt<'a> {
 fn shell_escape(s: &str) -> String {
     s.chars()
         .filter_map(|c| match c {
-            '"' | '\\' | '$' | '`' | '!' | '\'' => {
+            '"' | '\\' | '$' | '`' | '!' => {
                 let mut escaped = String::with_capacity(2);
                 escaped.push('\\');
                 escaped.push(c);
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_escapes_single_quotes() {
-        assert_eq!(shell_escape("it's"), r"it\'s");
+    fn shell_escape_preserves_single_quotes() {
+        assert_eq!(shell_escape("it's"), "it's");
     }
 }

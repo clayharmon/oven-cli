@@ -93,6 +93,7 @@ fn parse_issue_ids(ids: &str) -> Result<Vec<u32>> {
 }
 
 fn spawn_detached(project_dir: &std::path::Path, args: &OnArgs, run_id: &str) -> Result<()> {
+    use std::io::Write;
     let exe = std::env::current_exe().context("finding current executable")?;
 
     let mut cmd_args = vec!["on".to_string()];
@@ -120,7 +121,32 @@ fn spawn_detached(project_dir: &std::path::Path, args: &OnArgs, run_id: &str) ->
         .context("spawning detached process")?;
 
     let pid_path = project_dir.join(".oven").join("oven.pid");
-    std::fs::write(&pid_path, child.id().to_string()).context("writing PID file")?;
+    match std::fs::File::create_new(&pid_path) {
+        Ok(mut f) => {
+            write!(f, "{}", child.id()).context("writing PID file")?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Check if the existing PID is still alive
+            if let Ok(existing) = std::fs::read_to_string(&pid_path) {
+                if let Ok(existing_pid) = existing.trim().parse::<u32>() {
+                    let alive = std::process::Command::new("kill")
+                        .args(["-0", &existing_pid.to_string()])
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if alive {
+                        anyhow::bail!(
+                            "oven is already running (pid {existing_pid}). Use 'oven off' to stop it."
+                        );
+                    }
+                }
+            }
+            // Stale PID file, remove and retry
+            std::fs::remove_file(&pid_path).ok();
+            let mut f = std::fs::File::create_new(&pid_path).context("writing PID file")?;
+            write!(f, "{}", child.id()).context("writing PID to file")?;
+        }
+        Err(e) => return Err(e).context("creating PID file"),
+    }
 
     println!("{run_id}");
     Ok(())

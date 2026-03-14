@@ -138,9 +138,8 @@ pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
 ///
 /// Used after rebasing a pipeline branch onto the updated base branch.
 pub async fn force_push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
-    run_git(repo_dir, &["push", "--force-with-lease", "origin", branch])
-        .await
-        .context("force-pushing branch")?;
+    let lease = format!("--force-with-lease=refs/heads/{branch}");
+    run_git(repo_dir, &["push", &lease, "origin", branch]).await.context("force-pushing branch")?;
     Ok(())
 }
 
