@@ -316,12 +316,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
         git::force_push_branch(worktree_path, &ctx.branch).await?;
 
-        // 4. Merge
-        self.check_cancelled()?;
-        ctx.pr_number.context("no PR number for merge step")?;
-        self.update_status(run_id, RunStatus::Merging).await?;
-        let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
-        self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
+        // 4. Merge (only when auto-merge is enabled)
+        if auto_merge {
+            self.check_cancelled()?;
+            ctx.pr_number.context("no PR number for merge step")?;
+            self.update_status(run_id, RunStatus::Merging).await?;
+            let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
+            self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
+        }
 
         Ok(())
     }
