@@ -123,6 +123,14 @@ oven ticket close 1
 
 Tickets are markdown files in `.oven/issues/`. Oven picks them up the same way it picks up GitHub issues. PRs still go to GitHub.
 
+## Skills
+
+`oven prep` scaffolds Claude Code skills into `.claude/skills/` for use alongside your normal development workflow.
+
+**`/cook`** -- Interactive issue design. Researches your codebase, asks targeted clarifying questions, and produces an implementation-ready issue that an agent with zero prior context can pick up. Creates the issue via `gh issue create` or `oven ticket create` depending on your `issue_source` config.
+
+**`/refine`** -- Codebase audit across six dimensions: security, error handling, patterns, test gaps, data issues, and dependencies. Runs static analysis tools, performs manual code review, and produces a prioritized findings report. Offers to generate issues from critical and high findings.
+
 ---
 
 Built with Rust.
