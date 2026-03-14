@@ -11,6 +11,18 @@ pub async fn run(_global: &GlobalOpts) -> Result<()> {
         .context("no detached process found (missing .oven/oven.pid)")?;
     let pid = pid_str.trim().parse::<u32>().context("invalid PID in .oven/oven.pid")?;
 
+    // Verify the PID belongs to an oven process before killing
+    let comm_output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .context("checking process identity")?;
+    let comm = String::from_utf8_lossy(&comm_output.stdout).trim().to_string();
+    if !comm_output.status.success() || !comm.contains("oven") {
+        tracing::warn!(pid, comm = %comm, "PID is not an oven process, removing stale PID file");
+        std::fs::remove_file(&pid_path).ok();
+        anyhow::bail!("PID {pid} is not an oven process (found: {comm}). Removed stale PID file.");
+    }
+
     // Send SIGTERM via the kill command (avoids unsafe libc calls)
     let status = std::process::Command::new("kill")
         .arg("-TERM")
@@ -19,17 +31,27 @@ pub async fn run(_global: &GlobalOpts) -> Result<()> {
         .context("sending SIGTERM")?;
 
     if !status.success() {
-        // Process might already be dead, which is fine
         tracing::warn!(pid, "kill returned non-zero (process may already be stopped)");
     }
 
     // Wait briefly for the process to exit
+    let mut exited = false;
     for _ in 0..50 {
         let check = std::process::Command::new("kill").arg("-0").arg(pid.to_string()).status();
         match check {
-            Ok(s) if !s.success() => break, // process gone
+            Ok(s) if !s.success() => {
+                exited = true;
+                break;
+            }
             _ => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
+    }
+
+    // SIGKILL fallback if process didn't respond to SIGTERM
+    if !exited {
+        tracing::warn!(pid, "process did not exit after SIGTERM, sending SIGKILL");
+        let _ = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     std::fs::remove_file(&pid_path).ok();
