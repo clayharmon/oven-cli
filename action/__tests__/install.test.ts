@@ -66,6 +66,39 @@ describe("install", () => {
     );
   });
 
+  it("installClaude rejects registry redirection in version", async () => {
+    const { installClaude } = await import("../src/install");
+    await expect(
+      installClaude("1.0.0 --registry https://evil.com"),
+    ).rejects.toThrow("Invalid claude-version");
+  });
+
+  it("installClaude rejects path traversal in version", async () => {
+    const { installClaude } = await import("../src/install");
+    await expect(installClaude("../../evil")).rejects.toThrow(
+      "Invalid claude-version",
+    );
+  });
+
+  it("installClaude rejects shell metacharacters in version", async () => {
+    const { installClaude } = await import("../src/install");
+    await expect(installClaude("; rm -rf /")).rejects.toThrow(
+      "Invalid claude-version",
+    );
+  });
+
+  it("installClaude accepts valid prerelease version", async () => {
+    const exec = await import("@actions/exec");
+    const { installClaude } = await import("../src/install");
+
+    await installClaude("1.0.0-beta.1");
+    expect(exec.exec).toHaveBeenCalledWith("npm", [
+      "install",
+      "-g",
+      "@anthropic-ai/claude-code@1.0.0-beta.1",
+    ]);
+  });
+
   it("verifyInstallation calls both --version commands", async () => {
     const exec = await import("@actions/exec");
     const { verifyInstallation } = await import("../src/install");

@@ -75,7 +75,16 @@ export async function installOven(version: string): Promise<string> {
   }
 }
 
+function validateClaudeVersion(version: string | undefined): void {
+  if (version && !SEMVER_RE.test(version)) {
+    throw new Error(
+      `Invalid claude-version "${version}": must be a valid semver (e.g. "1.0.5") or empty for latest`,
+    );
+  }
+}
+
 export async function installClaude(claudeVersion?: string): Promise<void> {
+  validateClaudeVersion(claudeVersion);
   const pkg = claudeVersion
     ? `@anthropic-ai/claude-code@${claudeVersion}`
     : "@anthropic-ai/claude-code";
