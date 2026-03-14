@@ -36,6 +36,67 @@ function getIssueNumber(): number | null {
   return null;
 }
 
+const VALID_ASSOCIATIONS = new Set([
+  "OWNER",
+  "MEMBER",
+  "COLLABORATOR",
+  "CONTRIBUTOR",
+  "FIRST_TIME_CONTRIBUTOR",
+  "FIRST_TIMER",
+  "NONE",
+]);
+
+function isAuthorAllowed(): boolean {
+  const context = github.context;
+
+  // workflow_dispatch already requires repo write access, no need to gate
+  if (context.eventName !== "issues") {
+    return true;
+  }
+
+  const association: string =
+    (context.payload.issue?.author_association as string) ?? "NONE";
+  const allowedInput =
+    core.getInput("allowed-associations") || "OWNER,MEMBER,COLLABORATOR";
+  const allowed = new Set(
+    allowedInput.split(",").map((s) => s.trim().toUpperCase()),
+  );
+
+  // Validate that all configured values are recognized GitHub associations
+  for (const value of allowed) {
+    if (!VALID_ASSOCIATIONS.has(value)) {
+      core.warning(
+        `Unrecognized author_association value in allowed-associations: "${value}"`,
+      );
+    }
+  }
+
+  if (!allowed.has(association.toUpperCase())) {
+    core.warning(
+      `Skipping: issue author_association "${association}" is not in allowed list [${[...allowed].join(", ")}]`,
+    );
+    return false;
+  }
+
+  return true;
+}
+
+function validateMaxParallel(value: string): void {
+  if (!/^\d+$/.test(value) || parseInt(value, 10) < 1) {
+    throw new Error(
+      `Invalid max-parallel "${value}": must be a positive integer`,
+    );
+  }
+}
+
+function validateCostBudget(value: string): void {
+  if (!/^\d+(\.\d+)?$/.test(value) || parseFloat(value) <= 0) {
+    throw new Error(
+      `Invalid cost-budget "${value}": must be a positive number`,
+    );
+  }
+}
+
 function parseOvenReport(output: string): Partial<RunResult> {
   const result: Partial<RunResult> = {};
 
@@ -67,9 +128,15 @@ export async function run(): Promise<RunResult> {
     return { runId: "", status: "skipped", cost: "0", prNumber: "" };
   }
 
+  if (!isAuthorAllowed()) {
+    return { runId: "", status: "skipped", cost: "0", prNumber: "" };
+  }
+
   const autoMerge = core.getInput("auto-merge") === "true";
   const maxParallel = core.getInput("max-parallel");
   const costBudget = core.getInput("cost-budget");
+  validateMaxParallel(maxParallel);
+  validateCostBudget(costBudget);
 
   // Mask secrets so they don't appear in logs. Do NOT use core.exportVariable
   // which persists secrets to $GITHUB_ENV, making them available to all

@@ -24,6 +24,9 @@ inputs:
   cost-budget:
     description: 'Maximum cost in USD per issue'
     default: '10.0'
+  allowed-associations:
+    description: 'Comma-separated author_association values allowed to trigger the pipeline (e.g. OWNER,MEMBER,COLLABORATOR)'
+    default: 'OWNER,MEMBER,COLLABORATOR'
 
 outputs:
   run-id:
