@@ -134,6 +134,34 @@ pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Force-push a branch to origin using `--force-with-lease` for safety.
+///
+/// Used after rebasing a pipeline branch onto the updated base branch.
+pub async fn force_push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
+    run_git(repo_dir, &["push", "--force-with-lease", "origin", branch])
+        .await
+        .context("force-pushing branch")?;
+    Ok(())
+}
+
+/// Rebase the current branch onto the latest `origin/<base_branch>`.
+///
+/// Fetches the base branch first, then attempts a rebase. If the rebase fails
+/// (merge conflicts), it aborts the rebase and returns an error.
+pub async fn rebase_on_base(repo_dir: &Path, base_branch: &str) -> Result<()> {
+    run_git(repo_dir, &["fetch", "origin", base_branch])
+        .await
+        .context("fetching base branch before rebase")?;
+
+    let target = format!("origin/{base_branch}");
+    if run_git(repo_dir, &["rebase", &target]).await.is_ok() {
+        return Ok(());
+    }
+
+    let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
+    anyhow::bail!("merge conflicts with {base_branch} that could not be automatically resolved")
+}
+
 /// Get the default branch name (main or master).
 pub async fn default_branch(repo_dir: &Path) -> Result<String> {
     // Try symbolic-ref first
@@ -269,5 +297,107 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = list_worktrees(dir.path()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rebase_on_base_clean() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Create a feature branch with a non-conflicting change
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("feature.txt"), "feature work").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature commit"]).await.unwrap();
+
+        // Add a non-conflicting commit on the base branch
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("base.txt"), "base work").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base commit"]).await.unwrap();
+
+        // Go back to feature branch and rebase
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+
+        // rebase_on_base fetches from origin, so we need a remote.
+        // Use the repo itself as origin for testing.
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let result = rebase_on_base(dir.path(), &branch).await;
+        assert!(result.is_ok());
+
+        // Verify both files exist after rebase
+        assert!(dir.path().join("feature.txt").exists());
+        assert!(dir.path().join("base.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn rebase_on_base_conflict_aborts() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Create a feature branch with a conflicting change to README.md
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "feature version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature conflict"]).await.unwrap();
+
+        // Add a conflicting commit on the base branch
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "base version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base conflict"]).await.unwrap();
+
+        // Go back to feature and set up origin
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let result = rebase_on_base(dir.path(), &branch).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("merge conflicts"),
+            "error should mention merge conflicts"
+        );
+
+        // Verify rebase was aborted (no .git/rebase-merge directory)
+        assert!(!dir.path().join(".git/rebase-merge").exists());
+    }
+
+    #[tokio::test]
+    async fn force_push_branch_works() {
+        let dir = init_temp_repo().await;
+
+        // Set up a bare remote to push to
+        let remote_dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", "--bare", &dir.path().to_string_lossy(), "."])
+            .current_dir(remote_dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        run_git(dir.path(), &["remote", "add", "origin", &remote_dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        // Create a branch, push it, then amend and force-push
+        run_git(dir.path(), &["checkout", "-b", "test-branch"]).await.unwrap();
+        tokio::fs::write(dir.path().join("new.txt"), "v1").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "v1"]).await.unwrap();
+        push_branch(dir.path(), "test-branch").await.unwrap();
+
+        // Amend the commit (simulating a rebase)
+        tokio::fs::write(dir.path().join("new.txt"), "v2").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "--amend", "-m", "v2"]).await.unwrap();
+
+        // Regular push should fail, force push should succeed
+        assert!(push_branch(dir.path(), "test-branch").await.is_err());
+        assert!(force_push_branch(dir.path(), "test-branch").await.is_ok());
     }
 }

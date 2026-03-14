@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, de::DeserializeOwned};
 
-use crate::{db::ReviewFinding, process::CommandRunner};
+use crate::{db::ReviewFinding, issues::PipelineIssue, process::CommandRunner};
 
 /// The five agent roles in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,6 +85,9 @@ pub struct AgentContext {
     /// Issue source: "github" or "local". The merger skips `gh issue close`
     /// for local issues since they're not on GitHub.
     pub issue_source: String,
+    /// The default branch name (e.g. "main" or "master"). Used by the merger
+    /// to diff against the correct base.
+    pub base_branch: String,
 }
 
 /// An invocation ready to be sent to the process runner.
@@ -135,6 +138,46 @@ impl std::str::FromStr for Complexity {
             "simple" => Ok(Self::Simple),
             "full" => Ok(Self::Full),
             other => anyhow::bail!("unknown complexity: {other}"),
+        }
+    }
+}
+
+/// Metadata about an issue currently running through the pipeline.
+///
+/// Passed to the planner so it can reason about conflicts with in-flight work.
+#[derive(Debug, Clone)]
+pub struct InFlightIssue {
+    pub number: u32,
+    pub title: String,
+    pub area: String,
+    pub predicted_files: Vec<String>,
+    pub has_migration: bool,
+    pub complexity: Complexity,
+}
+
+impl From<&PlannedIssue> for InFlightIssue {
+    fn from(pi: &PlannedIssue) -> Self {
+        Self {
+            number: pi.number,
+            title: pi.title.clone(),
+            area: pi.area.clone(),
+            predicted_files: pi.predicted_files.clone(),
+            has_migration: pi.has_migration,
+            complexity: pi.complexity.clone(),
+        }
+    }
+}
+
+impl InFlightIssue {
+    /// Fallback constructor when the planner hasn't classified this issue.
+    pub fn from_issue(issue: &PipelineIssue) -> Self {
+        Self {
+            number: issue.number,
+            title: issue.title.clone(),
+            area: String::new(),
+            predicted_files: Vec::new(),
+            has_migration: false,
+            complexity: Complexity::Full,
         }
     }
 }

@@ -256,9 +256,9 @@ async fn setup_git_repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) 
         .await
         .unwrap();
 
-    // Init working repo
+    // Init working repo with explicit main branch (CI may default to master)
     tokio::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(work_dir.path())
         .output()
         .await

@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
     agents::{
-        self, AgentContext, AgentInvocation, AgentRole, Complexity, PlannerOutput, Severity,
-        invoke_agent, parse_planner_output, parse_review_output,
+        self, AgentContext, AgentInvocation, AgentRole, Complexity, InFlightIssue, PlannerOutput,
+        Severity, invoke_agent, parse_planner_output, parse_review_output,
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
@@ -95,9 +95,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             cycle: 1,
             target_repo: if is_multi_repo { issue.target_repo.clone() } else { None },
             issue_source: issue.source.as_str().to_string(),
+            base_branch: base_branch.clone(),
         };
 
-        let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge).await;
+        let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch).await;
         self.finalize_run(&run_id, issue, pr_number, &result).await?;
 
         if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
@@ -109,9 +110,16 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
     /// Invoke the planner agent to decide batching and complexity for a set of issues.
     ///
+    /// `in_flight` describes issues currently running through the pipeline so the planner
+    /// can avoid scheduling conflicting work in batch 1.
+    ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
-    pub async fn plan_issues(&self, issues: &[PipelineIssue]) -> Option<PlannerOutput> {
-        let prompt = match agents::planner::build_prompt(issues) {
+    pub async fn plan_issues(
+        &self,
+        issues: &[PipelineIssue],
+        in_flight: &[InFlightIssue],
+    ) -> Option<PlannerOutput> {
+        let prompt = match agents::planner::build_prompt(issues, in_flight) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "planner prompt build failed");
@@ -272,6 +280,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
         auto_merge: bool,
+        base_branch: &str,
     ) -> Result<()> {
         self.check_cancelled()?;
 
@@ -289,7 +298,25 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             anyhow::bail!("unresolved findings after max review cycles");
         }
 
-        // 3. Merge
+        // 3. Rebase onto base branch to resolve any conflicts from parallel merges
+        self.check_cancelled()?;
+        info!(run_id = %run_id, base = base_branch, "rebasing onto base branch");
+        if let Err(e) = git::rebase_on_base(worktree_path, base_branch).await {
+            if let Some(pr_number) = ctx.pr_number {
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format!(
+                        "Pipeline stopped: {e}\n\nPlease rebase manually and re-run the pipeline."
+                    ),
+                )
+                .await;
+            }
+            return Err(e);
+        }
+        git::force_push_branch(worktree_path, &ctx.branch).await?;
+
+        // 4. Merge
         self.check_cancelled()?;
         ctx.pr_number.context("no PR number for merge step")?;
         self.update_status(run_id, RunStatus::Merging).await?;
