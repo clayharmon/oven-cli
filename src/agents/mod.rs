@@ -85,6 +85,9 @@ pub struct AgentContext {
     /// Issue source: "github" or "local". The merger skips `gh issue close`
     /// for local issues since they're not on GitHub.
     pub issue_source: String,
+    /// The default branch name (e.g. "main" or "master"). Used by the merger
+    /// to diff against the correct base.
+    pub base_branch: String,
 }
 
 /// An invocation ready to be sent to the process runner.

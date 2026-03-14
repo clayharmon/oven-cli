@@ -95,6 +95,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             cycle: 1,
             target_repo: if is_multi_repo { issue.target_repo.clone() } else { None },
             issue_source: issue.source.as_str().to_string(),
+            base_branch: base_branch.clone(),
         };
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch).await;

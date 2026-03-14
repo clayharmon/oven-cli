@@ -31,6 +31,7 @@ mod tests {
             cycle: 1,
             target_repo: None,
             issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
         }
     }
 

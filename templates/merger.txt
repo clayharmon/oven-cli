@@ -15,7 +15,7 @@ are handled before this agent runs). Do NOT re-run the full test suite.
 Get the full diff and write a proper PR description:
 
 ```
-git diff main --stat
+git diff {{ ctx.base_branch }} --stat
 ```
 
 Update the PR with a summary of changes, using conventional commit format for the title:
@@ -55,7 +55,7 @@ gh pr merge {{ pr_number }} --squash --delete-branch
 After merging:
 
 ```
-git checkout main
+git checkout {{ ctx.base_branch }}
 git pull
 ```
 {% if ctx.target_repo.is_none() && ctx.issue_source == "github" %}
