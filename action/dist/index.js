@@ -32657,7 +32657,13 @@ async function installOven(version) {
         return version;
     }
 }
+function validateClaudeVersion(version) {
+    if (version && !SEMVER_RE.test(version)) {
+        throw new Error(`Invalid claude-version "${version}": must be a valid semver (e.g. "1.0.5") or empty for latest`);
+    }
+}
 async function installClaude(claudeVersion) {
+    validateClaudeVersion(claudeVersion);
     const pkg = claudeVersion
         ? `@anthropic-ai/claude-code@${claudeVersion}`
         : "@anthropic-ai/claude-code";
@@ -32759,6 +32765,46 @@ function getIssueNumber() {
     core.warning(`Unexpected event: ${context.eventName}`);
     return null;
 }
+const VALID_ASSOCIATIONS = new Set([
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIME_CONTRIBUTOR",
+    "FIRST_TIMER",
+    "NONE",
+]);
+function isAuthorAllowed() {
+    const context = github.context;
+    // workflow_dispatch already requires repo write access, no need to gate
+    if (context.eventName !== "issues") {
+        return true;
+    }
+    const association = context.payload.issue?.author_association ?? "NONE";
+    const allowedInput = core.getInput("allowed-associations") || "OWNER,MEMBER,COLLABORATOR";
+    const allowed = new Set(allowedInput.split(",").map((s) => s.trim().toUpperCase()));
+    // Validate that all configured values are recognized GitHub associations
+    for (const value of allowed) {
+        if (!VALID_ASSOCIATIONS.has(value)) {
+            core.warning(`Unrecognized author_association value in allowed-associations: "${value}"`);
+        }
+    }
+    if (!allowed.has(association.toUpperCase())) {
+        core.warning(`Skipping: issue author_association "${association}" is not in allowed list [${[...allowed].join(", ")}]`);
+        return false;
+    }
+    return true;
+}
+function validateMaxParallel(value) {
+    if (!/^\d+$/.test(value) || parseInt(value, 10) < 1) {
+        throw new Error(`Invalid max-parallel "${value}": must be a positive integer`);
+    }
+}
+function validateCostBudget(value) {
+    if (!/^\d+(\.\d+)?$/.test(value) || parseFloat(value) <= 0) {
+        throw new Error(`Invalid cost-budget "${value}": must be a positive number`);
+    }
+}
 function parseOvenReport(output) {
     const result = {};
     // Parse run ID from oven output (format: "run <id>")
@@ -32784,9 +32830,14 @@ async function run() {
         core.info("No issue to process, exiting");
         return { runId: "", status: "skipped", cost: "0", prNumber: "" };
     }
+    if (!isAuthorAllowed()) {
+        return { runId: "", status: "skipped", cost: "0", prNumber: "" };
+    }
     const autoMerge = core.getInput("auto-merge") === "true";
     const maxParallel = core.getInput("max-parallel");
     const costBudget = core.getInput("cost-budget");
+    validateMaxParallel(maxParallel);
+    validateCostBudget(costBudget);
     // Mask secrets so they don't appear in logs. Do NOT use core.exportVariable
     // which persists secrets to $GITHUB_ENV, making them available to all
     // subsequent steps (including third-party actions).
