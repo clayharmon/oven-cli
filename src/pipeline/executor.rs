@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
     agents::{
-        self, AgentContext, AgentInvocation, AgentRole, Complexity, PlannerOutput, Severity,
-        invoke_agent, parse_planner_output, parse_review_output,
+        self, AgentContext, AgentInvocation, AgentRole, Complexity, InFlightIssue, PlannerOutput,
+        Severity, invoke_agent, parse_planner_output, parse_review_output,
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
@@ -109,9 +109,16 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
     /// Invoke the planner agent to decide batching and complexity for a set of issues.
     ///
+    /// `in_flight` describes issues currently running through the pipeline so the planner
+    /// can avoid scheduling conflicting work in batch 1.
+    ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
-    pub async fn plan_issues(&self, issues: &[PipelineIssue]) -> Option<PlannerOutput> {
-        let prompt = match agents::planner::build_prompt(issues) {
+    pub async fn plan_issues(
+        &self,
+        issues: &[PipelineIssue],
+        in_flight: &[InFlightIssue],
+    ) -> Option<PlannerOutput> {
+        let prompt = match agents::planner::build_prompt(issues, in_flight) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "planner prompt build failed");
