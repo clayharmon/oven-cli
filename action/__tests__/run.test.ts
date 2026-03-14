@@ -26,6 +26,11 @@ vi.mock("@actions/github", () => ({
   },
   getOctokit: vi.fn().mockReturnValue({
     rest: {
+      users: {
+        getAuthenticated: vi.fn().mockResolvedValue({
+          data: { login: "test-app[bot]", id: 12345 },
+        }),
+      },
       issues: {
         createComment: vi.fn().mockResolvedValue({}),
       },
