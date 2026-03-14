@@ -62,14 +62,14 @@ mod tests {
     fn prompt_references_pr_number() {
         let prompt = build_prompt(&sample_context(), false).unwrap();
         assert!(prompt.contains("PR #99"));
-        assert!(prompt.contains("gh pr ready 99"));
+        assert!(prompt.contains("gh pr edit 99"));
         assert!(prompt.contains("#42"));
     }
 
     #[test]
     fn prompt_without_merge() {
         let prompt = build_prompt(&sample_context(), false).unwrap();
-        assert!(prompt.contains("gh pr ready 99"));
+        assert!(!prompt.contains("gh pr ready"));
         assert!(!prompt.contains("gh pr merge"));
     }
 

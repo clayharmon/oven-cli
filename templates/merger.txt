@@ -47,12 +47,13 @@ All tests passing.
 Automated by [oven](https://github.com/clayharmon/oven-cli)"
 ```
 
+{% if auto_merge %}
 ## Step 3: Mark PR Ready
 
 ```
 gh pr ready {{ pr_number }}
 ```
-{% if auto_merge %}
+
 ## Step 4: Merge
 
 ```
