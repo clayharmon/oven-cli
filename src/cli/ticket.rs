@@ -93,7 +93,11 @@ pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
                 anyhow::bail!("ticket #{} not found", edit_args.id);
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-            std::process::Command::new(&editor)
+            let mut parts = editor.split_whitespace();
+            let bin = parts.next().unwrap_or("vim");
+            let extra_args: Vec<&str> = parts.collect();
+            std::process::Command::new(bin)
+                .args(&extra_args)
                 .arg(&path)
                 .status()
                 .with_context(|| format!("opening {editor}"))?;
@@ -354,6 +358,32 @@ mod tests {
         let closed: Vec<_> = tickets.iter().filter(|t| t.status == "closed").collect();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].id, 2);
+    }
+
+    #[test]
+    fn editor_split_simple() {
+        let editor = "vim";
+        let mut parts = editor.split_whitespace();
+        assert_eq!(parts.next(), Some("vim"));
+        assert_eq!(parts.next(), None);
+    }
+
+    #[test]
+    fn editor_split_with_args() {
+        let editor = "code --wait";
+        let mut parts = editor.split_whitespace();
+        assert_eq!(parts.next(), Some("code"));
+        let args: Vec<&str> = parts.collect();
+        assert_eq!(args, vec!["--wait"]);
+    }
+
+    #[test]
+    fn editor_split_multiple_args() {
+        let editor = "emacs -nw --no-splash";
+        let mut parts = editor.split_whitespace();
+        assert_eq!(parts.next(), Some("emacs"));
+        let args: Vec<&str> = parts.collect();
+        assert_eq!(args, vec!["-nw", "--no-splash"]);
     }
 
     #[test]
