@@ -368,6 +368,8 @@ async fn apply_plan(
     deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
 ) {
     let (spawn_map, defer_list) = split_plan(plan, in_flight_numbers);
+    let issue_map: HashMap<u32, &PipelineIssue> =
+        new_issues.iter().map(|i| (i.number, i)).collect();
 
     for issue in new_issues {
         if let Some(metadata) = spawn_map.get(&issue.number) {
@@ -377,13 +379,13 @@ async fn apply_plan(
 
     let mut def_guard = deferred.lock().await;
     for (number, metadata, awaiting) in defer_list {
-        if let Some(issue) = new_issues.iter().find(|i| i.number == number) {
+        if let Some(issue) = issue_map.get(&number) {
             info!(
                 issue = number,
                 awaiting_count = awaiting.len(),
                 "deferring issue (waiting for dependencies)"
             );
-            def_guard.insert(number, DeferredIssue { issue: issue.clone(), metadata, awaiting });
+            def_guard.insert(number, DeferredIssue { issue: (*issue).clone(), metadata, awaiting });
         }
     }
 }
