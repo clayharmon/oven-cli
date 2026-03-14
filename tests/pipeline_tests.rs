@@ -1308,10 +1308,9 @@ async fn merger_never_runs_in_manual_mode() {
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline failed: {result:?}");
 
-    let called = agents_called.lock().unwrap();
     assert!(
-        !called.contains(&"merger".to_string()),
-        "merger must never be invoked in manual mode (auto_merge=false), but was called: {called:?}"
+        !agents_called.lock().unwrap().contains(&"merger".to_string()),
+        "merger must never be invoked in manual mode (auto_merge=false), but was called"
     );
 }
 
