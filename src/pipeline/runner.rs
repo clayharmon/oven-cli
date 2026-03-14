@@ -49,7 +49,6 @@ async fn run_batches_sequentially<R: CommandRunner + 'static>(
     auto_merge: bool,
 ) -> Result<()> {
     let issue_map: HashMap<u32, &PipelineIssue> = issues.iter().map(|i| (i.number, i)).collect();
-    let mut had_errors = false;
 
     for batch in &plan.batches {
         let batch_issues: Vec<PipelineIssue> = batch
@@ -69,16 +68,9 @@ async fn run_batches_sequentially<R: CommandRunner + 'static>(
             "starting batch"
         );
 
-        let batch_result =
-            run_single_batch(executor, batch_issues, &batch.issues, max_parallel, auto_merge).await;
-        if batch_result.is_err() {
-            had_errors = true;
-        }
+        run_single_batch(executor, batch_issues, &batch.issues, max_parallel, auto_merge).await?;
     }
 
-    if had_errors {
-        anyhow::bail!("one or more pipelines failed");
-    }
     Ok(())
 }
 
@@ -277,7 +269,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
                 total = plan.total_issues,
                 "planner produced a plan, spawning batch 1 only"
             );
-            extract_batch1(&plan, &new_issues)
+            extract_batch1(&plan)
         } else {
             warn!("planner failed, falling back to spawning all issues");
             let all: HashMap<u32, InFlightIssue> =
@@ -319,10 +311,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
 }
 
 /// Extract batch 1 issue numbers and their planner metadata from a planner output.
-fn extract_batch1(
-    plan: &PlannerOutput,
-    _issues: &[PipelineIssue],
-) -> (Vec<u32>, HashMap<u32, InFlightIssue>) {
+fn extract_batch1(plan: &PlannerOutput) -> (Vec<u32>, HashMap<u32, InFlightIssue>) {
     let mut batch1_numbers = Vec::new();
     let mut metadata_map = HashMap::new();
 
@@ -550,31 +539,7 @@ mod tests {
             parallel_capacity: 2,
         };
 
-        let issues = vec![
-            PipelineIssue {
-                number: 1,
-                title: "First".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 2,
-                title: "Second".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 3,
-                title: "Third".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-        ];
-
-        let (batch1_numbers, metadata_map) = extract_batch1(&plan, &issues);
+        let (batch1_numbers, metadata_map) = extract_batch1(&plan);
         assert_eq!(batch1_numbers, vec![1, 2]);
         assert!(!batch1_numbers.contains(&3));
         assert_eq!(metadata_map.get(&1).unwrap().complexity, Complexity::Simple);
@@ -587,7 +552,7 @@ mod tests {
     fn extract_batch1_empty_plan() {
         let plan =
             crate::agents::PlannerOutput { batches: vec![], total_issues: 0, parallel_capacity: 0 };
-        let (batch1, metadata) = extract_batch1(&plan, &[]);
+        let (batch1, metadata) = extract_batch1(&plan);
         assert!(batch1.is_empty());
         assert!(metadata.is_empty());
     }
