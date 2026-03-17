@@ -385,6 +385,7 @@ impl DependencyGraph {
                     predicted_files: node.predicted_files.clone(),
                     has_migration: node.has_migration,
                     depends_on,
+                    target_repo: node.target_repo.clone(),
                 })
             })
             .collect()

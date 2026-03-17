@@ -19,7 +19,8 @@ these. Only issues in "merged" state have their changes available on the base br
   state: {{ node.state }}
   area: {{ node.area }}
   predicted_files: {{ node.predicted_files.join(", ") }}
-  has_migration: {{ node.has_migration }}
+  has_migration: {{ node.has_migration }}{% if node.target_repo.is_some() %}
+  target_repo: {{ node.target_repo.as_deref().unwrap_or_default() }}{% endif %}
   depends_on: {% if node.depends_on.is_empty() %}(none){% else %}{% for d in node.depends_on %}#{{ d }}{% if !loop.last %}, {% endif %}{% endfor %}{% endif %}
 
 {% endfor -%}
