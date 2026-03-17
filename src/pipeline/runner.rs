@@ -61,6 +61,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
         let ready = graph.ready_issues();
         if ready.is_empty() {
             warn!("no ready issues but graph is not terminal, breaking to avoid infinite loop");
+            save_graph(&graph, executor).await;
             break;
         }
 
