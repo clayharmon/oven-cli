@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use super::executor::PipelineExecutor;
 use crate::{
-    agents::{GraphContextNode, InFlightIssue, PlannerGraphOutput, PlannerOutput},
+    agents::{GraphContextNode, InFlightIssue, PlannerGraphOutput},
     issues::PipelineIssue,
     process::CommandRunner,
 };
@@ -54,117 +54,92 @@ pub async fn run_batch<R: CommandRunner + 'static>(
     auto_merge: bool,
 ) -> Result<()> {
     if let Some(plan) = executor.plan_issues(&issues, &[]).await {
-        info!(
-            nodes = plan.nodes.len(),
-            total = plan.total_issues,
-            "planner produced a plan, converting to batch execution"
-        );
-        let legacy = graph_output_to_legacy(&plan);
-        run_batches_sequentially(executor, &issues, &legacy, max_parallel, auto_merge).await
+        info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
+        run_dag_layers(executor, &issues, &plan, max_parallel, auto_merge).await
     } else {
         warn!("planner failed, falling back to all-parallel execution");
         run_issues_parallel(executor, issues, None, max_parallel, auto_merge).await
     }
 }
 
-/// Convert a DAG planner output into legacy batch format for sequential execution.
+/// Compute topological layers from a DAG: nodes with no unsatisfied dependencies form
+/// layer 1, nodes depending only on layer 1 form layer 2, etc.
 ///
-/// Uses a topological sort to group nodes into dependency layers. Nodes with
-/// no unsatisfied dependencies go in batch 1, nodes depending only on batch 1
-/// go in batch 2, etc.
-fn graph_output_to_legacy(plan: &PlannerGraphOutput) -> PlannerOutput {
+/// Each layer is a vec of `PlannedNode` references. Nodes with unresolvable dependencies
+/// (cycles or missing nodes) are forced into the final layer.
+fn topological_layers(plan: &PlannerGraphOutput) -> Vec<Vec<&crate::agents::PlannedNode>> {
     use std::collections::VecDeque;
 
-    let mut batches = Vec::new();
+    let mut layers = Vec::new();
     let mut assigned: HashSet<u32> = HashSet::new();
     let mut remaining: VecDeque<&crate::agents::PlannedNode> = plan.nodes.iter().collect();
-    let mut batch_num = 0u32;
 
     while !remaining.is_empty() {
-        batch_num += 1;
-        let mut current_batch = Vec::new();
+        let mut current_layer = Vec::new();
         let mut next_remaining = VecDeque::new();
 
         for node in remaining {
             if node.depends_on.iter().all(|d| assigned.contains(d)) {
-                current_batch.push(node);
+                current_layer.push(node);
             } else {
                 next_remaining.push_back(node);
             }
         }
 
-        if current_batch.is_empty() {
-            // Remaining nodes have unresolvable deps, force them into final batch
+        if current_layer.is_empty() {
+            // Remaining nodes have unresolvable deps, force them into final layer
             for node in next_remaining {
-                current_batch.push(node);
+                current_layer.push(node);
             }
             next_remaining = VecDeque::new();
         }
 
-        for node in &current_batch {
+        for node in &current_layer {
             assigned.insert(node.number);
         }
 
-        batches.push(crate::agents::Batch {
-            batch: batch_num,
-            issues: current_batch
-                .iter()
-                .map(|n| crate::agents::PlannedIssue {
-                    number: n.number,
-                    title: n.title.clone(),
-                    area: n.area.clone(),
-                    predicted_files: n.predicted_files.clone(),
-                    has_migration: n.has_migration,
-                    complexity: n.complexity.clone(),
-                })
-                .collect(),
-            reasoning: current_batch.first().map_or_else(String::new, |n| n.reasoning.clone()),
-        });
-
+        layers.push(current_layer);
         remaining = next_remaining;
     }
 
-    PlannerOutput {
-        batches,
-        total_issues: plan.total_issues,
-        parallel_capacity: plan.parallel_capacity,
-    }
+    layers
 }
 
-/// Run planner batches in sequence: wait for batch N to complete before starting batch N+1.
-/// Issues within each batch run in parallel.
-async fn run_batches_sequentially<R: CommandRunner + 'static>(
+/// Run DAG layers in sequence: wait for layer N to complete before starting layer N+1.
+/// Issues within each layer run in parallel.
+async fn run_dag_layers<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
     issues: &[PipelineIssue],
-    plan: &PlannerOutput,
+    plan: &PlannerGraphOutput,
     max_parallel: usize,
     auto_merge: bool,
 ) -> Result<()> {
     let issue_map: HashMap<u32, &PipelineIssue> = issues.iter().map(|i| (i.number, i)).collect();
+    let layers = topological_layers(plan);
 
-    for batch in &plan.batches {
-        let batch_issues: Vec<PipelineIssue> = batch
-            .issues
+    for (idx, layer) in layers.iter().enumerate() {
+        let layer_issues: Vec<PipelineIssue> = layer
             .iter()
-            .filter_map(|pi| issue_map.get(&pi.number).map(|i| (*i).clone()))
+            .filter_map(|node| issue_map.get(&node.number).map(|i| (*i).clone()))
             .collect();
 
-        if batch_issues.is_empty() {
+        if layer_issues.is_empty() {
             continue;
         }
 
+        let reasoning = layer.first().map_or("", |n| &n.reasoning);
         info!(
-            batch = batch.batch,
-            count = batch_issues.len(),
-            reasoning = %batch.reasoning,
-            "starting batch"
+            layer = idx + 1,
+            count = layer_issues.len(),
+            reasoning = %reasoning,
+            "starting layer"
         );
 
         let complexity_map: HashMap<u32, crate::agents::Complexity> =
-            batch.issues.iter().map(|pi| (pi.number, pi.complexity.clone())).collect();
+            layer.iter().map(|n| (n.number, n.complexity.clone())).collect();
         run_issues_parallel(
             executor,
-            batch_issues,
+            layer_issues,
             Some(&complexity_map),
             max_parallel,
             auto_merge,
@@ -395,8 +370,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
 
         if let Some(plan) = executor.plan_issues(&new_issues, &graph_context).await {
             info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
-            let legacy = graph_output_to_legacy(&plan);
-            apply_plan(&new_issues, &legacy, &in_flight_numbers, &mut to_spawn, &sched.deferred)
+            apply_plan(&new_issues, &plan, &in_flight_numbers, &mut to_spawn, &sched.deferred)
                 .await;
         } else {
             warn!("planner failed, spawning all new issues immediately");
@@ -416,15 +390,15 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     spawn_issues(to_spawn, executor, sched, auto_merge).await;
 }
 
-/// Apply a planner output: add batch 1 issues to spawn list, batch 2+ to deferred.
+/// Apply a DAG planner output: layer-1 issues spawn immediately, later layers are deferred.
 async fn apply_plan(
     new_issues: &[PipelineIssue],
-    plan: &PlannerOutput,
+    plan: &PlannerGraphOutput,
     in_flight_numbers: &HashSet<u32>,
     to_spawn: &mut Vec<(PipelineIssue, InFlightIssue)>,
     deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
 ) {
-    let (spawn_map, defer_list) = split_plan(plan, in_flight_numbers);
+    let (spawn_map, defer_list) = split_graph_plan(plan, in_flight_numbers);
     let issue_map: HashMap<u32, &PipelineIssue> =
         new_issues.iter().map(|i| (i.number, i)).collect();
 
@@ -490,34 +464,46 @@ async fn spawn_issues<R: CommandRunner + 'static>(
 /// A deferred issue's number, planner metadata, and the set of issues it must wait for.
 type DeferredEntry = (u32, InFlightIssue, HashSet<u32>);
 
-/// Separate a planner output into batch 1 (spawn immediately) and deferred batches.
+/// Separate a DAG planner output into layer 1 (spawn immediately) and deferred layers.
 ///
-/// `in_flight_numbers` are issue numbers currently running -- they form the implicit
-/// "batch 0" that deferred issues must wait for in addition to lower-numbered batches.
-fn split_plan(
-    plan: &PlannerOutput,
+/// `in_flight_numbers` are issue numbers currently running -- they are added to the
+/// awaiting set of deferred issues (nodes that depend on them must wait).
+fn split_graph_plan(
+    plan: &PlannerGraphOutput,
     in_flight_numbers: &HashSet<u32>,
 ) -> (HashMap<u32, InFlightIssue>, Vec<DeferredEntry>) {
+    let layers = topological_layers(plan);
     let mut to_spawn = HashMap::new();
     let mut to_defer = Vec::new();
-    let mut lower_batch: HashSet<u32> = in_flight_numbers.clone();
+    let mut lower_layers: HashSet<u32> = in_flight_numbers.clone();
 
-    for batch in &plan.batches {
-        if batch.batch == 1 {
-            for pi in &batch.issues {
-                to_spawn.insert(pi.number, InFlightIssue::from(pi));
+    for (idx, layer) in layers.iter().enumerate() {
+        if idx == 0 {
+            for node in layer {
+                to_spawn.insert(node.number, inflight_from_node(node));
             }
         } else {
-            for pi in &batch.issues {
-                to_defer.push((pi.number, InFlightIssue::from(pi), lower_batch.clone()));
+            for node in layer {
+                to_defer.push((node.number, inflight_from_node(node), lower_layers.clone()));
             }
         }
-        for pi in &batch.issues {
-            lower_batch.insert(pi.number);
+        for node in layer {
+            lower_layers.insert(node.number);
         }
     }
 
     (to_spawn, to_defer)
+}
+
+fn inflight_from_node(node: &crate::agents::PlannedNode) -> InFlightIssue {
+    InFlightIssue {
+        number: node.number,
+        title: node.title.clone(),
+        area: node.area.clone(),
+        predicted_files: node.predicted_files.clone(),
+        has_migration: node.has_migration,
+        complexity: node.complexity.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -528,7 +514,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        agents::{Batch, Complexity, PlannedIssue},
+        agents::{Complexity, PlannedNode, PlannerGraphOutput},
         config::Config,
         github::GhClient,
         issues::{IssueOrigin, IssueProvider, github::GithubIssueProvider},
@@ -691,50 +677,37 @@ mod tests {
         handle_task_result(Ok((1, Err(anyhow::anyhow!("test error")))));
     }
 
+    fn make_node(number: u32, title: &str, area: &str, complexity: Complexity) -> PlannedNode {
+        PlannedNode {
+            number,
+            title: title.to_string(),
+            area: area.to_string(),
+            predicted_files: vec![],
+            has_migration: false,
+            complexity,
+            depends_on: vec![],
+            reasoning: String::new(),
+        }
+    }
+
     #[test]
-    fn split_plan_separates_batches() {
-        let plan = PlannerOutput {
-            batches: vec![
-                Batch {
-                    batch: 1,
-                    issues: vec![
-                        PlannedIssue {
-                            number: 1,
-                            title: "First".to_string(),
-                            area: "cli".to_string(),
-                            predicted_files: vec!["src/cli.rs".to_string()],
-                            has_migration: false,
-                            complexity: Complexity::Simple,
-                        },
-                        PlannedIssue {
-                            number: 2,
-                            title: "Second".to_string(),
-                            area: "config".to_string(),
-                            predicted_files: vec!["src/config.rs".to_string()],
-                            has_migration: false,
-                            complexity: Complexity::Full,
-                        },
-                    ],
-                    reasoning: "independent".to_string(),
-                },
-                Batch {
-                    batch: 2,
-                    issues: vec![PlannedIssue {
-                        number: 3,
-                        title: "Third".to_string(),
-                        area: "db".to_string(),
-                        predicted_files: vec!["src/db.rs".to_string()],
-                        has_migration: true,
-                        complexity: Complexity::Full,
-                    }],
-                    reasoning: "depends on batch 1".to_string(),
+    fn split_graph_plan_separates_layers() {
+        let plan = PlannerGraphOutput {
+            nodes: vec![
+                make_node(1, "First", "cli", Complexity::Simple),
+                make_node(2, "Second", "config", Complexity::Full),
+                {
+                    let mut n = make_node(3, "Third", "db", Complexity::Full);
+                    n.depends_on = vec![1, 2];
+                    n.has_migration = true;
+                    n
                 },
             ],
             total_issues: 3,
             parallel_capacity: 2,
         };
 
-        let (spawn_map, defer_list) = split_plan(&plan, &HashSet::new());
+        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
 
         assert_eq!(spawn_map.len(), 2);
         assert_eq!(spawn_map.get(&1).unwrap().complexity, Complexity::Simple);
@@ -751,48 +724,28 @@ mod tests {
     }
 
     #[test]
-    fn split_plan_empty() {
-        let plan = PlannerOutput { batches: vec![], total_issues: 0, parallel_capacity: 0 };
-        let (spawn_map, defer_list) = split_plan(&plan, &HashSet::new());
+    fn split_graph_plan_empty() {
+        let plan = PlannerGraphOutput { nodes: vec![], total_issues: 0, parallel_capacity: 0 };
+        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
         assert!(spawn_map.is_empty());
         assert!(defer_list.is_empty());
     }
 
     #[test]
-    fn split_plan_includes_in_flight_in_awaiting() {
-        let plan = PlannerOutput {
-            batches: vec![
-                Batch {
-                    batch: 1,
-                    issues: vec![PlannedIssue {
-                        number: 5,
-                        title: "New".to_string(),
-                        area: "cli".to_string(),
-                        predicted_files: vec![],
-                        has_migration: false,
-                        complexity: Complexity::Simple,
-                    }],
-                    reasoning: "ok".to_string(),
-                },
-                Batch {
-                    batch: 2,
-                    issues: vec![PlannedIssue {
-                        number: 6,
-                        title: "Depends".to_string(),
-                        area: "db".to_string(),
-                        predicted_files: vec![],
-                        has_migration: true,
-                        complexity: Complexity::Full,
-                    }],
-                    reasoning: "conflicts".to_string(),
-                },
-            ],
+    fn split_graph_plan_includes_in_flight_in_awaiting() {
+        let plan = PlannerGraphOutput {
+            nodes: vec![make_node(5, "New", "cli", Complexity::Simple), {
+                let mut n = make_node(6, "Depends", "db", Complexity::Full);
+                n.depends_on = vec![5];
+                n.has_migration = true;
+                n
+            }],
             total_issues: 2,
             parallel_capacity: 1,
         };
 
         let in_flight_nums: HashSet<u32> = [10, 11].into_iter().collect();
-        let (spawn_map, defer_list) = split_plan(&plan, &in_flight_nums);
+        let (spawn_map, defer_list) = split_graph_plan(&plan, &in_flight_nums);
 
         assert_eq!(spawn_map.len(), 1);
         assert!(spawn_map.contains_key(&5));
@@ -807,51 +760,26 @@ mod tests {
     }
 
     #[test]
-    fn split_plan_three_batches_chain_awaiting() {
-        let plan = PlannerOutput {
-            batches: vec![
-                Batch {
-                    batch: 1,
-                    issues: vec![PlannedIssue {
-                        number: 1,
-                        title: "A".to_string(),
-                        area: "a".to_string(),
-                        predicted_files: vec![],
-                        has_migration: false,
-                        complexity: Complexity::Simple,
-                    }],
-                    reasoning: String::new(),
+    fn split_graph_plan_three_layers_chain_awaiting() {
+        let plan = PlannerGraphOutput {
+            nodes: vec![
+                make_node(1, "A", "a", Complexity::Simple),
+                {
+                    let mut n = make_node(2, "B", "b", Complexity::Full);
+                    n.depends_on = vec![1];
+                    n
                 },
-                Batch {
-                    batch: 2,
-                    issues: vec![PlannedIssue {
-                        number: 2,
-                        title: "B".to_string(),
-                        area: "b".to_string(),
-                        predicted_files: vec![],
-                        has_migration: false,
-                        complexity: Complexity::Full,
-                    }],
-                    reasoning: String::new(),
-                },
-                Batch {
-                    batch: 3,
-                    issues: vec![PlannedIssue {
-                        number: 3,
-                        title: "C".to_string(),
-                        area: "c".to_string(),
-                        predicted_files: vec![],
-                        has_migration: false,
-                        complexity: Complexity::Full,
-                    }],
-                    reasoning: String::new(),
+                {
+                    let mut n = make_node(3, "C", "c", Complexity::Full);
+                    n.depends_on = vec![2];
+                    n
                 },
             ],
             total_issues: 3,
             parallel_capacity: 1,
         };
 
-        let (spawn_map, defer_list) = split_plan(&plan, &HashSet::new());
+        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
 
         assert_eq!(spawn_map.len(), 1);
         assert!(spawn_map.contains_key(&1));
