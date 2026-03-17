@@ -25,6 +25,10 @@ use crate::{
 pub struct PipelineOutcome {
     pub run_id: String,
     pub pr_number: u32,
+    /// Worktree path, retained so the caller can clean up after merge.
+    pub worktree_path: PathBuf,
+    /// Repo directory the worktree belongs to (needed for `git::remove_worktree`).
+    pub target_dir: PathBuf,
 }
 
 /// Runs a single issue through the full pipeline.
@@ -51,14 +55,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         auto_merge: bool,
         complexity: Option<Complexity>,
     ) -> Result<()> {
-        let outcome = self.run_issue_pipeline(issue, auto_merge, complexity).await;
-        match outcome {
-            Ok(o) => {
-                self.finalize_run(&o.run_id, issue, o.pr_number, &Ok(())).await?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        let outcome = self.run_issue_pipeline(issue, auto_merge, complexity).await?;
+        self.finalize_merge(&outcome, issue).await
     }
 
     /// Run the pipeline up to (but not including) finalization.
@@ -141,19 +139,27 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // Update status to AwaitingMerge
         self.update_status(&run_id, RunStatus::AwaitingMerge).await?;
 
-        Ok(PipelineOutcome { run_id, pr_number })
+        Ok(PipelineOutcome { run_id, pr_number, worktree_path: worktree.path, target_dir })
     }
 
-    /// Finalize a run after its PR has been merged (or when the pipeline failed).
+    /// Finalize a run after its PR has been merged.
     ///
-    /// Transitions labels, closes issues, and marks the run as complete.
+    /// Transitions labels, closes issues, marks the run as complete, and cleans
+    /// up the worktree that was left around while awaiting merge.
     pub async fn finalize_merge(
         &self,
-        run_id: &str,
+        outcome: &PipelineOutcome,
         issue: &PipelineIssue,
-        pr_number: u32,
     ) -> Result<()> {
-        self.finalize_run(run_id, issue, pr_number, &Ok(())).await
+        self.finalize_run(&outcome.run_id, issue, outcome.pr_number, &Ok(())).await?;
+        if let Err(e) = git::remove_worktree(&outcome.target_dir, &outcome.worktree_path).await {
+            warn!(
+                run_id = %outcome.run_id,
+                error = %e,
+                "failed to clean up worktree after merge"
+            );
+        }
+        Ok(())
     }
 
     /// Invoke the planner agent to decide dependency ordering for a set of issues.
