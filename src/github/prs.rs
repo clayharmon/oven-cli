@@ -66,6 +66,31 @@ impl<R: CommandRunner> GhClient<R> {
         Ok(())
     }
 
+    /// Update the title and body of a pull request (in the default repo).
+    pub async fn edit_pr(&self, pr_number: u32, title: &str, body: &str) -> Result<()> {
+        self.edit_pr_in(pr_number, title, body, &self.repo_dir).await
+    }
+
+    /// Update the title and body of a pull request in a specific repo directory.
+    pub async fn edit_pr_in(
+        &self,
+        pr_number: u32,
+        title: &str,
+        body: &str,
+        repo_dir: &Path,
+    ) -> Result<()> {
+        let output = self
+            .runner
+            .run_gh(
+                &Self::s(&["pr", "edit", &pr_number.to_string(), "--title", title, "--body", body]),
+                repo_dir,
+            )
+            .await
+            .context("editing PR")?;
+        Self::check_output(&output, "edit PR")?;
+        Ok(())
+    }
+
     /// Mark a PR as ready for review (in the default repo).
     pub async fn mark_pr_ready(&self, pr_number: u32) -> Result<()> {
         self.mark_pr_ready_in(pr_number, &self.repo_dir).await
@@ -156,6 +181,54 @@ mod tests {
         let client = GhClient::new(mock, Path::new("/tmp"));
         let pr_number = client.create_draft_pr("title", "branch", "body").await.unwrap();
         assert_eq!(pr_number, 99);
+    }
+
+    #[tokio::test]
+    async fn edit_pr_succeeds() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let result = client.edit_pr(42, "new title", "new body").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_pr_in_uses_given_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, Path::new("/repos/backend"));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/repos/god"));
+        let result = client.edit_pr_in(42, "title", "body", Path::new("/repos/backend")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_pr_failure_propagates() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "not found".to_string(),
+                    success: false,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let result = client.edit_pr(42, "title", "body").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[tokio::test]
