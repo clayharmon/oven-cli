@@ -628,7 +628,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     }
 }
 
-const COMMENT_FOOTER: &str = "\n---\nAutomated by [oven](https://github.com/clayharmon/oven-cli)";
+const COMMENT_FOOTER: &str =
+    "\n---\nAutomated by [oven](https://github.com/clayharmon/oven-cli) \u{1F35E}";
 
 fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
     let mut comment = String::from(
@@ -714,9 +715,8 @@ fn build_pr_body(impl_output: &str, ctx: &AgentContext) -> String {
 
     let mut body = String::new();
     let _ = writeln!(body, "{issue_ref}\n");
-    let _ = writeln!(body, "{summary}");
-    let _ = writeln!(body, "---");
-    let _ = write!(body, "Automated by [oven](https://github.com/clayharmon/oven-cli)");
+    let _ = write!(body, "{summary}");
+    body.push_str(COMMENT_FOOTER);
     body
 }
 
