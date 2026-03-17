@@ -695,7 +695,7 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
         let heading = match severity {
             Severity::Critical => "Critical",
             Severity::Warning => "Warning",
-            Severity::Info => "Info",
+            Severity::Info => unreachable!("loop only iterates Critical and Warning"),
         };
         let _ = writeln!(comment, "\n### {heading}\n");
         for f in group {
