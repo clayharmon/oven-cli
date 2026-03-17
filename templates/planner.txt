@@ -64,6 +64,8 @@ For each issue, determine which other issues (if any) it depends on. An issue de
 
 Only add dependencies that are truly necessary. Over-constraining the graph reduces parallelism.
 
+Only list **direct** dependencies in `depends_on`. If issue B depends on A, and issue C depends on B, do not also list A in C's `depends_on` -- the pipeline infers transitive dependencies automatically. Listing redundant transitive edges reduces parallelism.
+
 When referencing existing graph nodes (listed above), you may declare dependencies on them.
 Do not add dependencies on issue numbers that are not in the issues list or graph state.
 
