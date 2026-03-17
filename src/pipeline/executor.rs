@@ -744,11 +744,33 @@ fn format_review_parse_failure(cycle: u32) -> String {
 }
 
 /// Build a PR title using the issue metadata.
+///
+/// Infers a conventional-commit prefix from the issue title. Falls back to
+/// `fix` when no keyword matches.
 fn pr_title(ctx: &AgentContext) -> String {
+    let prefix = infer_commit_type(&ctx.issue_title);
     if ctx.issue_source == "github" {
-        format!("fix(#{}): {}", ctx.issue_number, ctx.issue_title)
+        format!("{prefix}(#{}): {}", ctx.issue_number, ctx.issue_title)
     } else {
-        format!("fix: {}", ctx.issue_title)
+        format!("{prefix}: {}", ctx.issue_title)
+    }
+}
+
+/// Infer a conventional-commit type from an issue title.
+fn infer_commit_type(title: &str) -> &'static str {
+    let lower = title.to_lowercase();
+    if lower.starts_with("feat") || lower.contains("add ") || lower.contains("implement ") {
+        "feat"
+    } else if lower.starts_with("refactor") {
+        "refactor"
+    } else if lower.starts_with("docs") || lower.starts_with("document") {
+        "docs"
+    } else if lower.starts_with("test") || lower.starts_with("add test") {
+        "test"
+    } else if lower.starts_with("chore") {
+        "chore"
+    } else {
+        "fix"
     }
 }
 
@@ -1007,6 +1029,49 @@ mod tests {
             base_branch: "main".to_string(),
         };
         assert_eq!(pr_title(&ctx), "fix: local thing");
+    }
+
+    #[test]
+    fn infer_commit_type_feat() {
+        assert_eq!(infer_commit_type("Add dark mode support"), "feat");
+        assert_eq!(infer_commit_type("Implement caching layer"), "feat");
+        assert_eq!(infer_commit_type("Feature: new dashboard"), "feat");
+    }
+
+    #[test]
+    fn infer_commit_type_refactor() {
+        assert_eq!(infer_commit_type("Refactor auth middleware"), "refactor");
+    }
+
+    #[test]
+    fn infer_commit_type_docs() {
+        assert_eq!(infer_commit_type("Document the API endpoints"), "docs");
+        assert_eq!(infer_commit_type("Docs: update README"), "docs");
+    }
+
+    #[test]
+    fn infer_commit_type_defaults_to_fix() {
+        assert_eq!(infer_commit_type("Null pointer in config parser"), "fix");
+        assert_eq!(infer_commit_type("Crash on empty input"), "fix");
+    }
+
+    #[test]
+    fn pr_title_feat_github() {
+        let ctx = AgentContext {
+            issue_number: 10,
+            issue_title: "Add dark mode".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "feat(#10): Add dark mode");
     }
 
     #[test]
