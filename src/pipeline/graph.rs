@@ -365,6 +365,33 @@ impl DependencyGraph {
         }
         lines
     }
+
+    /// Build planner context from the current graph state.
+    ///
+    /// Produces one `GraphContextNode` per node so the planner can see
+    /// in-flight work and avoid scheduling conflicts.
+    pub fn to_graph_context(&self) -> Vec<crate::agents::GraphContextNode> {
+        self.all_issues()
+            .into_iter()
+            .filter_map(|num| {
+                let node = self.nodes.get(&num)?;
+                let depends_on: Vec<u32> = self.edges.get(&num).map_or_else(Vec::new, |deps| {
+                    let mut v: Vec<u32> = deps.iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                });
+                Some(crate::agents::GraphContextNode {
+                    number: num,
+                    title: node.title.clone(),
+                    state: node.state,
+                    area: node.area.clone(),
+                    predicted_files: node.predicted_files.clone(),
+                    has_migration: node.has_migration,
+                    depends_on,
+                })
+            })
+            .collect()
+    }
 }
 
 fn node_from_planned(node: &PlannedNode, issue: Option<&PipelineIssue>) -> GraphNode {
@@ -842,6 +869,36 @@ mod tests {
         // Calling again should return empty (already failed)
         let failed2 = g.propagate_failure(1);
         assert!(failed2.is_empty());
+    }
+
+    #[test]
+    fn to_graph_context_includes_all_nodes() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_edge(2, 1);
+        g.add_edge(3, 1);
+        g.add_edge(3, 2);
+        g.transition(1, NodeState::InFlight);
+
+        let ctx = g.to_graph_context();
+        assert_eq!(ctx.len(), 3);
+
+        let ctx_map: HashMap<u32, &crate::agents::GraphContextNode> =
+            ctx.iter().map(|c| (c.number, c)).collect();
+
+        let c1 = ctx_map[&1];
+        assert_eq!(c1.state, NodeState::InFlight);
+        assert!(c1.depends_on.is_empty());
+
+        let c2 = ctx_map[&2];
+        assert_eq!(c2.state, NodeState::Pending);
+        assert_eq!(c2.depends_on, vec![1]);
+
+        let c3 = ctx_map[&3];
+        assert_eq!(c3.state, NodeState::Pending);
+        assert_eq!(c3.depends_on, vec![1, 2]);
     }
 
     #[test]
