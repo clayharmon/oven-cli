@@ -5,6 +5,7 @@ use rusqlite::Connection;
 use tracing::{info, warn};
 
 use crate::{
+    agents::{PlannedNode, PlannerGraphOutput},
     db::graph::{self, GraphNodeRow, NodeState},
     issues::PipelineIssue,
 };
@@ -273,6 +274,37 @@ impl DependencyGraph {
         Ok(())
     }
 
+    /// Build a graph from planner output, matching issues by number.
+    pub fn from_planner_output(
+        session_id: &str,
+        plan: &PlannerGraphOutput,
+        issues: &[PipelineIssue],
+    ) -> Self {
+        let issue_map: HashMap<u32, &PipelineIssue> =
+            issues.iter().map(|i| (i.number, i)).collect();
+        let mut g = Self::new(session_id);
+        for node in &plan.nodes {
+            g.add_node(node_from_planned(node, issue_map.get(&node.number).copied()));
+        }
+        add_planned_edges(&mut g, &plan.nodes);
+        g
+    }
+
+    /// Merge new planner output into an existing graph (polling mode).
+    ///
+    /// Only adds nodes not already present. Edges between new nodes and
+    /// existing nodes are added if they don't create cycles.
+    pub fn merge_planner_output(&mut self, plan: &PlannerGraphOutput, issues: &[PipelineIssue]) {
+        let issue_map: HashMap<u32, &PipelineIssue> =
+            issues.iter().map(|i| (i.number, i)).collect();
+        let new_nodes: Vec<&PlannedNode> =
+            plan.nodes.iter().filter(|n| !self.contains(n.number)).collect();
+        for node in &new_nodes {
+            self.add_node(node_from_planned(node, issue_map.get(&node.number).copied()));
+        }
+        add_planned_edges(self, &new_nodes);
+    }
+
     /// Format the graph for display in CLI output.
     pub fn display_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -292,6 +324,36 @@ impl DependencyGraph {
             }
         }
         lines
+    }
+}
+
+fn node_from_planned(node: &PlannedNode, issue: Option<&PipelineIssue>) -> GraphNode {
+    GraphNode {
+        issue_number: node.number,
+        title: node.title.clone(),
+        area: node.area.clone(),
+        predicted_files: node.predicted_files.clone(),
+        has_migration: node.has_migration,
+        complexity: node.complexity.to_string(),
+        state: NodeState::Pending,
+        pr_number: None,
+        run_id: None,
+        issue: issue.cloned(),
+    }
+}
+
+fn add_planned_edges(graph: &mut DependencyGraph, nodes: &[impl std::borrow::Borrow<PlannedNode>]) {
+    for node in nodes {
+        let node = node.borrow();
+        for &dep in &node.depends_on {
+            if !graph.add_edge(node.number, dep) {
+                warn!(
+                    from = node.number,
+                    to = dep,
+                    "skipping planner edge that would create cycle"
+                );
+            }
+        }
     }
 }
 
@@ -547,6 +609,110 @@ mod tests {
         let mut ready = g.ready_issues();
         ready.sort_unstable();
         assert_eq!(ready, vec![1, 2, 3]);
+    }
+
+    fn make_planned(number: u32, depends_on: Vec<u32>) -> crate::agents::PlannedNode {
+        crate::agents::PlannedNode {
+            number,
+            title: format!("Issue #{number}"),
+            area: "test".to_string(),
+            predicted_files: vec![],
+            has_migration: false,
+            complexity: crate::agents::Complexity::Full,
+            depends_on,
+            reasoning: String::new(),
+        }
+    }
+
+    fn make_issue(number: u32) -> PipelineIssue {
+        PipelineIssue {
+            number,
+            title: format!("Issue #{number}"),
+            body: String::new(),
+            source: crate::issues::IssueOrigin::Github,
+            target_repo: None,
+        }
+    }
+
+    #[test]
+    fn from_planner_output_basic() {
+        let plan = crate::agents::PlannerGraphOutput {
+            nodes: vec![
+                make_planned(1, vec![]),
+                make_planned(2, vec![]),
+                make_planned(3, vec![1, 2]),
+            ],
+            total_issues: 3,
+            parallel_capacity: 2,
+        };
+        let issues = vec![make_issue(1), make_issue(2), make_issue(3)];
+
+        let g = DependencyGraph::from_planner_output("sess", &plan, &issues);
+        assert_eq!(g.node_count(), 3);
+        assert_eq!(g.dependencies(3), HashSet::from([1, 2]));
+        assert!(g.dependencies(1).is_empty());
+        // Issues should be attached
+        assert!(g.node(1).unwrap().issue.is_some());
+        assert!(g.node(2).unwrap().issue.is_some());
+    }
+
+    #[test]
+    fn from_planner_output_skips_cycle() {
+        let plan = crate::agents::PlannerGraphOutput {
+            nodes: vec![make_planned(1, vec![2]), make_planned(2, vec![1])],
+            total_issues: 2,
+            parallel_capacity: 1,
+        };
+
+        let g = DependencyGraph::from_planner_output("sess", &plan, &[]);
+        // One edge should succeed, the other should be skipped (cycle)
+        assert_eq!(g.node_count(), 2);
+        let total_edges: usize = [1, 2].iter().map(|n| g.dependencies(*n).len()).sum();
+        assert_eq!(total_edges, 1);
+    }
+
+    #[test]
+    fn merge_planner_output_adds_new_only() {
+        let plan1 = crate::agents::PlannerGraphOutput {
+            nodes: vec![make_planned(1, vec![])],
+            total_issues: 1,
+            parallel_capacity: 1,
+        };
+        let mut g = DependencyGraph::from_planner_output("sess", &plan1, &[make_issue(1)]);
+        g.transition(1, NodeState::InFlight);
+
+        // Merge a plan that includes node 1 again and adds node 2
+        let plan2 = crate::agents::PlannerGraphOutput {
+            nodes: vec![make_planned(1, vec![]), make_planned(2, vec![1])],
+            total_issues: 2,
+            parallel_capacity: 1,
+        };
+        g.merge_planner_output(&plan2, &[make_issue(2)]);
+
+        assert_eq!(g.node_count(), 2);
+        // Node 1 should still be InFlight (not overwritten)
+        assert_eq!(g.node(1).unwrap().state, NodeState::InFlight);
+        // Node 2 should be Pending with edge to 1
+        assert_eq!(g.node(2).unwrap().state, NodeState::Pending);
+        assert_eq!(g.dependencies(2), HashSet::from([1]));
+    }
+
+    #[test]
+    fn merge_planner_output_cross_edges() {
+        let mut g = DependencyGraph::new("sess");
+        g.add_node(make_node(1));
+        g.transition(1, NodeState::Merged);
+
+        let plan = crate::agents::PlannerGraphOutput {
+            nodes: vec![make_planned(2, vec![1])],
+            total_issues: 1,
+            parallel_capacity: 1,
+        };
+        g.merge_planner_output(&plan, &[make_issue(2)]);
+
+        assert_eq!(g.dependencies(2), HashSet::from([1]));
+        // Node 2 should be ready since node 1 is merged
+        assert_eq!(g.ready_issues(), vec![2]);
     }
 
     #[test]
