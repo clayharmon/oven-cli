@@ -195,7 +195,10 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find the most recent session that has at least one non-terminal node.
+/// Find a session that has at least one non-terminal node.
+///
+/// When multiple active sessions exist, the returned session is arbitrary.
+/// In practice there is at most one active session at a time.
 pub fn get_active_session(conn: &Connection) -> Result<Option<String>> {
     let mut stmt = conn
         .prepare(
