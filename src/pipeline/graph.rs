@@ -276,8 +276,7 @@ impl DependencyGraph {
     /// Format the graph for display in CLI output.
     pub fn display_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        let mut issues = self.all_issues();
-        issues.sort_unstable();
+        let issues = self.all_issues();
 
         for num in issues {
             let Some(node) = self.nodes.get(&num) else { continue };
