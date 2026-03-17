@@ -31,6 +31,17 @@ struct DeferredIssue {
     awaiting: HashSet<u32>,
 }
 
+/// Shared mutable state for the polling scheduler.
+///
+/// Groups the semaphore, in-flight map, deferred map, and task set that are
+/// threaded through every poll cycle and spawn call.
+struct SchedulerState {
+    semaphore: Arc<Semaphore>,
+    in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>>,
+    deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>>,
+    tasks: JoinSet<(u32, Result<()>)>,
+}
+
 /// Run the pipeline for a batch of issues using planner-driven sequencing.
 ///
 /// Used for the explicit-IDs path (`oven on 42,43`). Calls the planner with no
@@ -246,10 +257,12 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
     let poll_interval = Duration::from_secs(executor.config.pipeline.poll_interval);
     let max_parallel = executor.config.pipeline.max_parallel as usize;
     let ready_label = executor.config.labels.ready.clone();
-    let semaphore = Arc::new(Semaphore::new(max_parallel));
-    let mut tasks = JoinSet::new();
-    let in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>> = Arc::new(Mutex::new(HashMap::new()));
-    let deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut sched = SchedulerState {
+        semaphore: Arc::new(Semaphore::new(max_parallel)),
+        in_flight: Arc::new(Mutex::new(HashMap::new())),
+        deferred: Arc::new(Mutex::new(HashMap::new())),
+        tasks: JoinSet::new(),
+    };
 
     info!(poll_interval_secs = poll_interval.as_secs(), max_parallel, "continuous polling started");
 
@@ -257,18 +270,15 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
         tokio::select! {
             () = cancel_token.cancelled() => {
                 info!("shutdown signal received, waiting for in-flight pipelines");
-                while let Some(result) = tasks.join_next().await {
+                while let Some(result) = sched.tasks.join_next().await {
                     handle_task_result(result);
                 }
                 break;
             }
             () = tokio::time::sleep(poll_interval) => {
-                poll_and_spawn(
-                    &executor, &ready_label, &semaphore, &in_flight, &deferred,
-                    &mut tasks, auto_merge,
-                ).await;
+                poll_and_spawn(&executor, &ready_label, &mut sched, auto_merge).await;
             }
-            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+            Some(result) = sched.tasks.join_next(), if !sched.tasks.is_empty() => {
                 handle_task_result(result);
             }
         }
@@ -319,10 +329,7 @@ async fn promote_deferred(
 async fn poll_and_spawn<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
     ready_label: &str,
-    semaphore: &Arc<Semaphore>,
-    in_flight: &Arc<Mutex<HashMap<u32, InFlightIssue>>>,
-    deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-    tasks: &mut JoinSet<(u32, Result<()>)>,
+    sched: &mut SchedulerState,
     auto_merge: bool,
 ) {
     let ready_issues = match executor.issues.get_ready_issues(ready_label).await {
@@ -334,11 +341,11 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     };
 
     let ready_numbers: HashSet<u32> = ready_issues.iter().map(|i| i.number).collect();
-    clean_stale_deferred(deferred, &ready_numbers).await;
+    clean_stale_deferred(&sched.deferred, &ready_numbers).await;
 
     // Snapshot in-flight and deferred state, then filter to genuinely new issues
     let (in_flight_numbers, in_flight_snapshot) = {
-        let guard = in_flight.lock().await;
+        let guard = sched.in_flight.lock().await;
         let numbers: HashSet<u32> = guard.keys().copied().collect();
         let snapshot: Vec<InFlightIssue> = guard.values().cloned().collect();
         drop(guard);
@@ -346,7 +353,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     };
 
     let (deferred_numbers, deferred_snapshot) = {
-        let guard = deferred.lock().await;
+        let guard = sched.deferred.lock().await;
         let numbers: HashSet<u32> = guard.keys().copied().collect();
         let snapshot: Vec<DeferredIssue> = guard.values().cloned().collect();
         drop(guard);
@@ -358,7 +365,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
         .filter(|i| !in_flight_numbers.contains(&i.number) && !deferred_numbers.contains(&i.number))
         .collect();
 
-    let mut to_spawn = promote_deferred(deferred).await;
+    let mut to_spawn = promote_deferred(&sched.deferred).await;
 
     // Only invoke the planner for genuinely new issues
     if !new_issues.is_empty() {
@@ -389,7 +396,8 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
         if let Some(plan) = executor.plan_issues(&new_issues, &graph_context).await {
             info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
             let legacy = graph_output_to_legacy(&plan);
-            apply_plan(&new_issues, &legacy, &in_flight_numbers, &mut to_spawn, deferred).await;
+            apply_plan(&new_issues, &legacy, &in_flight_numbers, &mut to_spawn, &sched.deferred)
+                .await;
         } else {
             warn!("planner failed, spawning all new issues immediately");
             for issue in &new_issues {
@@ -405,7 +413,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
         return;
     }
 
-    spawn_issues(to_spawn, semaphore, executor, in_flight, deferred, tasks, auto_merge).await;
+    spawn_issues(to_spawn, executor, sched, auto_merge).await;
 }
 
 /// Apply a planner output: add batch 1 issues to spawn list, batch 2+ to deferred.
@@ -442,24 +450,21 @@ async fn apply_plan(
 /// Spawn pipeline tasks for a set of issues.
 async fn spawn_issues<R: CommandRunner + 'static>(
     to_spawn: Vec<(PipelineIssue, InFlightIssue)>,
-    semaphore: &Arc<Semaphore>,
     executor: &Arc<PipelineExecutor<R>>,
-    in_flight: &Arc<Mutex<HashMap<u32, InFlightIssue>>>,
-    deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-    tasks: &mut JoinSet<(u32, Result<()>)>,
+    sched: &mut SchedulerState,
     auto_merge: bool,
 ) {
     for (issue, metadata) in to_spawn {
-        let sem = Arc::clone(semaphore);
+        let sem = Arc::clone(&sched.semaphore);
         let exec = Arc::clone(executor);
-        let in_fl = Arc::clone(in_flight);
-        let def = Arc::clone(deferred);
+        let in_fl = Arc::clone(&sched.in_flight);
+        let def = Arc::clone(&sched.deferred);
         let number = issue.number;
         let complexity = Some(metadata.complexity.clone());
 
         in_fl.lock().await.insert(number, metadata);
 
-        tasks.spawn(async move {
+        sched.tasks.spawn(async move {
             let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
