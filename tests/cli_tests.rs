@@ -233,7 +233,7 @@ fn look_no_runs() {
         .arg("look")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no runs found"));
+        .stderr(predicate::str::contains("no log directories found"));
 }
 
 #[test]
@@ -375,82 +375,42 @@ fn report_all_with_multiple_runs() {
 #[test]
 fn look_with_seeded_run_and_log() {
     let dir = common::setup_oven_project();
-    let db_path = dir.path().join(".oven").join("oven.db");
-    let conn = oven_cli::db::open(&db_path).unwrap();
 
-    oven_cli::db::runs::insert_run(
-        &conn,
-        &oven_cli::db::Run {
-            id: "look1234".to_string(),
-            issue_number: 10,
-            status: oven_cli::db::RunStatus::Complete,
-            pr_number: None,
-            branch: None,
-            worktree_path: None,
-            cost_usd: 0.0,
-            auto_merge: false,
-            started_at: "2026-03-12T10:00:00".to_string(),
-            finished_at: Some("2026-03-12T10:05:00".to_string()),
-            error_message: None,
-            complexity: "full".to_string(),
-            issue_source: "github".to_string(),
-        },
-    )
-    .unwrap();
-    drop(conn);
-
-    // Create log directory and file
+    // Create log directory with JSON-formatted log lines
     let log_dir = dir.path().join(".oven").join("logs").join("look1234");
     std::fs::create_dir_all(&log_dir).unwrap();
     std::fs::write(
         log_dir.join("pipeline.log"),
-        "agent=implementer cycle=1 starting\nagent=reviewer cycle=1 reviewing\n",
+        concat!(
+            r#"{"timestamp":"2026-03-12T10:00:01Z","level":"INFO","fields":{"message":"agent starting","agent":"implementer","cycle":1},"target":"test"}"#, "\n",
+            r#"{"timestamp":"2026-03-12T10:00:05Z","level":"INFO","fields":{"message":"review clean","agent":"reviewer","cycle":1},"target":"test"}"#, "\n",
+        ),
     )
     .unwrap();
 
-    // Dump completed run
     Command::cargo_bin("oven")
         .unwrap()
         .current_dir(dir.path())
         .args(["look", "look1234"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("agent=implementer"))
-        .stdout(predicate::str::contains("agent=reviewer"));
+        .stdout(predicate::str::contains("agent starting"))
+        .stdout(predicate::str::contains("review clean"));
 }
 
 #[test]
 fn look_with_agent_filter() {
     let dir = common::setup_oven_project();
-    let db_path = dir.path().join(".oven").join("oven.db");
-    let conn = oven_cli::db::open(&db_path).unwrap();
-
-    oven_cli::db::runs::insert_run(
-        &conn,
-        &oven_cli::db::Run {
-            id: "filt1234".to_string(),
-            issue_number: 10,
-            status: oven_cli::db::RunStatus::Complete,
-            pr_number: None,
-            branch: None,
-            worktree_path: None,
-            cost_usd: 0.0,
-            auto_merge: false,
-            started_at: "2026-03-12T10:00:00".to_string(),
-            finished_at: Some("2026-03-12T10:05:00".to_string()),
-            error_message: None,
-            complexity: "full".to_string(),
-            issue_source: "github".to_string(),
-        },
-    )
-    .unwrap();
-    drop(conn);
 
     let log_dir = dir.path().join(".oven").join("logs").join("filt1234");
     std::fs::create_dir_all(&log_dir).unwrap();
     std::fs::write(
         log_dir.join("pipeline.log"),
-        "agent=implementer starting\nagent=reviewer reviewing\nagent=implementer done\n",
+        concat!(
+            r#"{"timestamp":"2026-03-12T10:00:01Z","level":"INFO","fields":{"message":"starting","agent":"implementer"},"target":"test"}"#, "\n",
+            r#"{"timestamp":"2026-03-12T10:00:05Z","level":"INFO","fields":{"message":"reviewing","agent":"reviewer"},"target":"test"}"#, "\n",
+            r#"{"timestamp":"2026-03-12T10:00:10Z","level":"INFO","fields":{"message":"done","agent":"implementer"},"target":"test"}"#, "\n",
+        ),
     )
     .unwrap();
 
@@ -460,45 +420,22 @@ fn look_with_agent_filter() {
         .args(["look", "filt1234", "--agent", "reviewer"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("agent=reviewer"))
-        .stdout(predicate::str::contains("agent=implementer").not());
+        .stdout(predicate::str::contains("reviewing"))
+        .stdout(predicate::str::contains("done").not());
 }
 
 #[test]
 fn look_missing_log_file_errors() {
     let dir = common::setup_oven_project();
-    let db_path = dir.path().join(".oven").join("oven.db");
-    let conn = oven_cli::db::open(&db_path).unwrap();
 
-    oven_cli::db::runs::insert_run(
-        &conn,
-        &oven_cli::db::Run {
-            id: "nolog123".to_string(),
-            issue_number: 10,
-            status: oven_cli::db::RunStatus::Complete,
-            pr_number: None,
-            branch: None,
-            worktree_path: None,
-            cost_usd: 0.0,
-            auto_merge: false,
-            started_at: "2026-03-12T10:00:00".to_string(),
-            finished_at: Some("2026-03-12T10:05:00".to_string()),
-            error_message: None,
-            complexity: "full".to_string(),
-            issue_source: "github".to_string(),
-        },
-    )
-    .unwrap();
-    drop(conn);
-
-    // Don't create log file
+    // Don't create a log directory -- look should fail
     Command::cargo_bin("oven")
         .unwrap()
         .current_dir(dir.path())
         .args(["look", "nolog123"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no log file"));
+        .stderr(predicate::str::contains("no log directory found"));
 }
 
 #[test]

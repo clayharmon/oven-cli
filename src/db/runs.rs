@@ -79,6 +79,20 @@ pub fn get_latest_run(conn: &Connection) -> Result<Option<Run>> {
     }
 }
 
+pub fn get_active_runs(conn: &Connection) -> Result<Vec<Run>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, issue_number, status, pr_number, branch, worktree_path, \
+             cost_usd, auto_merge, started_at, finished_at, error_message, complexity, \
+             issue_source \
+             FROM runs WHERE status NOT IN ('complete', 'failed') ORDER BY started_at",
+        )
+        .context("preparing get_active_runs")?;
+
+    let rows = stmt.query_map([], row_to_run).context("querying active runs")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().context("collecting active runs")
+}
+
 pub fn get_all_runs(conn: &Connection) -> Result<Vec<Run>> {
     let mut stmt = conn
         .prepare(

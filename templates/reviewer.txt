@@ -67,6 +67,22 @@ Good: "Fix: add length validation on `name` param in `src/config/mod.rs:42`, max
 
 Every finding must reference a specific file, line, and concrete fix. Vague findings are useless to the fixer agent.
 
+{% if !prior_addressed.is_empty() %}
+## Prior Addressed Findings
+
+These findings were raised in a previous cycle and the fixer has already applied fixes.
+Do NOT re-raise these unless the fix itself is demonstrably broken (compilation failure,
+test failure, or a new bug introduced by the fix). If the fix approach differs from what
+you would have chosen but is functionally correct, accept it.
+
+{% for a in prior_addressed -%}
+- **{{ a.severity }}** {{ a.category }}
+{%- if let Some(path) = &a.file_path %} at `{{ path }}
+{%- if let Some(line) = a.line_number %}:{{ line }}{% endif %}`
+{%- endif %}: {{ a.message }}
+  -> **Fix applied:** {{ a.dispute_reason.as_deref().unwrap_or("no details") }}
+{% endfor -%}
+{% endif %}
 {% if !prior_disputes.is_empty() %}
 ## Prior Disputes
 
@@ -85,6 +101,23 @@ not exist, do NOT re-raise -- the compiler is authoritative over the issue spec.
 {%- endif %}: {{ d.message }}
   -> **Fixer's reason:** {{ d.dispute_reason.as_deref().unwrap_or("no reason given") }}
 {% endfor -%}
+{% endif %}
+{% if !prior_addressed.is_empty() || !prior_disputes.is_empty() %}
+## Anti-Goalpost Rules (CRITICAL)
+
+This is review cycle 2+. The following rules are mandatory:
+
+1. **Do not re-raise addressed findings.** If a finding was raised in a prior cycle and the
+   fixer applied a fix, it is resolved. You may only flag the same area if the fix itself
+   introduced a genuinely new, distinct bug (not a stylistic alternative).
+2. **Do not contradict your prior suggested approach.** If a prior cycle suggested fix X and
+   the fixer implemented X, do not now criticize X or propose Y instead. Moving the goalposts
+   wastes cycles and causes pipeline failure.
+3. **Do not raise new findings on lines changed solely to address a prior finding.** Focus
+   new findings on code that was NOT already reviewed.
+4. **Severity must not escalate across cycles.** A concern that was info-level in cycle 1
+   cannot become a warning in cycle 2 unless new evidence (failing test, security issue)
+   justifies it. "Technically imprecise but correct in practice" is info, not warning.
 {% endif %}
 ## Output Format (REQUIRED)
 
