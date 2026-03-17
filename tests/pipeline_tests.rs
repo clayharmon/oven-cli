@@ -741,7 +741,8 @@ async fn e2e_continuous_polling_processes_issues() {
     let issue_list_count = Arc::new(AtomicU32::new(0));
     let ilc = Arc::clone(&issue_list_count);
 
-    // GH runner: returns 1 issue on first poll, empty on subsequent polls
+    // GH runner: returns 1 issue on first poll, empty on subsequent polls.
+    // PR view returns MERGED so poll_awaiting_merges can finalize.
     let gh_runner = TestRunner {
         claude_handler: Box::new(|_, _, _| AgentResult {
             cost_usd: 0.0,
@@ -763,6 +764,12 @@ async fn e2e_continuous_polling_processes_issues() {
             } else if args.iter().any(|a| a == "create") {
                 CommandOutput {
                     stdout: "https://github.com/test/repo/pull/77\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            } else if args.iter().any(|a| a == "view") && args.iter().any(|a| a == "--json") {
+                CommandOutput {
+                    stdout: r#"{"state":"MERGED"}"#.to_string(),
                     stderr: String::new(),
                     success: true,
                 }
@@ -823,7 +830,8 @@ async fn e2e_continuous_polling_multiple_issues() {
     let issue_list_count = Arc::new(AtomicU32::new(0));
     let ilc = Arc::clone(&issue_list_count);
 
-    // GH runner: returns 2 issues on first poll, empty after
+    // GH runner: returns 2 issues on first poll, empty after.
+    // PR view returns MERGED so poll_awaiting_merges can finalize.
     let gh_runner = TestRunner {
         claude_handler: Box::new(|_, _, _| AgentResult {
             cost_usd: 0.0,
@@ -845,6 +853,12 @@ async fn e2e_continuous_polling_multiple_issues() {
             } else if args.iter().any(|a| a == "create") {
                 CommandOutput {
                     stdout: "https://github.com/test/repo/pull/88\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            } else if args.iter().any(|a| a == "view") && args.iter().any(|a| a == "--json") {
+                CommandOutput {
+                    stdout: r#"{"state":"MERGED"}"#.to_string(),
                     stderr: String::new(),
                     success: true,
                 }
