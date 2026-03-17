@@ -514,6 +514,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     line_number: finding.line_number,
                     message: finding.message.clone(),
                     resolved: false,
+                    dispute_reason: None,
                 };
                 db::agent_runs::insert_finding(&conn, &db_finding)?;
             }
