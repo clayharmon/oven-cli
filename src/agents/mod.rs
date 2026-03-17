@@ -168,6 +168,19 @@ impl From<&PlannedIssue> for InFlightIssue {
     }
 }
 
+impl From<&PlannedNode> for InFlightIssue {
+    fn from(node: &PlannedNode) -> Self {
+        Self {
+            number: node.number,
+            title: node.title.clone(),
+            area: node.area.clone(),
+            predicted_files: node.predicted_files.clone(),
+            has_migration: node.has_migration,
+            complexity: node.complexity.clone(),
+        }
+    }
+}
+
 impl InFlightIssue {
     /// Fallback constructor when the planner hasn't classified this issue.
     pub fn from_issue(issue: &PipelineIssue) -> Self {

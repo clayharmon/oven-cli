@@ -479,12 +479,12 @@ fn split_graph_plan(
 
     for (idx, layer) in layers.iter().enumerate() {
         if idx == 0 {
-            for node in layer {
-                to_spawn.insert(node.number, inflight_from_node(node));
+            for &node in layer {
+                to_spawn.insert(node.number, InFlightIssue::from(node));
             }
         } else {
-            for node in layer {
-                to_defer.push((node.number, inflight_from_node(node), lower_layers.clone()));
+            for &node in layer {
+                to_defer.push((node.number, InFlightIssue::from(node), lower_layers.clone()));
             }
         }
         for node in layer {
@@ -493,17 +493,6 @@ fn split_graph_plan(
     }
 
     (to_spawn, to_defer)
-}
-
-fn inflight_from_node(node: &crate::agents::PlannedNode) -> InFlightIssue {
-    InFlightIssue {
-        number: node.number,
-        title: node.title.clone(),
-        area: node.area.clone(),
-        predicted_files: node.predicted_files.clone(),
-        has_migration: node.has_migration,
-        complexity: node.complexity.clone(),
-    }
 }
 
 #[cfg(test)]
