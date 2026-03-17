@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tracing::warn;
 
 use super::{GhClient, PrState};
 use crate::process::CommandRunner;
@@ -88,7 +89,11 @@ impl<R: CommandRunner> GhClient<R> {
         Ok(match state_str {
             "MERGED" => PrState::Merged,
             "CLOSED" => PrState::Closed,
-            _ => PrState::Open,
+            "OPEN" => PrState::Open,
+            other => {
+                warn!(pr = pr_number, state = other, "unexpected PR state, treating as Open");
+                PrState::Open
+            }
         })
     }
 
@@ -228,6 +233,24 @@ mod tests {
         let client = GhClient::new(mock, Path::new("/tmp"));
         let state = client.get_pr_state(42).await.unwrap();
         assert_eq!(state, crate::github::PrState::Closed);
+    }
+
+    #[tokio::test]
+    async fn get_pr_state_unknown_defaults_to_open() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"state":"DRAFT"}"#.to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let state = client.get_pr_state(42).await.unwrap();
+        assert_eq!(state, crate::github::PrState::Open);
     }
 
     #[tokio::test]
