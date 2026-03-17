@@ -240,6 +240,68 @@ async fn handle_task_result<R: CommandRunner>(
     save_graph(graph, executor).await;
 }
 
+/// Check `AwaitingMerge` nodes and transition them to `Merged` or `Failed`
+/// based on the PR's actual state on GitHub.
+async fn poll_awaiting_merges<R: CommandRunner + 'static>(
+    graph: &mut DependencyGraph,
+    executor: &Arc<PipelineExecutor<R>>,
+) {
+    let awaiting = graph.awaiting_merge();
+    if awaiting.is_empty() {
+        return;
+    }
+
+    for num in awaiting {
+        let Some(node) = graph.node(num) else { continue };
+        let Some(pr_number) = node.pr_number else {
+            warn!(issue = num, "AwaitingMerge node has no PR number, skipping");
+            continue;
+        };
+        let run_id = node.run_id.clone().unwrap_or_default();
+        let issue = node.issue.clone();
+
+        let pr_state = match executor.github.get_pr_state(pr_number).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(issue = num, pr = pr_number, error = %e, "failed to check PR state");
+                continue;
+            }
+        };
+
+        match pr_state {
+            crate::github::PrState::Merged => {
+                info!(issue = num, pr = pr_number, "PR merged, finalizing");
+                if let Some(ref issue) = issue {
+                    match executor.reconstruct_outcome(issue, &run_id, pr_number) {
+                        Ok(outcome) => {
+                            if let Err(e) = executor.finalize_merge(&outcome, issue).await {
+                                warn!(issue = num, error = %e, "finalize_merge after poll failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(issue = num, error = %e, "failed to reconstruct outcome");
+                        }
+                    }
+                }
+                graph.transition(num, NodeState::Merged);
+            }
+            crate::github::PrState::Closed => {
+                warn!(issue = num, pr = pr_number, "PR closed without merge, marking failed");
+                graph.transition(num, NodeState::Failed);
+                let blocked = graph.propagate_failure(num);
+                for b in &blocked {
+                    warn!(issue = b, blocked_by = num, "transitively failed (PR closed)");
+                }
+            }
+            crate::github::PrState::Open => {
+                // Still open, keep waiting
+            }
+        }
+    }
+
+    save_graph(graph, executor).await;
+}
+
 /// Single poll cycle: plan new issues, promote ready ones, and spawn tasks.
 async fn poll_and_spawn<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
@@ -247,6 +309,9 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     sched: &mut SchedulerState,
     auto_merge: bool,
 ) {
+    // Check if any AwaitingMerge PRs have been merged
+    poll_awaiting_merges(&mut sched.graph, executor).await;
+
     let ready_issues = match executor.issues.get_ready_issues(ready_label).await {
         Ok(i) => i,
         Err(e) => {
@@ -738,6 +803,174 @@ mod tests {
             let loaded = DependencyGraph::from_db(&*db.lock().await, "persist-test").unwrap();
             assert_eq!(loaded.node(1).unwrap().state, NodeState::AwaitingMerge);
             assert_eq!(loaded.node(1).unwrap().pr_number, Some(10));
+        });
+    }
+
+    fn mock_runner_with_pr_state(state: &'static str) -> MockCommandRunner {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(move |args, _| {
+            let args = args.to_vec();
+            Box::pin(async move {
+                if args.iter().any(|a| a == "view") {
+                    Ok(CommandOutput {
+                        stdout: format!(r#"{{"state":"{state}"}}"#),
+                        stderr: String::new(),
+                        success: true,
+                    })
+                } else {
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        success: true,
+                    })
+                }
+            })
+        });
+        mock.expect_run_claude().returning(|_, _, _, _| {
+            Box::pin(async {
+                Ok(AgentResult {
+                    cost_usd: 0.0,
+                    duration: Duration::from_secs(0),
+                    turns: 0,
+                    output: String::new(),
+                    session_id: String::new(),
+                    success: true,
+                })
+            })
+        });
+        mock
+    }
+
+    fn make_merge_poll_executor(state: &'static str) -> Arc<PipelineExecutor<MockCommandRunner>> {
+        let gh_mock = mock_runner_with_pr_state(state);
+        let github = Arc::new(GhClient::new(gh_mock, std::path::Path::new("/tmp")));
+        let issues = make_github_provider(&github);
+        let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
+        let runner = Arc::new(mock_runner_with_pr_state(state));
+        Arc::new(PipelineExecutor {
+            runner,
+            github,
+            issues,
+            db,
+            config: Config::default(),
+            cancel_token: CancellationToken::new(),
+            repo_dir: PathBuf::from("/tmp"),
+        })
+    }
+
+    #[test]
+    fn merge_polling_transitions_merged_pr() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let executor = make_merge_poll_executor("MERGED");
+
+            let mut graph = DependencyGraph::new("merge-poll-test");
+            let mut node = standalone_node(&make_issue(1));
+            node.pr_number = Some(42);
+            node.run_id = Some("run-1".to_string());
+            graph.add_node(node);
+            graph.transition(1, NodeState::AwaitingMerge);
+
+            poll_awaiting_merges(&mut graph, &executor).await;
+
+            assert_eq!(graph.node(1).unwrap().state, NodeState::Merged);
+        });
+    }
+
+    #[test]
+    fn merge_polling_handles_closed_pr() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let executor = make_merge_poll_executor("CLOSED");
+
+            let plan = PlannerGraphOutput {
+                nodes: vec![
+                    crate::agents::PlannedNode {
+                        number: 1,
+                        title: "Root".to_string(),
+                        area: "a".to_string(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                        depends_on: vec![],
+                        reasoning: String::new(),
+                    },
+                    crate::agents::PlannedNode {
+                        number: 2,
+                        title: "Dep".to_string(),
+                        area: "b".to_string(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                        depends_on: vec![1],
+                        reasoning: String::new(),
+                    },
+                ],
+                total_issues: 2,
+                parallel_capacity: 1,
+            };
+            let test_issues = vec![make_issue(1), make_issue(2)];
+            let mut graph =
+                DependencyGraph::from_planner_output("merge-poll-close", &plan, &test_issues);
+            graph.transition(1, NodeState::AwaitingMerge);
+            graph.set_pr_number(1, 42);
+            graph.set_run_id(1, "run-1");
+
+            poll_awaiting_merges(&mut graph, &executor).await;
+
+            assert_eq!(graph.node(1).unwrap().state, NodeState::Failed);
+            // Dependent should be transitively failed
+            assert_eq!(graph.node(2).unwrap().state, NodeState::Failed);
+        });
+    }
+
+    #[test]
+    fn merge_unlocks_dependent() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let executor = make_merge_poll_executor("MERGED");
+
+            let plan = PlannerGraphOutput {
+                nodes: vec![
+                    crate::agents::PlannedNode {
+                        number: 1,
+                        title: "Root".to_string(),
+                        area: "a".to_string(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                        depends_on: vec![],
+                        reasoning: String::new(),
+                    },
+                    crate::agents::PlannedNode {
+                        number: 2,
+                        title: "Dep".to_string(),
+                        area: "b".to_string(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                        depends_on: vec![1],
+                        reasoning: String::new(),
+                    },
+                ],
+                total_issues: 2,
+                parallel_capacity: 1,
+            };
+            let test_issues = vec![make_issue(1), make_issue(2)];
+            let mut graph =
+                DependencyGraph::from_planner_output("merge-unlock", &plan, &test_issues);
+            graph.transition(1, NodeState::AwaitingMerge);
+            graph.set_pr_number(1, 42);
+            graph.set_run_id(1, "run-1");
+
+            // Before polling: node 2 is not ready (dep 1 is AwaitingMerge)
+            assert!(graph.ready_issues().is_empty());
+
+            poll_awaiting_merges(&mut graph, &executor).await;
+
+            // After polling: node 1 merged, node 2 should now be ready
+            assert_eq!(graph.node(1).unwrap().state, NodeState::Merged);
+            assert_eq!(graph.ready_issues(), vec![2]);
         });
     }
 }

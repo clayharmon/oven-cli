@@ -220,6 +220,22 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
     }
 
+    /// Reconstruct a `PipelineOutcome` from graph node data (for merge polling).
+    ///
+    /// Worktree paths are deterministic, so we can rebuild the outcome from
+    /// the issue metadata stored on the graph node.
+    pub fn reconstruct_outcome(
+        &self,
+        issue: &PipelineIssue,
+        run_id: &str,
+        pr_number: u32,
+    ) -> Result<PipelineOutcome> {
+        let (target_dir, _) = self.resolve_target_dir(issue.target_repo.as_ref())?;
+        let worktree_path =
+            target_dir.join(".oven").join("worktrees").join(format!("issue-{}", issue.number));
+        Ok(PipelineOutcome { run_id: run_id.to_string(), pr_number, worktree_path, target_dir })
+    }
+
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {
         let conn = self.db.lock().await;
         db::runs::update_run_worktree(
