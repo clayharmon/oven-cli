@@ -420,16 +420,7 @@ fn spawn_issues<R: CommandRunner + 'static>(
                 Ok(p) => p,
                 Err(e) => return (number, Err(anyhow::anyhow!("semaphore closed: {e}"))),
             };
-            let result = exec.run_issue_pipeline(&issue, auto_merge, Some(complexity)).await;
-            let outcome = match result {
-                Ok(outcome) => {
-                    if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
-                        warn!(issue = number, error = %e, "finalize_merge failed");
-                    }
-                    Ok(outcome)
-                }
-                Err(e) => Err(e),
-            };
+            let outcome = exec.run_issue_pipeline(&issue, auto_merge, Some(complexity)).await;
             drop(permit);
             (number, outcome)
         });
