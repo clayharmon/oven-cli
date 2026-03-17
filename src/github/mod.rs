@@ -26,12 +26,20 @@ pub struct Issue {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<IssueLabel>,
+    #[serde(default)]
+    pub author: Option<IssueAuthor>,
 }
 
 /// A label on a GitHub issue (gh CLI returns objects with a `name` field).
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueLabel {
     pub name: String,
+}
+
+/// The author of a GitHub issue (gh CLI returns `{"login": "..."}` objects).
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueAuthor {
+    pub login: String,
 }
 
 /// Client for GitHub operations via the `gh` CLI.

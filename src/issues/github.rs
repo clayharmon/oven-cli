@@ -35,6 +35,7 @@ impl<R: CommandRunner + 'static> IssueProvider for GithubIssueProvider<R> {
                     body: parsed.body_without_frontmatter,
                     source: IssueOrigin::Github,
                     target_repo: parsed.target_repo,
+                    author: i.author.map(|a| a.login),
                 }
             })
             .collect())
@@ -49,6 +50,7 @@ impl<R: CommandRunner + 'static> IssueProvider for GithubIssueProvider<R> {
             body: parsed.body_without_frontmatter,
             source: IssueOrigin::Github,
             target_repo: parsed.target_repo,
+            author: issue.author.map(|a| a.login),
         })
     }
 
@@ -78,7 +80,7 @@ mod tests {
         mock.expect_run_gh().returning(|_, _| {
             Box::pin(async {
                 Ok(CommandOutput {
-                    stdout: r#"[{"number":1,"title":"Fix bug","body":"details","labels":[]}]"#
+                    stdout: r#"[{"number":1,"title":"Fix bug","body":"details","labels":[],"author":{"login":"me"}}]"#
                         .to_string(),
                     stderr: String::new(),
                     success: true,
@@ -94,6 +96,7 @@ mod tests {
         assert_eq!(issues[0].number, 1);
         assert_eq!(issues[0].source, IssueOrigin::Github);
         assert!(issues[0].target_repo.is_none());
+        assert_eq!(issues[0].author.as_deref(), Some("me"));
     }
 
     #[tokio::test]
@@ -116,6 +119,48 @@ mod tests {
 
         assert_eq!(issues[0].target_repo.as_deref(), Some("api"));
         assert_eq!(issues[0].body, "Body");
+    }
+
+    #[tokio::test]
+    async fn get_issue_propagates_author() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"number":5,"title":"Test","body":"b","labels":[],"author":{"login":"bob"}}"#
+                        .to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = Arc::new(GhClient::new(mock, Path::new("/tmp")));
+        let provider = GithubIssueProvider::new(client, "target_repo");
+        let issue = provider.get_issue(5).await.unwrap();
+
+        assert_eq!(issue.author.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn get_issue_author_none_when_missing() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"number":6,"title":"No author","body":"b","labels":[]}"#
+                        .to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = Arc::new(GhClient::new(mock, Path::new("/tmp")));
+        let provider = GithubIssueProvider::new(client, "target_repo");
+        let issue = provider.get_issue(6).await.unwrap();
+
+        assert!(issue.author.is_none());
     }
 
     #[tokio::test]
