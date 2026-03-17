@@ -101,8 +101,6 @@ fn show_graph(conn: &rusqlite::Connection, json: bool) -> Result<()> {
         return Ok(());
     };
 
-    let graph = DependencyGraph::from_db(conn, &session_id)?;
-
     if json {
         let nodes = db_graph::get_nodes(conn, &session_id)?;
         let edges = db_graph::get_edges(conn, &session_id)?;
@@ -126,6 +124,7 @@ fn show_graph(conn: &rusqlite::Connection, json: bool) -> Result<()> {
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let graph = DependencyGraph::from_db(conn, &session_id)?;
         println!("Dependency Graph (session {session_id}):");
         for line in graph.display_lines() {
             println!("{line}");

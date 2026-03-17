@@ -125,9 +125,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             base_branch: base_branch.clone(),
         };
 
-        let result = self
-            .run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch, &target_dir)
-            .await;
+        let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &target_dir).await;
 
         if let Err(ref e) = result {
             // On failure, finalize immediately (no merge to wait for)
@@ -362,7 +360,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
         auto_merge: bool,
-        base_branch: &str,
         target_dir: &std::path::Path,
     ) -> Result<()> {
         self.check_cancelled()?;
@@ -397,8 +394,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         // 3. Rebase onto base branch to resolve any conflicts from parallel merges
         self.check_cancelled()?;
-        info!(run_id = %run_id, base = base_branch, "rebasing onto base branch");
-        if let Err(e) = git::rebase_on_base(worktree_path, base_branch).await {
+        info!(run_id = %run_id, base = %ctx.base_branch, "rebasing onto base branch");
+        if let Err(e) = git::rebase_on_base(worktree_path, &ctx.base_branch).await {
             if let Some(pr_number) = ctx.pr_number {
                 github::safe_comment(
                     &self.github,
@@ -411,7 +408,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             return Err(e);
         }
         git::force_push_branch(worktree_path, &ctx.branch).await?;
-
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
             self.check_cancelled()?;

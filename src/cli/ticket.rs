@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::{GlobalOpts, TicketArgs, TicketCommands};
-use crate::issues::local::{parse_label_array, rewrite_frontmatter_labels};
+use crate::{
+    issues::local::{parse_label_array, rewrite_frontmatter_labels},
+    pipeline::executor::truncate,
+};
 
 #[allow(clippy::unused_async)]
 pub async fn run(args: TicketArgs, _global: &GlobalOpts) -> Result<()> {
@@ -210,18 +213,6 @@ fn replace_frontmatter_status(content: &str, from: &str, to: &str) -> String {
     }
     // Fallback: no valid frontmatter, do nothing
     content.to_string()
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
-    let target = max_len.saturating_sub(3);
-    let mut end = target;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &s[..end])
 }
 
 #[cfg(test)]
