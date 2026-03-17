@@ -278,19 +278,9 @@ impl DependencyGraph {
     /// this session. Runs inside a transaction so a crash mid-save cannot leave a
     /// partial graph.
     pub fn save_to_db(&self, conn: &Connection) -> Result<()> {
-        conn.execute_batch("BEGIN IMMEDIATE").context("starting graph save transaction")?;
+        let tx = conn.unchecked_transaction().context("starting graph save transaction")?;
 
-        let result = self.save_to_db_inner(conn);
-        if result.is_ok() {
-            conn.execute_batch("COMMIT").context("committing graph save transaction")?;
-        } else {
-            let _ = conn.execute_batch("ROLLBACK");
-        }
-        result
-    }
-
-    fn save_to_db_inner(&self, conn: &Connection) -> Result<()> {
-        graph::delete_session(conn, &self.session_id)?;
+        graph::delete_session(&tx, &self.session_id)?;
         for node in self.nodes.values() {
             let row = GraphNodeRow {
                 issue_number: node.issue_number,
@@ -304,13 +294,15 @@ impl DependencyGraph {
                 has_migration: node.has_migration,
                 complexity: node.complexity.clone(),
             };
-            graph::insert_node(conn, &self.session_id, &row)?;
+            graph::insert_node(&tx, &self.session_id, &row)?;
         }
         for (&from, deps) in &self.edges {
             for &to in deps {
-                graph::insert_edge(conn, &self.session_id, from, to)?;
+                graph::insert_edge(&tx, &self.session_id, from, to)?;
             }
         }
+
+        tx.commit().context("committing graph save transaction")?;
         Ok(())
     }
 
