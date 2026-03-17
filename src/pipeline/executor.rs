@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agents::{
         self, AgentContext, AgentInvocation, AgentRole, Complexity, GraphContextNode,
-        PlannerGraphOutput, Severity, invoke_agent, parse_planner_graph_output,
+        PlannerGraphOutput, Severity, invoke_agent, parse_fixer_output, parse_planner_graph_output,
         parse_review_output,
     },
     config::Config,
@@ -435,7 +435,17 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
-            let review_prompt = agents::reviewer::build_prompt(ctx, &[])?;
+
+            // On cycles 2+, include prior disputes so the reviewer sees what the
+            // fixer already tried and why certain findings were skipped.
+            let prior_disputes = if cycle > 1 {
+                let conn = self.db.lock().await;
+                db::agent_runs::get_resolved_findings(&conn, run_id)?
+            } else {
+                Vec::new()
+            };
+
+            let review_prompt = agents::reviewer::build_prompt(ctx, &prior_disputes)?;
             let review_result = self
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
@@ -488,12 +498,50 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             };
 
             let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
-            self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
+            let fix_result =
+                self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
+
+            // Parse fixer output and mark disputed findings as resolved
+            let fixer_output = parse_fixer_output(&fix_result.output);
+            self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
 
             git::push_branch(worktree_path, &ctx.branch).await?;
         }
 
         Ok(false)
+    }
+
+    /// Process fixer disputes by marking corresponding review findings as resolved.
+    ///
+    /// The fixer references findings by 1-indexed position in the list it received.
+    /// We map those back to the actual `ReviewFinding` IDs and mark them resolved
+    /// with the fixer's dispute reason.
+    async fn process_fixer_disputes(
+        &self,
+        run_id: &str,
+        findings_sent_to_fixer: &[ReviewFinding],
+        fixer_output: &agents::FixerOutput,
+    ) -> Result<()> {
+        if fixer_output.disputed.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.db.lock().await;
+        for dispute in &fixer_output.disputed {
+            // finding numbers are 1-indexed
+            let idx = dispute.finding.saturating_sub(1) as usize;
+            if let Some(finding) = findings_sent_to_fixer.get(idx) {
+                db::agent_runs::resolve_finding(&conn, finding.id, &dispute.reason)?;
+                info!(
+                    run_id = %run_id,
+                    finding_id = finding.id,
+                    reason = %dispute.reason,
+                    "finding disputed by fixer, marked resolved"
+                );
+            }
+        }
+        drop(conn);
+        Ok(())
     }
 
     async fn store_findings(&self, run_id: &str, findings: &[agents::Finding]) -> Result<()> {
