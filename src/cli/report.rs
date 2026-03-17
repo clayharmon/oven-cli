@@ -4,13 +4,20 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::{GlobalOpts, ReportArgs};
-use crate::db::{self, AgentRun, Run};
+use crate::{
+    db::{self, AgentRun, Run, graph as db_graph},
+    pipeline::graph::DependencyGraph,
+};
 
 #[allow(clippy::unused_async)]
 pub async fn run(args: ReportArgs, _global: &GlobalOpts) -> Result<()> {
     let project_dir = std::env::current_dir().context("getting current directory")?;
     let db_path = project_dir.join(".oven").join("oven.db");
     let conn = db::open(&db_path)?;
+
+    if args.graph {
+        return show_graph(&conn, args.json);
+    }
 
     if args.all {
         let runs = db::runs::get_all_runs(&conn)?;
@@ -86,6 +93,71 @@ fn print_run_report(run: &Run, agent_runs: &[AgentRun]) {
             println!("{line}");
         }
     }
+}
+
+fn show_graph(conn: &rusqlite::Connection, json: bool) -> Result<()> {
+    let Some(session_id) = db_graph::get_active_session(conn)? else {
+        println!("no active dependency graph found");
+        return Ok(());
+    };
+
+    let graph = DependencyGraph::from_db(conn, &session_id)?;
+
+    if json {
+        let nodes = db_graph::get_nodes(conn, &session_id)?;
+        let edges = db_graph::get_edges(conn, &session_id)?;
+        let report = GraphReport {
+            session_id,
+            nodes: nodes
+                .iter()
+                .map(|n| GraphNodeReport {
+                    issue_number: n.issue_number,
+                    title: n.title.clone(),
+                    state: n.state.to_string(),
+                    area: n.area.clone(),
+                    pr_number: n.pr_number,
+                    run_id: n.run_id.clone(),
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(from, to)| GraphEdgeReport { from: *from, to: *to })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Dependency Graph (session {session_id}):");
+        for line in graph.display_lines() {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct GraphReport {
+    session_id: String,
+    nodes: Vec<GraphNodeReport>,
+    edges: Vec<GraphEdgeReport>,
+}
+
+#[derive(Serialize)]
+struct GraphNodeReport {
+    issue_number: u32,
+    title: String,
+    state: String,
+    area: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphEdgeReport {
+    from: u32,
+    to: u32,
 }
 
 /// Serializable report for JSON output.
