@@ -1,4 +1,4 @@
-# oven
+# oven 🍞
 
 let 'em cook.
 
@@ -7,10 +7,10 @@ Oven is a CLI that runs Claude Code agent pipelines against your GitHub issues. 
 ## How it works
 
 1. You label a GitHub issue `o-ready`
-2. Oven picks it up, creates a draft PR, and gets to work
+2. Oven picks it up, plans a dependency graph, and creates draft PRs
 3. An implementer writes the code and tests
 4. A reviewer checks quality, security, and simplicity
-5. A fixer addresses any findings (up to 2 rounds)
+5. A fixer addresses any findings (up to 2 rounds, can dispute false positives)
 6. You get a PR ready for human review
 
 All agent activity shows up as comments on the PR. You stay in the loop without being in the way.
@@ -28,7 +28,9 @@ flowchart LR
     style F fill:#d4edda,stroke:#555
 ```
 
-Oven keeps polling while it works. New issues that can run in parallel get picked up automatically, even mid-run.
+The planner builds a dependency graph across issues so dependent work waits for its prerequisites to merge before starting.
+
+Oven keeps polling while it works. Issues with no dependencies run in parallel, and new issues get picked up automatically mid-run.
 
 ## Install
 
@@ -50,6 +52,9 @@ oven on
 # Or run specific issues
 oven on 123,245
 
+# Skip author validation for explicit IDs
+oven on 123 --trust
+
 # Detached mode
 oven on -d
 
@@ -61,10 +66,10 @@ oven on -m
 
 ```
 oven prep              Set up project (recipe.toml, agents, db)
-oven on [IDS]          Start the pipeline (-d detached, -m auto-merge)
+oven on [IDS]          Start the pipeline (-d detached, -m auto-merge, --trust)
 oven off               Stop a detached run
 oven look [RUN_ID]     View logs (--agent <name> to filter)
-oven report [RUN_ID]   Costs, runtime, summary (--all, --json)
+oven report [RUN_ID]   Costs, runtime, summary (--all, --json, --graph)
 oven clean             Remove worktrees, logs, merged branches
 oven ticket            Local issue management (create, list, view, close, label, edit)
 ```
@@ -133,4 +138,4 @@ Tickets are markdown files in `.oven/issues/`. Oven picks them up the same way i
 
 ---
 
-Built with Rust.
+Built with Rust. 🍞
