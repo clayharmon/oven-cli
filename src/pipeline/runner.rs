@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use super::executor::PipelineExecutor;
 use crate::{
-    agents::{InFlightIssue, PlannerOutput},
+    agents::{GraphContextNode, InFlightIssue, PlannerGraphOutput, PlannerOutput},
     issues::PipelineIssue,
     process::CommandRunner,
 };
@@ -44,14 +44,79 @@ pub async fn run_batch<R: CommandRunner + 'static>(
 ) -> Result<()> {
     if let Some(plan) = executor.plan_issues(&issues, &[]).await {
         info!(
-            batches = plan.batches.len(),
+            nodes = plan.nodes.len(),
             total = plan.total_issues,
-            "planner produced a plan, running batches sequentially"
+            "planner produced a plan, converting to batch execution"
         );
-        run_batches_sequentially(executor, &issues, &plan, max_parallel, auto_merge).await
+        let legacy = graph_output_to_legacy(&plan);
+        run_batches_sequentially(executor, &issues, &legacy, max_parallel, auto_merge).await
     } else {
         warn!("planner failed, falling back to all-parallel execution");
         run_all_parallel(executor, issues, max_parallel, auto_merge).await
+    }
+}
+
+/// Convert a DAG planner output into legacy batch format for sequential execution.
+///
+/// Uses a topological sort to group nodes into dependency layers. Nodes with
+/// no unsatisfied dependencies go in batch 1, nodes depending only on batch 1
+/// go in batch 2, etc.
+fn graph_output_to_legacy(plan: &PlannerGraphOutput) -> PlannerOutput {
+    use std::collections::VecDeque;
+
+    let mut batches = Vec::new();
+    let mut assigned: HashSet<u32> = HashSet::new();
+    let mut remaining: VecDeque<&crate::agents::PlannedNode> = plan.nodes.iter().collect();
+    let mut batch_num = 0u32;
+
+    while !remaining.is_empty() {
+        batch_num += 1;
+        let mut current_batch = Vec::new();
+        let mut next_remaining = VecDeque::new();
+
+        for node in remaining {
+            if node.depends_on.iter().all(|d| assigned.contains(d)) {
+                current_batch.push(node);
+            } else {
+                next_remaining.push_back(node);
+            }
+        }
+
+        if current_batch.is_empty() {
+            // Remaining nodes have unresolvable deps, force them into final batch
+            for node in next_remaining {
+                current_batch.push(node);
+            }
+            next_remaining = VecDeque::new();
+        }
+
+        for node in &current_batch {
+            assigned.insert(node.number);
+        }
+
+        batches.push(crate::agents::Batch {
+            batch: batch_num,
+            issues: current_batch
+                .iter()
+                .map(|n| crate::agents::PlannedIssue {
+                    number: n.number,
+                    title: n.title.clone(),
+                    area: n.area.clone(),
+                    predicted_files: n.predicted_files.clone(),
+                    has_migration: n.has_migration,
+                    complexity: n.complexity.clone(),
+                })
+                .collect(),
+            reasoning: current_batch.first().map_or_else(String::new, |n| n.reasoning.clone()),
+        });
+
+        remaining = next_remaining;
+    }
+
+    PlannerOutput {
+        batches,
+        total_issues: plan.total_issues,
+        parallel_capacity: plan.parallel_capacity,
     }
 }
 
@@ -309,16 +374,21 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     clean_stale_deferred(deferred, &ready_numbers).await;
 
     // Snapshot in-flight and deferred state, then filter to genuinely new issues
-    let in_flight_guard = in_flight.lock().await;
-    let in_flight_snapshot: Vec<InFlightIssue> = in_flight_guard.values().cloned().collect();
-    let in_flight_numbers: HashSet<u32> = in_flight_guard.keys().copied().collect();
-    drop(in_flight_guard);
+    let (in_flight_numbers, in_flight_snapshot) = {
+        let guard = in_flight.lock().await;
+        let numbers: HashSet<u32> = guard.keys().copied().collect();
+        let snapshot: Vec<InFlightIssue> = guard.values().cloned().collect();
+        drop(guard);
+        (numbers, snapshot)
+    };
 
-    let deferred_guard = deferred.lock().await;
-    let deferred_context: Vec<InFlightIssue> =
-        deferred_guard.values().map(|d| d.metadata.clone()).collect();
-    let deferred_numbers: HashSet<u32> = deferred_guard.keys().copied().collect();
-    drop(deferred_guard);
+    let (deferred_numbers, deferred_snapshot) = {
+        let guard = deferred.lock().await;
+        let numbers: HashSet<u32> = guard.keys().copied().collect();
+        let snapshot: Vec<DeferredIssue> = guard.values().cloned().collect();
+        drop(guard);
+        (numbers, snapshot)
+    };
 
     let new_issues: Vec<_> = ready_issues
         .into_iter()
@@ -331,16 +401,32 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     if !new_issues.is_empty() {
         info!(count = new_issues.len(), "found new issues to evaluate");
 
-        let mut planner_context = in_flight_snapshot;
-        planner_context.extend(deferred_context);
+        let mut graph_context: Vec<GraphContextNode> = in_flight_snapshot
+            .iter()
+            .map(|ifl| GraphContextNode {
+                number: ifl.number,
+                title: ifl.title.clone(),
+                state: "in_flight".to_string(),
+                area: ifl.area.clone(),
+                predicted_files: ifl.predicted_files.clone(),
+                has_migration: ifl.has_migration,
+                depends_on: vec![],
+            })
+            .collect();
+        graph_context.extend(deferred_snapshot.iter().map(|d| GraphContextNode {
+            number: d.metadata.number,
+            title: d.metadata.title.clone(),
+            state: "pending".to_string(),
+            area: d.metadata.area.clone(),
+            predicted_files: d.metadata.predicted_files.clone(),
+            has_migration: d.metadata.has_migration,
+            depends_on: d.awaiting.iter().copied().collect(),
+        }));
 
-        if let Some(plan) = executor.plan_issues(&new_issues, &planner_context).await {
-            info!(
-                batches = plan.batches.len(),
-                total = plan.total_issues,
-                "planner produced a plan"
-            );
-            apply_plan(&new_issues, &plan, &in_flight_numbers, &mut to_spawn, deferred).await;
+        if let Some(plan) = executor.plan_issues(&new_issues, &graph_context).await {
+            info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
+            let legacy = graph_output_to_legacy(&plan);
+            apply_plan(&new_issues, &legacy, &in_flight_numbers, &mut to_spawn, deferred).await;
         } else {
             warn!("planner failed, spawning all new issues immediately");
             for issue in &new_issues {

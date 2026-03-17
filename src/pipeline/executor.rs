@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     agents::{
-        self, AgentContext, AgentInvocation, AgentRole, Complexity, InFlightIssue, PlannerOutput,
-        Severity, invoke_agent, parse_planner_output, parse_review_output,
+        self, AgentContext, AgentInvocation, AgentRole, Complexity, GraphContextNode,
+        PlannerGraphOutput, Severity, invoke_agent, parse_planner_graph_output,
+        parse_review_output,
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
@@ -108,18 +109,18 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         result
     }
 
-    /// Invoke the planner agent to decide batching and complexity for a set of issues.
+    /// Invoke the planner agent to decide dependency ordering for a set of issues.
     ///
-    /// `in_flight` describes issues currently running through the pipeline so the planner
-    /// can avoid scheduling conflicting work in batch 1.
+    /// `graph_context` describes the current dependency graph state so the planner
+    /// can avoid scheduling conflicting work alongside in-flight issues.
     ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
     pub async fn plan_issues(
         &self,
         issues: &[PipelineIssue],
-        in_flight: &[InFlightIssue],
-    ) -> Option<PlannerOutput> {
-        let prompt = match agents::planner::build_prompt(issues, in_flight) {
+        graph_context: &[GraphContextNode],
+    ) -> Option<PlannerGraphOutput> {
+        let prompt = match agents::planner::build_prompt(issues, graph_context) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "planner prompt build failed");
@@ -136,14 +137,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         match invoke_agent(self.runner.as_ref(), &invocation).await {
             Ok(result) => {
                 debug!(output = %result.output, "raw planner output");
-                let parsed = parse_planner_output(&result.output);
+                let parsed = parse_planner_graph_output(&result.output);
                 if parsed.is_none() {
-                    warn!(output = %result.output, "planner returned unparseable output, falling back to single batch");
+                    warn!(output = %result.output, "planner returned unparseable output, falling back to all-parallel");
                 }
                 parsed
             }
             Err(e) => {
-                warn!(error = %e, "planner agent failed, falling back to single batch");
+                warn!(error = %e, "planner agent failed, falling back to all-parallel");
                 None
             }
         }
