@@ -75,7 +75,7 @@ impl<R: CommandRunner> GhClient<R> {
                     "--author",
                     "@me",
                     "--json",
-                    "number,title,body,labels",
+                    "number,title,body,labels,author",
                     "--state",
                     "open",
                     "--limit",
@@ -104,7 +104,7 @@ impl<R: CommandRunner> GhClient<R> {
                     "view",
                     &issue_number.to_string(),
                     "--json",
-                    "number,title,body,labels",
+                    "number,title,body,labels,author",
                 ]),
                 &self.repo_dir,
             )
@@ -262,7 +262,13 @@ mod tests {
     }
 
     fn make_issue(body: &str) -> Issue {
-        Issue { number: 1, title: "Test".to_string(), body: body.to_string(), labels: vec![] }
+        Issue {
+            number: 1,
+            title: "Test".to_string(),
+            body: body.to_string(),
+            labels: vec![],
+            author: None,
+        }
     }
 
     #[test]

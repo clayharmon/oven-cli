@@ -62,6 +62,9 @@ pub struct OnArgs {
     /// Auto-merge PRs when done
     #[arg(short, long)]
     pub merge: bool,
+    /// Skip author validation for explicit issue IDs
+    #[arg(short, long)]
+    pub trust: bool,
     /// Internal: pre-generated run ID (used by detached mode)
     #[arg(long, hide = true)]
     pub run_id: Option<String>,

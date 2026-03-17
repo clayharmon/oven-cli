@@ -15,6 +15,7 @@ pub struct PipelineIssue {
     pub body: String,
     pub source: IssueOrigin,
     pub target_repo: Option<String>,
+    pub author: Option<String>,
 }
 
 /// Where an issue originated.

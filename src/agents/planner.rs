@@ -28,6 +28,7 @@ mod tests {
                 body: "implement login flow".to_string(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
             PipelineIssue {
                 number: 2,
@@ -35,6 +36,7 @@ mod tests {
                 body: "crash on startup".to_string(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
         ]
     }

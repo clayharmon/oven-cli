@@ -4,7 +4,7 @@ pub mod prs;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::process::{CommandOutput, CommandRunner};
@@ -54,6 +54,17 @@ impl<R: CommandRunner> GhClient<R> {
             anyhow::bail!("{operation} failed: {}", output.stderr.trim());
         }
         Ok(())
+    }
+
+    /// Get the login of the currently authenticated GitHub user.
+    pub async fn get_current_user(&self) -> Result<String> {
+        let output = self
+            .runner
+            .run_gh(&Self::s(&["api", "user", "--jq", ".login"]), &self.repo_dir)
+            .await
+            .context("fetching current user")?;
+        Self::check_output(&output, "get current user")?;
+        Ok(output.stdout.trim().to_string())
     }
 }
 

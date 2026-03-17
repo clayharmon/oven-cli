@@ -29,12 +29,14 @@ impl<R: CommandRunner + 'static> IssueProvider for GithubIssueProvider<R> {
             .into_iter()
             .map(|i| {
                 let parsed = parse_issue_frontmatter(&i, &self.target_field);
+                let author = i.author.map(|a| a.login);
                 PipelineIssue {
                     number: i.number,
                     title: i.title,
                     body: parsed.body_without_frontmatter,
                     source: IssueOrigin::Github,
                     target_repo: parsed.target_repo,
+                    author,
                 }
             })
             .collect())
@@ -43,12 +45,14 @@ impl<R: CommandRunner + 'static> IssueProvider for GithubIssueProvider<R> {
     async fn get_issue(&self, number: u32) -> Result<PipelineIssue> {
         let issue = self.client.get_issue(number).await?;
         let parsed = parse_issue_frontmatter(&issue, &self.target_field);
+        let author = issue.author.map(|a| a.login);
         Ok(PipelineIssue {
             number: issue.number,
             title: issue.title,
             body: parsed.body_without_frontmatter,
             source: IssueOrigin::Github,
             target_repo: parsed.target_repo,
+            author,
         })
     }
 

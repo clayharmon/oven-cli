@@ -140,6 +140,7 @@ impl IssueProvider for LocalIssueProvider {
                         body: ticket.body,
                         source: IssueOrigin::Local,
                         target_repo: ticket.target_repo,
+                        author: None,
                     });
                 }
             }
@@ -159,6 +160,7 @@ impl IssueProvider for LocalIssueProvider {
             body: ticket.body,
             source: IssueOrigin::Local,
             target_repo: ticket.target_repo,
+            author: None,
         })
     }
 

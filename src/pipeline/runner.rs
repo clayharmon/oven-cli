@@ -600,6 +600,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
             PipelineIssue {
                 number: 2,
@@ -607,6 +608,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
             PipelineIssue {
                 number: 3,
@@ -614,6 +616,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
         ];
 
@@ -837,6 +840,7 @@ mod tests {
                     body: String::new(),
                     source: IssueOrigin::Github,
                     target_repo: None,
+                    author: None,
                 },
                 metadata: InFlightIssue {
                     number: 2,
@@ -857,6 +861,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
             PipelineIssue {
                 number: 2,
@@ -864,6 +869,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
             PipelineIssue {
                 number: 3,
@@ -871,6 +877,7 @@ mod tests {
                 body: String::new(),
                 source: IssueOrigin::Github,
                 target_repo: None,
+                author: None,
             },
         ];
 
@@ -901,6 +908,7 @@ mod tests {
                     body: String::new(),
                     source: IssueOrigin::Github,
                     target_repo: None,
+                    author: None,
                 },
                 metadata: InFlightIssue {
                     number: 3,
@@ -962,6 +970,7 @@ mod tests {
                         body: String::new(),
                         source: IssueOrigin::Github,
                         target_repo: None,
+                        author: None,
                     },
                     metadata: InFlightIssue {
                         number: 2,
@@ -983,6 +992,7 @@ mod tests {
                         body: String::new(),
                         source: IssueOrigin::Github,
                         target_repo: None,
+                        author: None,
                     },
                     metadata: InFlightIssue {
                         number: 3,
@@ -1053,6 +1063,7 @@ mod tests {
             body: "body".to_string(),
             source: IssueOrigin::Github,
             target_repo: None,
+            author: None,
         }];
 
         // plan_issues returns None for unparseable output
