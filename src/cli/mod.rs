@@ -86,6 +86,9 @@ pub struct ReportArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+    /// Show the dependency graph
+    #[arg(long)]
+    pub graph: bool,
 }
 
 #[derive(Args)]

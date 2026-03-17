@@ -1,4 +1,5 @@
 pub mod agent_runs;
+pub mod graph;
 pub mod runs;
 
 use std::path::Path;
@@ -58,6 +59,35 @@ CREATE INDEX idx_findings_severity ON review_findings(severity);",
         M::up("ALTER TABLE runs ADD COLUMN complexity TEXT NOT NULL DEFAULT 'full';"),
         M::up("ALTER TABLE runs ADD COLUMN issue_source TEXT NOT NULL DEFAULT 'github';"),
         M::up("ALTER TABLE agent_runs ADD COLUMN raw_output TEXT;"),
+        M::up(
+            "CREATE TABLE graph_nodes (
+    issue_number INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    pr_number INTEGER,
+    run_id TEXT,
+    title TEXT NOT NULL DEFAULT '',
+    area TEXT NOT NULL DEFAULT '',
+    predicted_files TEXT NOT NULL DEFAULT '[]',
+    has_migration INTEGER NOT NULL DEFAULT 0,
+    complexity TEXT NOT NULL DEFAULT 'full',
+    PRIMARY KEY (issue_number, session_id)
+);
+
+CREATE TABLE graph_edges (
+    session_id TEXT NOT NULL,
+    from_issue INTEGER NOT NULL,
+    to_issue INTEGER NOT NULL,
+    PRIMARY KEY (session_id, from_issue, to_issue),
+    FOREIGN KEY (from_issue, session_id) REFERENCES graph_nodes(issue_number, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (to_issue, session_id) REFERENCES graph_nodes(issue_number, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_graph_nodes_session ON graph_nodes(session_id);
+CREATE INDEX idx_graph_nodes_state ON graph_nodes(state);
+CREATE INDEX idx_graph_edges_session ON graph_edges(session_id);
+CREATE INDEX idx_graph_edges_to ON graph_edges(to_issue, session_id);",
+        ),
     ])
 });
 
@@ -90,6 +120,7 @@ pub enum RunStatus {
     Implementing,
     Reviewing,
     Fixing,
+    AwaitingMerge,
     Merging,
     Complete,
     Failed,
@@ -102,6 +133,7 @@ impl std::fmt::Display for RunStatus {
             Self::Implementing => "implementing",
             Self::Reviewing => "reviewing",
             Self::Fixing => "fixing",
+            Self::AwaitingMerge => "awaiting_merge",
             Self::Merging => "merging",
             Self::Complete => "complete",
             Self::Failed => "failed",
@@ -118,6 +150,7 @@ impl std::str::FromStr for RunStatus {
             "implementing" => Ok(Self::Implementing),
             "reviewing" => Ok(Self::Reviewing),
             "fixing" => Ok(Self::Fixing),
+            "awaiting_merge" => Ok(Self::AwaitingMerge),
             "merging" => Ok(Self::Merging),
             "complete" => Ok(Self::Complete),
             "failed" => Ok(Self::Failed),
@@ -180,11 +213,12 @@ mod tests {
 
     use super::*;
 
-    const ALL_STATUSES: [RunStatus; 7] = [
+    const ALL_STATUSES: [RunStatus; 8] = [
         RunStatus::Pending,
         RunStatus::Implementing,
         RunStatus::Reviewing,
         RunStatus::Fixing,
+        RunStatus::AwaitingMerge,
         RunStatus::Merging,
         RunStatus::Complete,
         RunStatus::Failed,
@@ -192,7 +226,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn run_status_display_fromstr_roundtrip(idx in 0..7usize) {
+        fn run_status_display_fromstr_roundtrip(idx in 0..8usize) {
             let status = ALL_STATUSES[idx];
             let s = status.to_string();
             let parsed: RunStatus = s.parse().unwrap();
@@ -226,6 +260,7 @@ mod tests {
             RunStatus::Implementing,
             RunStatus::Reviewing,
             RunStatus::Fixing,
+            RunStatus::AwaitingMerge,
             RunStatus::Merging,
             RunStatus::Complete,
             RunStatus::Failed,

@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     agents::{
-        self, AgentContext, AgentInvocation, AgentRole, Complexity, InFlightIssue, PlannerOutput,
-        Severity, invoke_agent, parse_planner_output, parse_review_output,
+        self, AgentContext, AgentInvocation, AgentRole, Complexity, GraphContextNode,
+        PlannerGraphOutput, Severity, invoke_agent, parse_planner_graph_output,
+        parse_review_output,
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
@@ -18,6 +19,17 @@ use crate::{
     issues::{IssueOrigin, IssueProvider, PipelineIssue},
     process::CommandRunner,
 };
+
+/// The result of running an issue through the pipeline (before merge).
+#[derive(Debug)]
+pub struct PipelineOutcome {
+    pub run_id: String,
+    pub pr_number: u32,
+    /// Worktree path, retained so the caller can clean up after merge.
+    pub worktree_path: PathBuf,
+    /// Repo directory the worktree belongs to (needed for `git::remove_worktree`).
+    pub target_dir: PathBuf,
+}
 
 /// Runs a single issue through the full pipeline.
 pub struct PipelineExecutor<R: CommandRunner> {
@@ -43,6 +55,21 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         auto_merge: bool,
         complexity: Option<Complexity>,
     ) -> Result<()> {
+        let outcome = self.run_issue_pipeline(issue, auto_merge, complexity).await?;
+        self.finalize_merge(&outcome, issue).await
+    }
+
+    /// Run the pipeline up to (but not including) finalization.
+    ///
+    /// Returns a `PipelineOutcome` with the run ID and PR number.
+    /// The caller is responsible for calling `finalize_run` or `finalize_merge`
+    /// at the appropriate time (e.g., after the PR is actually merged).
+    pub async fn run_issue_pipeline(
+        &self,
+        issue: &PipelineIssue,
+        auto_merge: bool,
+        complexity: Option<Complexity>,
+    ) -> Result<PipelineOutcome> {
         let run_id = generate_run_id();
 
         // Determine target repo for worktrees and PRs (multi-repo routing)
@@ -99,27 +126,54 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         };
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch).await;
-        self.finalize_run(&run_id, issue, pr_number, &result).await?;
 
-        if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
-            warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
+        if let Err(ref e) = result {
+            // On failure, finalize immediately (no merge to wait for)
+            self.finalize_run(&run_id, issue, pr_number, &result).await?;
+            if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
+                warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
+            }
+            return Err(anyhow::anyhow!("{e:#}"));
         }
 
-        result
+        // Update status to AwaitingMerge
+        self.update_status(&run_id, RunStatus::AwaitingMerge).await?;
+
+        Ok(PipelineOutcome { run_id, pr_number, worktree_path: worktree.path, target_dir })
     }
 
-    /// Invoke the planner agent to decide batching and complexity for a set of issues.
+    /// Finalize a run after its PR has been merged.
     ///
-    /// `in_flight` describes issues currently running through the pipeline so the planner
-    /// can avoid scheduling conflicting work in batch 1.
+    /// Transitions labels, closes issues, marks the run as complete, and cleans
+    /// up the worktree that was left around while awaiting merge.
+    pub async fn finalize_merge(
+        &self,
+        outcome: &PipelineOutcome,
+        issue: &PipelineIssue,
+    ) -> Result<()> {
+        self.finalize_run(&outcome.run_id, issue, outcome.pr_number, &Ok(())).await?;
+        if let Err(e) = git::remove_worktree(&outcome.target_dir, &outcome.worktree_path).await {
+            warn!(
+                run_id = %outcome.run_id,
+                error = %e,
+                "failed to clean up worktree after merge"
+            );
+        }
+        Ok(())
+    }
+
+    /// Invoke the planner agent to decide dependency ordering for a set of issues.
+    ///
+    /// `graph_context` describes the current dependency graph state so the planner
+    /// can avoid scheduling conflicting work alongside in-flight issues.
     ///
     /// Returns `None` if the planner fails or returns unparseable output (fallback to default).
     pub async fn plan_issues(
         &self,
         issues: &[PipelineIssue],
-        in_flight: &[InFlightIssue],
-    ) -> Option<PlannerOutput> {
-        let prompt = match agents::planner::build_prompt(issues, in_flight) {
+        graph_context: &[GraphContextNode],
+    ) -> Option<PlannerGraphOutput> {
+        let prompt = match agents::planner::build_prompt(issues, graph_context) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "planner prompt build failed");
@@ -136,14 +190,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         match invoke_agent(self.runner.as_ref(), &invocation).await {
             Ok(result) => {
                 debug!(output = %result.output, "raw planner output");
-                let parsed = parse_planner_output(&result.output);
+                let parsed = parse_planner_graph_output(&result.output);
                 if parsed.is_none() {
-                    warn!(output = %result.output, "planner returned unparseable output, falling back to single batch");
+                    warn!(output = %result.output, "planner returned unparseable output, falling back to all-parallel");
                 }
                 parsed
             }
             Err(e) => {
-                warn!(error = %e, "planner agent failed, falling back to single batch");
+                warn!(error = %e, "planner agent failed, falling back to all-parallel");
                 None
             }
         }
@@ -164,6 +218,22 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             }
             None => Ok((self.repo_dir.clone(), false)),
         }
+    }
+
+    /// Reconstruct a `PipelineOutcome` from graph node data (for merge polling).
+    ///
+    /// Worktree paths are deterministic, so we can rebuild the outcome from
+    /// the issue metadata stored on the graph node.
+    pub fn reconstruct_outcome(
+        &self,
+        issue: &PipelineIssue,
+        run_id: &str,
+        pr_number: u32,
+    ) -> Result<PipelineOutcome> {
+        let (target_dir, _) = self.resolve_target_dir(issue.target_repo.as_ref())?;
+        let worktree_path =
+            target_dir.join(".oven").join("worktrees").join(format!("issue-{}", issue.number));
+        Ok(PipelineOutcome { run_id: run_id.to_string(), pr_number, worktree_path, target_dir })
     }
 
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {
