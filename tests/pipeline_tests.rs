@@ -1811,11 +1811,18 @@ async fn fixer_disputes_break_deadlock() {
     let runs = db::runs::get_all_runs(&conn).unwrap();
     assert_eq!(runs[0].status, RunStatus::Complete);
 
-    // Verify finding 2 was resolved with dispute reason
+    // Verify both findings are resolved: finding 1 (addressed) and finding 2 (disputed)
     let resolved = db::agent_runs::get_resolved_findings(&conn, &runs[0].id).unwrap();
     drop(conn);
-    assert_eq!(resolved.len(), 1);
-    assert!(resolved[0].dispute_reason.as_deref().unwrap().contains("FlashList v2"));
+    assert_eq!(resolved.len(), 2);
+    let has_addressed = resolved
+        .iter()
+        .any(|f| f.dispute_reason.as_deref().unwrap().starts_with("ADDRESSED: "));
+    let has_disputed = resolved
+        .iter()
+        .any(|f| f.dispute_reason.as_deref().unwrap().contains("FlashList v2"));
+    assert!(has_addressed, "expected an addressed finding");
+    assert!(has_disputed, "expected a disputed finding");
 }
 
 #[tokio::test]

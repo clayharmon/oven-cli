@@ -432,16 +432,36 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
 
-            // On cycles 2+, include prior disputes so the reviewer sees what the
-            // fixer already tried and why certain findings were skipped.
-            let prior_disputes = if cycle > 1 {
+            // On cycles 2+, include prior resolved findings so the reviewer sees
+            // what was addressed (fixed) and what was disputed (rejected) by the fixer.
+            let (prior_addressed, prior_disputes) = if cycle > 1 {
                 let conn = self.db.lock().await;
-                db::agent_runs::get_resolved_findings(&conn, run_id)?
+                let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
+                drop(conn);
+
+                let (mut addressed, disputed): (Vec<_>, Vec<_>) =
+                    all_resolved.into_iter().partition(|f| {
+                        f.dispute_reason
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("ADDRESSED: "))
+                    });
+
+                // Strip the "ADDRESSED: " prefix so the template gets clean action text
+                for f in &mut addressed {
+                    if let Some(ref mut reason) = f.dispute_reason {
+                        if let Some(stripped) = reason.strip_prefix("ADDRESSED: ") {
+                            *reason = stripped.to_string();
+                        }
+                    }
+                }
+
+                (addressed, disputed)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
 
-            let review_prompt = agents::reviewer::build_prompt(ctx, &prior_disputes)?;
+            let review_prompt =
+                agents::reviewer::build_prompt(ctx, &prior_addressed, &prior_disputes)?;
             let review_result = self
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
@@ -497,9 +517,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             let fix_result =
                 self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
 
-            // Parse fixer output and mark disputed findings as resolved
+            // Parse fixer output and mark disputed + addressed findings as resolved
             let fixer_output = parse_fixer_output(&fix_result.output);
             self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
+            self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
 
             git::push_branch(worktree_path, &ctx.branch).await?;
         }
@@ -533,6 +554,39 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     finding_id = finding.id,
                     reason = %dispute.reason,
                     "finding disputed by fixer, marked resolved"
+                );
+            }
+        }
+        drop(conn);
+        Ok(())
+    }
+
+    /// Process fixer addressed actions by marking corresponding review findings as resolved.
+    ///
+    /// Similar to `process_fixer_disputes`, but for findings the fixer actually fixed.
+    /// Stores the action with an `ADDRESSED: ` prefix so we can distinguish addressed
+    /// findings from disputed ones when building the next reviewer prompt.
+    async fn process_fixer_addressed(
+        &self,
+        run_id: &str,
+        findings_sent_to_fixer: &[ReviewFinding],
+        fixer_output: &agents::FixerOutput,
+    ) -> Result<()> {
+        if fixer_output.addressed.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.db.lock().await;
+        for action in &fixer_output.addressed {
+            let idx = action.finding.saturating_sub(1) as usize;
+            if let Some(finding) = findings_sent_to_fixer.get(idx) {
+                let reason = format!("ADDRESSED: {}", action.action);
+                db::agent_runs::resolve_finding(&conn, finding.id, &reason)?;
+                info!(
+                    run_id = %run_id,
+                    finding_id = finding.id,
+                    action = %action.action,
+                    "finding addressed by fixer, marked resolved"
                 );
             }
         }
