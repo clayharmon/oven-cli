@@ -336,7 +336,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 github::safe_comment(
                     &self.github,
                     pr_number,
-                    &format!("Pipeline failed: {e:#}"),
+                    &format_pipeline_failure(e),
                     target_dir,
                 )
                 .await;
@@ -403,9 +403,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 github::safe_comment(
                     &self.github,
                     pr_number,
-                    &format!(
-                        "Pipeline stopped: {e}\n\nPlease rebase manually and re-run the pipeline."
-                    ),
+                    &format_rebase_failure(&e),
                     target_dir,
                 )
                 .await;
@@ -450,7 +448,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                         github::safe_comment(
                             &self.github,
                             pr_number,
-                            &format!("Review cycle {cycle} returned unparseable output. Stopping pipeline."),
+                            &format_review_parse_failure(cycle),
                             target_dir,
                         )
                         .await;
@@ -630,17 +628,69 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     }
 }
 
+const COMMENT_FOOTER: &str = "\n---\nAutomated by [oven](https://github.com/clayharmon/oven-cli)";
+
 fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
-    let mut comment = String::from("## Unresolved findings after max review cycles\n\n");
-    for f in actionable {
-        let loc = match (&f.file_path, f.line_number) {
-            (Some(path), Some(line)) => format!(" at `{path}:{line}`"),
-            (Some(path), None) => format!(" in `{path}`"),
-            _ => String::new(),
+    let mut comment = String::from(
+        "## Pipeline stopped: unresolved review findings\n\n\
+         The review-fix loop ran 2 cycles but these findings remain unresolved.\n",
+    );
+
+    // Group findings by severity
+    for severity in &[Severity::Critical, Severity::Warning] {
+        let group: Vec<_> = actionable.iter().filter(|f| &f.severity == severity).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let heading = match severity {
+            Severity::Critical => "Critical",
+            Severity::Warning => "Warning",
+            Severity::Info => "Info",
         };
-        let _ = writeln!(comment, "- **[{}]** {}{}: {}", f.severity, f.category, loc, f.message);
+        let _ = writeln!(comment, "\n### {heading}\n");
+        for f in group {
+            let loc = match (&f.file_path, f.line_number) {
+                (Some(path), Some(line)) => format!(" in `{path}:{line}`"),
+                (Some(path), None) => format!(" in `{path}`"),
+                _ => String::new(),
+            };
+            let _ = writeln!(comment, "- **{}**{} -- {}", f.category, loc, f.message);
+        }
     }
+
+    comment.push_str(COMMENT_FOOTER);
     comment
+}
+
+fn format_pipeline_failure(e: &anyhow::Error) -> String {
+    format!(
+        "## Pipeline failed\n\n\
+         **Error:** {e:#}\n\n\
+         The pipeline hit an unrecoverable error. Check the run logs for detail, \
+         or re-run the pipeline.\
+         {COMMENT_FOOTER}"
+    )
+}
+
+fn format_rebase_failure(e: &anyhow::Error) -> String {
+    format!(
+        "## Pipeline stopped: rebase conflict\n\n\
+         Could not rebase onto the base branch. This usually happens when another \
+         PR merged while this pipeline was running.\n\n\
+         **Error:** {e}\n\n\
+         Rebase manually and re-run the pipeline.\
+         {COMMENT_FOOTER}"
+    )
+}
+
+fn format_review_parse_failure(cycle: u32) -> String {
+    format!(
+        "## Pipeline stopped: review output error\n\n\
+         The reviewer agent returned output that could not be parsed as structured \
+         findings (cycle {cycle}). This usually means the reviewer produced malformed JSON.\n\n\
+         Re-run the pipeline to try again.\
+         {COMMENT_FOOTER}"
+    )
 }
 
 /// Build a PR title using the issue metadata.
@@ -896,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn format_unresolved_comment_includes_findings() {
+    fn format_unresolved_comment_groups_by_severity() {
         let findings = [
             agents::Finding {
                 severity: Severity::Critical,
@@ -915,9 +965,51 @@ mod tests {
         ];
         let refs: Vec<_> = findings.iter().collect();
         let comment = format_unresolved_comment(&refs);
-        assert!(comment.contains("Unresolved findings"));
-        assert!(comment.contains("null pointer"));
-        assert!(comment.contains("`src/main.rs:42`"));
-        assert!(comment.contains("missing docs"));
+        assert!(comment.contains("### Critical"));
+        assert!(comment.contains("### Warning"));
+        assert!(comment.contains("**bug** in `src/main.rs:42` -- null pointer"));
+        assert!(comment.contains("**style** -- missing docs"));
+        assert!(comment.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn format_unresolved_comment_skips_empty_severity_groups() {
+        let findings = [agents::Finding {
+            severity: Severity::Warning,
+            category: "testing".to_string(),
+            file_path: Some("src/lib.rs".to_string()),
+            line_number: None,
+            message: "missing edge case test".to_string(),
+        }];
+        let refs: Vec<_> = findings.iter().collect();
+        let comment = format_unresolved_comment(&refs);
+        assert!(!comment.contains("### Critical"));
+        assert!(comment.contains("### Warning"));
+    }
+
+    #[test]
+    fn format_pipeline_failure_includes_error() {
+        let err = anyhow::anyhow!("cost budget exceeded: $12.50 > $10.00");
+        let comment = format_pipeline_failure(&err);
+        assert!(comment.contains("## Pipeline failed"));
+        assert!(comment.contains("cost budget exceeded"));
+        assert!(comment.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn format_rebase_failure_includes_error() {
+        let err = anyhow::anyhow!("merge conflict in src/config/mod.rs");
+        let comment = format_rebase_failure(&err);
+        assert!(comment.contains("## Pipeline stopped: rebase conflict"));
+        assert!(comment.contains("merge conflict"));
+        assert!(comment.contains("Rebase manually"));
+    }
+
+    #[test]
+    fn format_review_parse_failure_includes_cycle() {
+        let comment = format_review_parse_failure(2);
+        assert!(comment.contains("## Pipeline stopped: review output error"));
+        assert!(comment.contains("cycle 2"));
+        assert!(comment.contains("Re-run the pipeline"));
     }
 }
