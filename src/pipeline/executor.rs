@@ -326,8 +326,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             }
             Err(e) => {
                 warn!(run_id = %run_id, error = %e, "pipeline failed");
-                github::safe_comment(&self.github, pr_number, &format!("Pipeline failed: {e:#}"))
-                    .await;
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format!("Pipeline failed: {e:#}"),
+                    &self.repo_dir,
+                )
+                .await;
                 let _ = self
                     .issues
                     .transition(
@@ -379,6 +384,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     &format!(
                         "Pipeline stopped: {e}\n\nPlease rebase manually and re-run the pipeline."
                     ),
+                    &self.repo_dir,
                 )
                 .await;
             }
@@ -422,6 +428,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                             &self.github,
                             pr_number,
                             &format!("Review cycle {cycle} returned unparseable output. Stopping pipeline."),
+                            &self.repo_dir,
                         )
                         .await;
                     }
@@ -443,7 +450,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             if cycle == 3 {
                 if let Some(pr_number) = ctx.pr_number {
                     let comment = format_unresolved_comment(&actionable);
-                    github::safe_comment(&self.github, pr_number, &comment).await;
+                    github::safe_comment(&self.github, pr_number, &comment, &self.repo_dir).await;
                 } else {
                     warn!(run_id = %run_id, "no PR number, cannot post unresolved findings");
                 }
