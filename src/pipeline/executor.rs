@@ -25,7 +25,6 @@ use crate::{
 pub struct PipelineOutcome {
     pub run_id: String,
     pub pr_number: u32,
-    pub succeeded: bool,
 }
 
 /// Runs a single issue through the full pipeline.
@@ -64,7 +63,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
     /// Run the pipeline up to (but not including) finalization.
     ///
-    /// Returns a `PipelineOutcome` with the run ID, PR number, and success status.
+    /// Returns a `PipelineOutcome` with the run ID and PR number.
     /// The caller is responsible for calling `finalize_run` or `finalize_merge`
     /// at the appropriate time (e.g., after the PR is actually merged).
     pub async fn run_issue_pipeline(
@@ -130,7 +129,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch).await;
 
-        let succeeded = result.is_ok();
         if let Err(ref e) = result {
             // On failure, finalize immediately (no merge to wait for)
             self.finalize_run(&run_id, issue, pr_number, &result).await?;
@@ -143,7 +141,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // Update status to AwaitingMerge
         self.update_status(&run_id, RunStatus::AwaitingMerge).await?;
 
-        Ok(PipelineOutcome { run_id, pr_number, succeeded })
+        Ok(PipelineOutcome { run_id, pr_number })
     }
 
     /// Finalize a run after its PR has been merged (or when the pipeline failed).
