@@ -14,7 +14,7 @@ Issue source is configurable: GitHub (default) or local `.oven/issues/` files. P
 - `oven prep` - scaffold project (recipe.toml, .claude/agents/, .oven/)
 - `oven on [IDS]` - start pipeline. IDS are comma-separated issue numbers. Flags: `-d` (detached), `-m` (auto-merge), `--trust` (skip author validation). Prints a run ID (8 hex chars from uuid).
 - `oven off` - kill detached process (reads .oven/oven.pid)
-- `oven look [RUN_ID]` - view logs. Tails if active, dumps if done. `--agent <NAME>` filters.
+- `oven look [RUN_ID]` - view logs. Tails if active, dumps if done. `--agent <NAME>` filters. `--stream` shows agent progress/status from DB.
 - `oven report [RUN_ID]` - cost, runtime, summary. `--all` for history, `--json` for machine output, `--graph` for dependency graph.
 - `oven clean` - remove worktrees, logs, merged branches. `--only-logs`, `--only-trees`, `--only-branches`.
 - `oven ticket create|list|view|close|label|edit` - local issue management in .oven/issues/

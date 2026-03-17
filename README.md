@@ -68,7 +68,7 @@ oven on -m
 oven prep              Set up project (recipe.toml, agents, db)
 oven on [IDS]          Start the pipeline (-d detached, -m auto-merge, --trust)
 oven off               Stop a detached run
-oven look [RUN_ID]     View logs (--agent <name> to filter)
+oven look [RUN_ID]     View logs (--agent <name>, --stream for status view)
 oven report [RUN_ID]   Costs, runtime, summary (--all, --json, --graph)
 oven clean             Remove worktrees, logs, merged branches
 oven ticket            Local issue management (create, list, view, close, label, edit)
