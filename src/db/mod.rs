@@ -89,6 +89,7 @@ CREATE INDEX idx_graph_edges_session ON graph_edges(session_id);
 CREATE INDEX idx_graph_edges_to ON graph_edges(to_issue, session_id);",
         ),
         M::up("ALTER TABLE graph_nodes ADD COLUMN target_repo TEXT;"),
+        M::up("ALTER TABLE review_findings ADD COLUMN dispute_reason TEXT;"),
     ])
 });
 
@@ -206,6 +207,7 @@ pub struct ReviewFinding {
     pub line_number: Option<u32>,
     pub message: String,
     pub resolved: bool,
+    pub dispute_reason: Option<String>,
 }
 
 #[cfg(test)]

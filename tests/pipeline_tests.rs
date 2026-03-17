@@ -1720,3 +1720,171 @@ fn make_graph_node(num: u32, title: &str) -> GraphNode {
         target_repo: None,
     }
 }
+
+// -- Dispute flow integration tests --
+
+/// Build a `TestRunner` that simulates the dispute deadlock-breaking flow:
+/// - Reviewer cycle 1: returns 2 critical findings
+/// - Fixer cycle 1: addresses finding 1, disputes finding 2 with structured JSON
+/// - Reviewer cycle 2: returns clean (respects the dispute)
+fn test_runner_with_dispute() -> TestRunner {
+    let review_count = Arc::new(AtomicU32::new(0));
+    let review_count_clone = Arc::clone(&review_count);
+
+    // Track which role is running by detecting fixer via prompt content
+    let fixer_count = Arc::new(AtomicU32::new(0));
+    let fixer_count_clone = Arc::clone(&fixer_count);
+
+    TestRunner {
+        claude_handler: Box::new(move |prompt, tools, _dir| {
+            let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let output = if tool_list == ["Bash"] {
+                // Merger
+                "Merged.".to_string()
+            } else if tool_list == ["Read", "Glob", "Grep"] {
+                // Reviewer
+                let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // Cycle 1: raise 2 findings
+                    r#"{"findings":[
+                        {"severity":"critical","category":"bug","file_path":"src/app.rs","line_number":10,"message":"missing null check"},
+                        {"severity":"critical","category":"convention","file_path":"src/list.rs","line_number":20,"message":"add estimatedItemSize prop"}
+                    ],"summary":"2 issues"}"#.to_string()
+                } else {
+                    // Cycle 2: clean (respects the dispute)
+                    r#"{"findings":[],"summary":"all clean after dispute"}"#.to_string()
+                }
+            } else if prompt.contains("<review_findings>") {
+                // Fixer (has Write tool + review findings in prompt)
+                fixer_count_clone.fetch_add(1, Ordering::SeqCst);
+                r#"{"addressed":[{"finding":1,"action":"Added null check"}],"disputed":[{"finding":2,"reason":"FlashList v2 removed estimatedItemSize -- tsc --noEmit confirms prop does not exist"}]}"#.to_string()
+            } else {
+                // Implementer
+                "## Changes Made\n- Added feature\n## Tests Added\n- test.rs".to_string()
+            };
+            AgentResult {
+                cost_usd: 1.00,
+                duration: Duration::from_secs(5),
+                turns: 3,
+                output,
+                session_id: "sess-dispute".to_string(),
+                success: true,
+            }
+        }),
+        gh_handler: Box::new(|args, _dir| {
+            let stdout = if args.get(1).map(String::as_str) == Some("create") {
+                "https://github.com/test/repo/pull/77\n".to_string()
+            } else {
+                String::new()
+            };
+            CommandOutput { stdout, stderr: String::new(), success: true }
+        }),
+    }
+}
+
+#[tokio::test]
+async fn fixer_disputes_break_deadlock() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let runner = Arc::new(test_runner_with_dispute());
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
+    let db_conn = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        issues,
+        db: Arc::clone(&db_conn),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir: repo_dir.clone(),
+    });
+
+    let issue = make_github_issue(99, "Add FlashList", "Use FlashList for performance.");
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "pipeline should succeed: {result:?}");
+
+    // Verify the run completed (not failed)
+    let conn = db_conn.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    assert_eq!(runs[0].status, RunStatus::Complete);
+
+    // Verify finding 2 was resolved with dispute reason
+    let resolved = db::agent_runs::get_resolved_findings(&conn, &runs[0].id).unwrap();
+    drop(conn);
+    assert_eq!(resolved.len(), 1);
+    assert!(resolved[0].dispute_reason.as_deref().unwrap().contains("FlashList v2"));
+}
+
+#[tokio::test]
+async fn fixer_prose_output_does_not_break_pipeline() {
+    let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
+    let repo_dir = work_dir.path().to_path_buf();
+
+    let review_count = Arc::new(AtomicU32::new(0));
+    let review_count_clone = Arc::clone(&review_count);
+
+    // Fixer returns prose (no JSON) -- backward compat
+    let runner = Arc::new(TestRunner {
+        claude_handler: Box::new(move |prompt, tools, _dir| {
+            let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let output = if tool_list == ["Bash"] {
+                "Done.".to_string()
+            } else if tool_list == ["Read", "Glob", "Grep"] {
+                let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    r#"{"findings":[{"severity":"warning","category":"bug","message":"issue"}],"summary":"1 issue"}"#.to_string()
+                } else {
+                    r#"{"findings":[],"summary":"clean"}"#.to_string()
+                }
+            } else if prompt.contains("<review_findings>") {
+                "I fixed the issue. All tests pass.".to_string()
+            } else {
+                "Implementation done.".to_string()
+            };
+            AgentResult {
+                cost_usd: 1.00,
+                duration: Duration::from_secs(5),
+                turns: 3,
+                output,
+                session_id: "sess-prose".to_string(),
+                success: true,
+            }
+        }),
+        gh_handler: Box::new(|args, _dir| {
+            let stdout = if args.get(1).map(String::as_str) == Some("create") {
+                "https://github.com/test/repo/pull/80\n".to_string()
+            } else {
+                String::new()
+            };
+            CommandOutput { stdout, stderr: String::new(), success: true }
+        }),
+    });
+
+    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+    let issues = make_github_provider(&github);
+    let db_conn = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
+
+    let executor = Arc::new(PipelineExecutor {
+        runner,
+        github,
+        issues,
+        db: Arc::clone(&db_conn),
+        config: Config::default(),
+        cancel_token: CancellationToken::new(),
+        repo_dir: repo_dir.clone(),
+    });
+
+    let issue = make_github_issue(50, "Fix bug", "Fix the bug.");
+    let result = executor.run_issue(&issue, false).await;
+    assert!(result.is_ok(), "pipeline should succeed with prose fixer output: {result:?}");
+
+    // No findings should be resolved (parse_fixer_output returned default)
+    let conn = db_conn.lock().await;
+    let runs = db::runs::get_all_runs(&conn).unwrap();
+    let resolved = db::agent_runs::get_resolved_findings(&conn, &runs[0].id).unwrap();
+    drop(conn);
+    assert!(resolved.is_empty(), "no disputes should be tracked for prose output");
+}

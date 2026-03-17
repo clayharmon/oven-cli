@@ -48,6 +48,7 @@ mod tests {
             line_number: Some(10),
             message: "null pointer".to_string(),
             resolved: false,
+            dispute_reason: None,
         }]
     }
 

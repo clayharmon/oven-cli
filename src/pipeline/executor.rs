@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agents::{
         self, AgentContext, AgentInvocation, AgentRole, Complexity, GraphContextNode,
-        PlannerGraphOutput, Severity, invoke_agent, parse_planner_graph_output,
+        PlannerGraphOutput, Severity, invoke_agent, parse_fixer_output, parse_planner_graph_output,
         parse_review_output,
     },
     config::Config,
@@ -125,9 +125,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             base_branch: base_branch.clone(),
         };
 
-        let result = self
-            .run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch, &target_dir)
-            .await;
+        let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &target_dir).await;
 
         if let Err(ref e) = result {
             // On failure, finalize immediately (no merge to wait for)
@@ -336,7 +334,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 github::safe_comment(
                     &self.github,
                     pr_number,
-                    &format!("Pipeline failed: {e:#}"),
+                    &format_pipeline_failure(e),
                     target_dir,
                 )
                 .await;
@@ -362,7 +360,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
         auto_merge: bool,
-        base_branch: &str,
         target_dir: &std::path::Path,
     ) -> Result<()> {
         self.check_cancelled()?;
@@ -370,9 +367,23 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // 1. Implement
         self.update_status(run_id, RunStatus::Implementing).await?;
         let impl_prompt = agents::implementer::build_prompt(ctx)?;
-        self.run_agent(run_id, AgentRole::Implementer, &impl_prompt, worktree_path, 1).await?;
+        let impl_result =
+            self.run_agent(run_id, AgentRole::Implementer, &impl_prompt, worktree_path, 1).await?;
 
         git::push_branch(worktree_path, &ctx.branch).await?;
+
+        // 1b. Update PR description and mark ready for review
+        if let Some(pr_number) = ctx.pr_number {
+            let body = build_pr_body(&impl_result.output, ctx);
+            if let Err(e) =
+                self.github.edit_pr_in(pr_number, &pr_title(ctx), &body, target_dir).await
+            {
+                warn!(run_id = %run_id, error = %e, "failed to update PR description");
+            }
+            if let Err(e) = self.github.mark_pr_ready_in(pr_number, target_dir).await {
+                warn!(run_id = %run_id, error = %e, "failed to mark PR ready");
+            }
+        }
 
         // 2. Review-fix loop
         let clean = self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
@@ -383,15 +394,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         // 3. Rebase onto base branch to resolve any conflicts from parallel merges
         self.check_cancelled()?;
-        info!(run_id = %run_id, base = base_branch, "rebasing onto base branch");
-        if let Err(e) = git::rebase_on_base(worktree_path, base_branch).await {
+        info!(run_id = %run_id, base = %ctx.base_branch, "rebasing onto base branch");
+        if let Err(e) = git::rebase_on_base(worktree_path, &ctx.base_branch).await {
             if let Some(pr_number) = ctx.pr_number {
                 github::safe_comment(
                     &self.github,
                     pr_number,
-                    &format!(
-                        "Pipeline stopped: {e}\n\nPlease rebase manually and re-run the pipeline."
-                    ),
+                    &format_rebase_failure(&e),
                     target_dir,
                 )
                 .await;
@@ -399,7 +408,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             return Err(e);
         }
         git::force_push_branch(worktree_path, &ctx.branch).await?;
-
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
             self.check_cancelled()?;
@@ -423,7 +431,17 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
-            let review_prompt = agents::reviewer::build_prompt(ctx)?;
+
+            // On cycles 2+, include prior disputes so the reviewer sees what the
+            // fixer already tried and why certain findings were skipped.
+            let prior_disputes = if cycle > 1 {
+                let conn = self.db.lock().await;
+                db::agent_runs::get_resolved_findings(&conn, run_id)?
+            } else {
+                Vec::new()
+            };
+
+            let review_prompt = agents::reviewer::build_prompt(ctx, &prior_disputes)?;
             let review_result = self
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
@@ -436,7 +454,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                         github::safe_comment(
                             &self.github,
                             pr_number,
-                            &format!("Review cycle {cycle} returned unparseable output. Stopping pipeline."),
+                            &format_review_parse_failure(cycle),
                             target_dir,
                         )
                         .await;
@@ -476,12 +494,50 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             };
 
             let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
-            self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
+            let fix_result =
+                self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
+
+            // Parse fixer output and mark disputed findings as resolved
+            let fixer_output = parse_fixer_output(&fix_result.output);
+            self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
 
             git::push_branch(worktree_path, &ctx.branch).await?;
         }
 
         Ok(false)
+    }
+
+    /// Process fixer disputes by marking corresponding review findings as resolved.
+    ///
+    /// The fixer references findings by 1-indexed position in the list it received.
+    /// We map those back to the actual `ReviewFinding` IDs and mark them resolved
+    /// with the fixer's dispute reason.
+    async fn process_fixer_disputes(
+        &self,
+        run_id: &str,
+        findings_sent_to_fixer: &[ReviewFinding],
+        fixer_output: &agents::FixerOutput,
+    ) -> Result<()> {
+        if fixer_output.disputed.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.db.lock().await;
+        for dispute in &fixer_output.disputed {
+            // finding numbers are 1-indexed
+            let idx = dispute.finding.saturating_sub(1) as usize;
+            if let Some(finding) = findings_sent_to_fixer.get(idx) {
+                db::agent_runs::resolve_finding(&conn, finding.id, &dispute.reason)?;
+                info!(
+                    run_id = %run_id,
+                    finding_id = finding.id,
+                    reason = %dispute.reason,
+                    "finding disputed by fixer, marked resolved"
+                );
+            }
+        }
+        drop(conn);
+        Ok(())
     }
 
     async fn store_findings(&self, run_id: &str, findings: &[agents::Finding]) -> Result<()> {
@@ -502,6 +558,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     line_number: finding.line_number,
                     message: finding.message.clone(),
                     resolved: false,
+                    dispute_reason: None,
                 };
                 db::agent_runs::insert_finding(&conn, &db_finding)?;
             }
@@ -616,17 +673,143 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     }
 }
 
+const COMMENT_FOOTER: &str =
+    "\n---\nAutomated by [oven](https://github.com/clayharmon/oven-cli) \u{1F35E}";
+
 fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
-    let mut comment = String::from("## Unresolved findings after max review cycles\n\n");
-    for f in actionable {
-        let loc = match (&f.file_path, f.line_number) {
-            (Some(path), Some(line)) => format!(" at `{path}:{line}`"),
-            (Some(path), None) => format!(" in `{path}`"),
-            _ => String::new(),
+    let mut comment = String::from(
+        "## Pipeline stopped: unresolved review findings\n\n\
+         The review-fix loop ran 2 cycles but these findings remain unresolved.\n",
+    );
+
+    // Group findings by severity
+    for severity in &[Severity::Critical, Severity::Warning] {
+        let group: Vec<_> = actionable.iter().filter(|f| &f.severity == severity).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let heading = match severity {
+            Severity::Critical => "Critical",
+            Severity::Warning => "Warning",
+            Severity::Info => unreachable!("loop only iterates Critical and Warning"),
         };
-        let _ = writeln!(comment, "- **[{}]** {}{}: {}", f.severity, f.category, loc, f.message);
+        let _ = writeln!(comment, "\n### {heading}\n");
+        for f in group {
+            let loc = match (&f.file_path, f.line_number) {
+                (Some(path), Some(line)) => format!(" in `{path}:{line}`"),
+                (Some(path), None) => format!(" in `{path}`"),
+                _ => String::new(),
+            };
+            let _ = writeln!(comment, "- **{}**{} -- {}", f.category, loc, f.message);
+        }
     }
+
+    comment.push_str(COMMENT_FOOTER);
     comment
+}
+
+fn format_pipeline_failure(e: &anyhow::Error) -> String {
+    format!(
+        "## Pipeline failed\n\n\
+         **Error:** {e:#}\n\n\
+         The pipeline hit an unrecoverable error. Check the run logs for detail, \
+         or re-run the pipeline.\
+         {COMMENT_FOOTER}"
+    )
+}
+
+fn format_rebase_failure(e: &anyhow::Error) -> String {
+    format!(
+        "## Pipeline stopped: rebase conflict\n\n\
+         Could not rebase onto the base branch. This usually happens when another \
+         PR merged while this pipeline was running.\n\n\
+         **Error:** {e}\n\n\
+         Rebase manually and re-run the pipeline.\
+         {COMMENT_FOOTER}"
+    )
+}
+
+fn format_review_parse_failure(cycle: u32) -> String {
+    format!(
+        "## Pipeline stopped: review output error\n\n\
+         The reviewer agent returned output that could not be parsed as structured \
+         findings (cycle {cycle}). This usually means the reviewer produced malformed JSON.\n\n\
+         Re-run the pipeline to try again.\
+         {COMMENT_FOOTER}"
+    )
+}
+
+/// Build a PR title using the issue metadata.
+///
+/// Infers a conventional-commit prefix from the issue title. Falls back to
+/// `fix` when no keyword matches.
+fn pr_title(ctx: &AgentContext) -> String {
+    let prefix = infer_commit_type(&ctx.issue_title);
+    if ctx.issue_source == "github" {
+        format!("{prefix}(#{}): {}", ctx.issue_number, ctx.issue_title)
+    } else {
+        format!("{prefix}: {}", ctx.issue_title)
+    }
+}
+
+/// Infer a conventional-commit type from an issue title.
+fn infer_commit_type(title: &str) -> &'static str {
+    let lower = title.to_lowercase();
+    if lower.starts_with("feat") || lower.contains("add ") || lower.contains("implement ") {
+        "feat"
+    } else if lower.starts_with("refactor") {
+        "refactor"
+    } else if lower.starts_with("docs") || lower.starts_with("document") {
+        "docs"
+    } else if lower.starts_with("test") || lower.starts_with("add test") {
+        "test"
+    } else if lower.starts_with("chore") {
+        "chore"
+    } else {
+        "fix"
+    }
+}
+
+/// Build a full PR body from the implementer's output and issue context.
+fn build_pr_body(impl_output: &str, ctx: &AgentContext) -> String {
+    let issue_ref = if ctx.issue_source == "github" {
+        format!("Resolves #{}", ctx.issue_number)
+    } else {
+        format!("From local issue #{}", ctx.issue_number)
+    };
+
+    let summary = extract_impl_summary(impl_output);
+
+    let mut body = String::new();
+    let _ = writeln!(body, "{issue_ref}\n");
+    let _ = write!(body, "{summary}");
+    body.push_str(COMMENT_FOOTER);
+    body
+}
+
+/// Extract the summary section from implementer output.
+///
+/// Looks for `## PR Template` (repo-specific PR template) or `## Changes Made`
+/// (default format) headings. Falls back to the full output (truncated) if
+/// neither heading is found.
+fn extract_impl_summary(output: &str) -> String {
+    // Prefer a filled-out PR template if the implementer found one
+    let idx = output.find("## PR Template").or_else(|| output.find("## Changes Made"));
+
+    if let Some(idx) = idx {
+        let summary = output[idx..].trim();
+        // Strip the "## PR Template" heading itself so the body reads cleanly
+        let summary = summary.strip_prefix("## PR Template").map_or(summary, |s| s.trim_start());
+        if summary.len() <= 4000 {
+            return summary.to_string();
+        }
+        return truncate(summary, 4000);
+    }
+    // Fallback: no structured summary found
+    if output.trim().is_empty() {
+        return String::from("*No implementation summary available.*");
+    }
+    truncate(output.trim(), 2000)
 }
 
 fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
@@ -733,7 +916,162 @@ mod tests {
     }
 
     #[test]
-    fn format_unresolved_comment_includes_findings() {
+    fn extract_impl_summary_finds_changes_made() {
+        let output = "Some preamble text\n\n## Changes Made\n- src/foo.rs: added bar\n\n## Tests Added\n- tests/foo.rs: bar test\n";
+        let summary = extract_impl_summary(output);
+        assert!(summary.starts_with("## Changes Made"));
+        assert!(summary.contains("added bar"));
+        assert!(summary.contains("## Tests Added"));
+    }
+
+    #[test]
+    fn extract_impl_summary_prefers_pr_template() {
+        let output = "Preamble\n\n## PR Template\n## Summary\n- Added auth flow\n\n## Testing\n- Unit tests pass\n";
+        let summary = extract_impl_summary(output);
+        // Should strip the "## PR Template" heading
+        assert!(!summary.contains("## PR Template"));
+        assert!(summary.starts_with("## Summary"));
+        assert!(summary.contains("Added auth flow"));
+    }
+
+    #[test]
+    fn extract_impl_summary_fallback_on_no_heading() {
+        let output = "just some raw agent output with no structure";
+        let summary = extract_impl_summary(output);
+        assert!(summary.contains("just some raw agent output"));
+    }
+
+    #[test]
+    fn extract_impl_summary_empty_output() {
+        assert_eq!(extract_impl_summary(""), "*No implementation summary available.*");
+        assert_eq!(extract_impl_summary("   "), "*No implementation summary available.*");
+    }
+
+    #[test]
+    fn build_pr_body_github_issue() {
+        let ctx = AgentContext {
+            issue_number: 42,
+            issue_title: "fix the thing".to_string(),
+            issue_body: String::new(),
+            branch: "oven/issue-42".to_string(),
+            pr_number: Some(10),
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        let body = build_pr_body("## Changes Made\n- added stuff", &ctx);
+        assert!(body.contains("Resolves #42"));
+        assert!(body.contains("## Changes Made"));
+        assert!(body.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn build_pr_body_local_issue() {
+        let ctx = AgentContext {
+            issue_number: 7,
+            issue_title: "local thing".to_string(),
+            issue_body: String::new(),
+            branch: "oven/issue-7".to_string(),
+            pr_number: Some(10),
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "local".to_string(),
+            base_branch: "main".to_string(),
+        };
+        let body = build_pr_body("raw output", &ctx);
+        assert!(body.contains("From local issue #7"));
+    }
+
+    #[test]
+    fn pr_title_github() {
+        let ctx = AgentContext {
+            issue_number: 42,
+            issue_title: "fix the thing".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "fix(#42): fix the thing");
+    }
+
+    #[test]
+    fn pr_title_local() {
+        let ctx = AgentContext {
+            issue_number: 7,
+            issue_title: "local thing".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "local".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "fix: local thing");
+    }
+
+    #[test]
+    fn infer_commit_type_feat() {
+        assert_eq!(infer_commit_type("Add dark mode support"), "feat");
+        assert_eq!(infer_commit_type("Implement caching layer"), "feat");
+        assert_eq!(infer_commit_type("Feature: new dashboard"), "feat");
+    }
+
+    #[test]
+    fn infer_commit_type_refactor() {
+        assert_eq!(infer_commit_type("Refactor auth middleware"), "refactor");
+    }
+
+    #[test]
+    fn infer_commit_type_docs() {
+        assert_eq!(infer_commit_type("Document the API endpoints"), "docs");
+        assert_eq!(infer_commit_type("Docs: update README"), "docs");
+    }
+
+    #[test]
+    fn infer_commit_type_defaults_to_fix() {
+        assert_eq!(infer_commit_type("Null pointer in config parser"), "fix");
+        assert_eq!(infer_commit_type("Crash on empty input"), "fix");
+    }
+
+    #[test]
+    fn pr_title_feat_github() {
+        let ctx = AgentContext {
+            issue_number: 10,
+            issue_title: "Add dark mode".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "feat(#10): Add dark mode");
+    }
+
+    #[test]
+    fn format_unresolved_comment_groups_by_severity() {
         let findings = [
             agents::Finding {
                 severity: Severity::Critical,
@@ -752,9 +1090,51 @@ mod tests {
         ];
         let refs: Vec<_> = findings.iter().collect();
         let comment = format_unresolved_comment(&refs);
-        assert!(comment.contains("Unresolved findings"));
-        assert!(comment.contains("null pointer"));
-        assert!(comment.contains("`src/main.rs:42`"));
-        assert!(comment.contains("missing docs"));
+        assert!(comment.contains("### Critical"));
+        assert!(comment.contains("### Warning"));
+        assert!(comment.contains("**bug** in `src/main.rs:42` -- null pointer"));
+        assert!(comment.contains("**style** -- missing docs"));
+        assert!(comment.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn format_unresolved_comment_skips_empty_severity_groups() {
+        let findings = [agents::Finding {
+            severity: Severity::Warning,
+            category: "testing".to_string(),
+            file_path: Some("src/lib.rs".to_string()),
+            line_number: None,
+            message: "missing edge case test".to_string(),
+        }];
+        let refs: Vec<_> = findings.iter().collect();
+        let comment = format_unresolved_comment(&refs);
+        assert!(!comment.contains("### Critical"));
+        assert!(comment.contains("### Warning"));
+    }
+
+    #[test]
+    fn format_pipeline_failure_includes_error() {
+        let err = anyhow::anyhow!("cost budget exceeded: $12.50 > $10.00");
+        let comment = format_pipeline_failure(&err);
+        assert!(comment.contains("## Pipeline failed"));
+        assert!(comment.contains("cost budget exceeded"));
+        assert!(comment.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn format_rebase_failure_includes_error() {
+        let err = anyhow::anyhow!("merge conflict in src/config/mod.rs");
+        let comment = format_rebase_failure(&err);
+        assert!(comment.contains("## Pipeline stopped: rebase conflict"));
+        assert!(comment.contains("merge conflict"));
+        assert!(comment.contains("Rebase manually"));
+    }
+
+    #[test]
+    fn format_review_parse_failure_includes_cycle() {
+        let comment = format_review_parse_failure(2);
+        assert!(comment.contains("## Pipeline stopped: review output error"));
+        assert!(comment.contains("cycle 2"));
+        assert!(comment.contains("Re-run the pipeline"));
     }
 }

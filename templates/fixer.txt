@@ -79,18 +79,25 @@ Make atomic conventional commits for your fixes. Use `fix(<scope>): <description
 - Never use `git add -A` or `git add .` -- stage specific files
 - Do NOT amend previous commits -- always create new ones
 
-## Output
+## Output (REQUIRED)
 
-When done, provide a summary:
+After all fixes are committed and verified, output a JSON summary. This format is parsed by the pipeline -- do not deviate:
 
+```json
+{
+  "addressed": [
+    { "finding": 1, "action": "Fixed by extracting to module-level constant" },
+    { "finding": 3, "action": "Added missing test for edge case" }
+  ],
+  "disputed": [
+    { "finding": 2, "reason": "FlashList v2 removed estimatedItemSize -- tsc --noEmit confirms prop does not exist in type definitions" }
+  ]
+}
 ```
-## Findings Addressed
-- [finding #]: [what you did to fix it]
 
-## Findings Skipped
-- [finding #]: [why you skipped it]
-
-## Verification
-- Tests: pass/fail
-- Lint: pass/fail
-```
+Rules for this JSON:
+- Every finding number from the `<review_findings>` list must appear in either `addressed` or `disputed`
+- `finding` numbers are 1-indexed, matching the numbered list in `<review_findings>`
+- Use `disputed` ONLY when a finding is **objectively wrong**: (a) it references an API/prop/method that does not exist (verified via compilation or reading the dependency's type definitions), (b) it contradicts the actual installed version of a dependency, or (c) implementing it would break existing passing tests
+- Do NOT dispute findings just because they are hard to fix -- if you attempted a fix but couldn't get it working, use `addressed` with `"action": "Unable to fix: <brief reason>"`
+- Keep `reason` strings factual and specific (e.g., "tsc --noEmit fails with 'Property does not exist on type'")

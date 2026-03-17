@@ -102,6 +102,7 @@ fn agent_run_with_findings() {
             line_number: Some(42),
             message: "null pointer".to_string(),
             resolved: false,
+            dispute_reason: None,
         },
     )
     .unwrap();
@@ -117,6 +118,7 @@ fn agent_run_with_findings() {
             line_number: None,
             message: "consider renaming".to_string(),
             resolved: false,
+            dispute_reason: None,
         },
     )
     .unwrap();
@@ -127,7 +129,7 @@ fn agent_run_with_findings() {
     assert_eq!(unresolved[0].severity, "critical");
 
     // Resolve the critical finding
-    db::agent_runs::resolve_finding(&conn, unresolved[0].id).unwrap();
+    db::agent_runs::resolve_finding(&conn, unresolved[0].id, "fixed").unwrap();
 
     let remaining = db::agent_runs::get_unresolved_findings(&conn, "run123").unwrap();
     assert!(remaining.is_empty());

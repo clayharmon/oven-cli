@@ -81,8 +81,8 @@ pub fn finish_agent_run(
 pub fn insert_finding(conn: &Connection, finding: &ReviewFinding) -> Result<i64> {
     conn.execute(
         "INSERT INTO review_findings (agent_run_id, severity, category, file_path, \
-         line_number, message, resolved) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         line_number, message, resolved, dispute_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             finding.agent_run_id,
             finding.severity,
@@ -91,6 +91,7 @@ pub fn insert_finding(conn: &Connection, finding: &ReviewFinding) -> Result<i64>
             finding.line_number,
             finding.message,
             finding.resolved,
+            finding.dispute_reason,
         ],
     )
     .context("inserting finding")?;
@@ -104,7 +105,7 @@ pub fn get_findings_for_agent_run(
     let mut stmt = conn
         .prepare(
             "SELECT id, agent_run_id, severity, category, file_path, line_number, \
-             message, resolved FROM review_findings WHERE agent_run_id = ?1",
+             message, resolved, dispute_reason FROM review_findings WHERE agent_run_id = ?1",
         )
         .context("preparing get_findings_for_agent_run")?;
 
@@ -118,7 +119,7 @@ pub fn get_unresolved_findings(conn: &Connection, run_id: &str) -> Result<Vec<Re
     let mut stmt = conn
         .prepare(
             "SELECT f.id, f.agent_run_id, f.severity, f.category, f.file_path, \
-             f.line_number, f.message, f.resolved \
+             f.line_number, f.message, f.resolved, f.dispute_reason \
              FROM review_findings f \
              JOIN agent_runs a ON f.agent_run_id = a.id \
              WHERE a.run_id = ?1 AND f.resolved = 0 AND f.severity != 'info'",
@@ -131,9 +132,12 @@ pub fn get_unresolved_findings(conn: &Connection, run_id: &str) -> Result<Vec<Re
     rows.collect::<std::result::Result<Vec<_>, _>>().context("collecting unresolved findings")
 }
 
-pub fn resolve_finding(conn: &Connection, finding_id: i64) -> Result<()> {
-    conn.execute("UPDATE review_findings SET resolved = 1 WHERE id = ?1", params![finding_id])
-        .context("resolving finding")?;
+pub fn resolve_finding(conn: &Connection, finding_id: i64, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE review_findings SET resolved = 1, dispute_reason = ?2 WHERE id = ?1",
+        params![finding_id, reason],
+    )
+    .context("resolving finding")?;
     Ok(())
 }
 
@@ -147,7 +151,25 @@ fn row_to_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding> {
         line_number: row.get(5)?,
         message: row.get(6)?,
         resolved: row.get(7)?,
+        dispute_reason: row.get(8)?,
     })
+}
+
+pub fn get_resolved_findings(conn: &Connection, run_id: &str) -> Result<Vec<ReviewFinding>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, f.agent_run_id, f.severity, f.category, f.file_path, \
+             f.line_number, f.message, f.resolved, f.dispute_reason \
+             FROM review_findings f \
+             JOIN agent_runs a ON f.agent_run_id = a.id \
+             WHERE a.run_id = ?1 AND f.resolved = 1",
+        )
+        .context("preparing get_resolved_findings")?;
+
+    let rows =
+        stmt.query_map(params![run_id], row_to_finding).context("querying resolved findings")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>().context("collecting resolved findings")
 }
 
 #[cfg(test)]
@@ -243,6 +265,7 @@ mod tests {
             line_number: Some(42),
             message: "null pointer".to_string(),
             resolved: false,
+            dispute_reason: None,
         };
         let fid = insert_finding(&conn, &finding).unwrap();
         assert!(fid > 0);
@@ -268,13 +291,15 @@ mod tests {
             line_number: None,
             message: "missing docs".to_string(),
             resolved: false,
+            dispute_reason: None,
         };
         let fid = insert_finding(&conn, &finding).unwrap();
 
-        resolve_finding(&conn, fid).unwrap();
+        resolve_finding(&conn, fid, "test reason").unwrap();
 
         let findings = get_findings_for_agent_run(&conn, ar_id).unwrap();
         assert!(findings[0].resolved);
+        assert_eq!(findings[0].dispute_reason.as_deref(), Some("test reason"));
     }
 
     #[test]
@@ -295,6 +320,7 @@ mod tests {
                 line_number: None,
                 message: "bad".to_string(),
                 resolved: false,
+                dispute_reason: None,
             },
         )
         .unwrap();
@@ -311,6 +337,7 @@ mod tests {
                 line_number: None,
                 message: "fyi".to_string(),
                 resolved: false,
+                dispute_reason: None,
             },
         )
         .unwrap();
@@ -327,10 +354,11 @@ mod tests {
                 line_number: None,
                 message: "meh".to_string(),
                 resolved: false,
+                dispute_reason: None,
             },
         )
         .unwrap();
-        resolve_finding(&conn, wid).unwrap();
+        resolve_finding(&conn, wid, "not applicable").unwrap();
 
         let unresolved = get_unresolved_findings(&conn, "run1").unwrap();
         assert_eq!(unresolved.len(), 1);
@@ -366,6 +394,7 @@ mod tests {
                 line_number: None,
                 message: "bad".to_string(),
                 resolved: false,
+                dispute_reason: None,
             },
         )
         .unwrap();
@@ -379,5 +408,104 @@ mod tests {
 
         let findings = get_findings_for_agent_run(&conn, ar_id).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn resolve_finding_stores_dispute_reason() {
+        let conn = test_db();
+        insert_test_run(&conn, "run1");
+        let ar_id = insert_agent_run(&conn, &sample_agent_run("run1", "reviewer")).unwrap();
+
+        let finding = ReviewFinding {
+            id: 0,
+            agent_run_id: ar_id,
+            severity: "critical".to_string(),
+            category: "convention".to_string(),
+            file_path: Some("src/app.rs".to_string()),
+            line_number: Some(10),
+            message: "missing estimatedItemSize".to_string(),
+            resolved: false,
+            dispute_reason: None,
+        };
+        let fid = insert_finding(&conn, &finding).unwrap();
+
+        resolve_finding(&conn, fid, "FlashList v2 removed this prop").unwrap();
+
+        let findings = get_findings_for_agent_run(&conn, ar_id).unwrap();
+        assert!(findings[0].resolved);
+        assert_eq!(findings[0].dispute_reason.as_deref(), Some("FlashList v2 removed this prop"));
+    }
+
+    #[test]
+    fn get_resolved_findings_returns_only_resolved() {
+        let conn = test_db();
+        insert_test_run(&conn, "run1");
+        let ar_id = insert_agent_run(&conn, &sample_agent_run("run1", "reviewer")).unwrap();
+
+        // Unresolved finding
+        insert_finding(
+            &conn,
+            &ReviewFinding {
+                id: 0,
+                agent_run_id: ar_id,
+                severity: "critical".to_string(),
+                category: "bug".to_string(),
+                file_path: None,
+                line_number: None,
+                message: "unresolved".to_string(),
+                resolved: false,
+                dispute_reason: None,
+            },
+        )
+        .unwrap();
+
+        // Resolved finding with reason
+        let fid = insert_finding(
+            &conn,
+            &ReviewFinding {
+                id: 0,
+                agent_run_id: ar_id,
+                severity: "warning".to_string(),
+                category: "convention".to_string(),
+                file_path: Some("src/lib.rs".to_string()),
+                line_number: None,
+                message: "disputed".to_string(),
+                resolved: false,
+                dispute_reason: None,
+            },
+        )
+        .unwrap();
+        resolve_finding(&conn, fid, "API does not exist").unwrap();
+
+        let resolved = get_resolved_findings(&conn, "run1").unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].message, "disputed");
+        assert_eq!(resolved[0].dispute_reason.as_deref(), Some("API does not exist"));
+    }
+
+    #[test]
+    fn get_resolved_findings_empty_when_none_resolved() {
+        let conn = test_db();
+        insert_test_run(&conn, "run1");
+        let ar_id = insert_agent_run(&conn, &sample_agent_run("run1", "reviewer")).unwrap();
+
+        insert_finding(
+            &conn,
+            &ReviewFinding {
+                id: 0,
+                agent_run_id: ar_id,
+                severity: "critical".to_string(),
+                category: "bug".to_string(),
+                file_path: None,
+                line_number: None,
+                message: "not resolved".to_string(),
+                resolved: false,
+                dispute_reason: None,
+            },
+        )
+        .unwrap();
+
+        let resolved = get_resolved_findings(&conn, "run1").unwrap();
+        assert!(resolved.is_empty());
     }
 }
