@@ -283,6 +283,13 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
                             warn!(issue = num, error = %e, "failed to reconstruct outcome");
                         }
                     }
+                } else {
+                    warn!(
+                        issue = num,
+                        pr = pr_number,
+                        "node restored from DB has no PipelineIssue, \
+                         skipping finalization (labels and worktree may need manual cleanup)"
+                    );
                 }
                 graph.transition(num, NodeState::Merged);
             }
@@ -865,6 +872,37 @@ mod tests {
 
             poll_awaiting_merges(&mut graph, &executor).await;
 
+            assert_eq!(graph.node(1).unwrap().state, NodeState::Merged);
+        });
+    }
+
+    #[test]
+    fn merge_polling_transitions_node_without_issue() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let executor = make_merge_poll_executor("MERGED");
+
+            let mut graph = DependencyGraph::new("db-restore-test");
+            // Simulate a node restored from DB (no PipelineIssue attached)
+            let mut node = GraphNode {
+                issue_number: 1,
+                title: "Issue #1".to_string(),
+                area: "test".to_string(),
+                predicted_files: vec![],
+                has_migration: false,
+                complexity: "full".to_string(),
+                state: NodeState::Pending,
+                pr_number: Some(42),
+                run_id: Some("run-1".to_string()),
+                issue: None,
+            };
+            node.state = NodeState::Pending;
+            graph.add_node(node);
+            graph.transition(1, NodeState::AwaitingMerge);
+
+            poll_awaiting_merges(&mut graph, &executor).await;
+
+            // Should still transition to Merged even without issue data
             assert_eq!(graph.node(1).unwrap().state, NodeState::Merged);
         });
     }
