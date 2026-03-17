@@ -35,12 +35,11 @@ pub async fn run(args: LookArgs, _global: &GlobalOpts) -> Result<()> {
     }
 
     let is_active = is_oven_running(&project_dir);
-    let agent_tag = args.agent.as_deref().map(|a| format!("agent={a}"));
 
     if is_active {
-        tail_log(&log_file, args.agent.as_deref(), agent_tag.as_deref()).await?;
+        tail_log(&log_file, args.agent.as_deref()).await?;
     } else {
-        dump_log(&log_file, args.agent.as_deref(), agent_tag.as_deref()).await?;
+        dump_log(&log_file, args.agent.as_deref()).await?;
     }
 
     Ok(())
@@ -187,21 +186,21 @@ fn is_oven_running(project_dir: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-async fn dump_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&str>) -> Result<()> {
+async fn dump_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
     let file = tokio::fs::File::open(path).await.context("reading log file")?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await.context("reading log line")? {
-        if should_show_line(&line, agent_filter, agent_tag) {
-            println!("{line}");
+        if let Some(formatted) = format_log_line(&line, agent_filter) {
+            println!("{formatted}");
         }
     }
 
     Ok(())
 }
 
-async fn tail_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&str>) -> Result<()> {
+async fn tail_log(path: &Path, agent_filter: Option<&str>) -> Result<()> {
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();
 
@@ -221,13 +220,12 @@ async fn tail_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&st
             result = reader.read_line(&mut line) => {
                 match result {
                     Ok(0) => {
-                        // EOF, wait briefly for more content
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     Ok(_) => {
                         let trimmed = line.trim_end();
-                        if should_show_line(trimmed, agent_filter, agent_tag) {
-                            println!("{trimmed}");
+                        if let Some(formatted) = format_log_line(trimmed, agent_filter) {
+                            println!("{formatted}");
                         }
                         line.clear();
                     }
@@ -240,11 +238,67 @@ async fn tail_log(path: &Path, agent_filter: Option<&str>, agent_tag: Option<&st
     Ok(())
 }
 
-fn should_show_line(line: &str, agent_filter: Option<&str>, agent_tag: Option<&str>) -> bool {
-    match (agent_filter, agent_tag) {
-        (Some(agent), Some(tag)) => line.contains(tag) || line.contains(agent),
-        _ => true,
+/// Messages to suppress in formatted output (noisy polling lines).
+const SUPPRESSED_MESSAGES: &[&str] = &["no actionable issues, waiting"];
+
+/// Format a JSON tracing log line into a compact human-readable string.
+///
+/// Returns `None` if the line should be suppressed (noisy polling messages)
+/// or doesn't match the agent filter.
+fn format_log_line(line: &str, agent_filter: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+
+    let fields = v.get("fields")?;
+    let message = fields.get("message").and_then(|m| m.as_str()).unwrap_or("");
+
+    // Suppress noisy polling messages
+    if SUPPRESSED_MESSAGES.contains(&message) {
+        return None;
     }
+
+    // Agent filter
+    if let Some(filter) = agent_filter {
+        let agent = fields.get("agent").and_then(|a| a.as_str()).unwrap_or("");
+        if !agent.is_empty() && agent != filter {
+            return None;
+        }
+    }
+
+    // Extract timestamp -- just HH:MM:SS from the ISO string
+    let timestamp = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|t| t.find('T').map(|i| &t[i + 1..]))
+        .map_or("??:??:??", |t| if t.len() > 8 { &t[..8] } else { t });
+
+    let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("INFO");
+
+    let level_tag = match level {
+        "ERROR" => "ERR ",
+        "WARN" => "WARN",
+        "DEBUG" => "DBG ",
+        _ => "    ",
+    };
+
+    // Collect extra fields (skip "message" since we already have it)
+    let mut extras = Vec::new();
+    if let Some(obj) = fields.as_object() {
+        for (k, val) in obj {
+            if k == "message" {
+                continue;
+            }
+            let val_str = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            extras.push(format!("{k}={val_str}"));
+        }
+    }
+
+    let extra_str =
+        if extras.is_empty() { String::new() } else { format!("  {}", extras.join(" ")) };
+
+    Some(format!("{timestamp} {level_tag} {message}{extra_str}"))
 }
 
 #[cfg(test)]
@@ -252,33 +306,56 @@ mod tests {
     use super::*;
     use crate::db::RunStatus;
 
-    #[test]
-    fn filter_matches_agent_field() {
-        let tag = "agent=reviewer";
-        assert!(should_show_line(
-            r#"{"agent":"reviewer","msg":"ok"}"#,
-            Some("reviewer"),
-            Some(tag)
-        ));
-        assert!(!should_show_line(
-            r#"{"agent":"implementer","msg":"ok"}"#,
-            Some("reviewer"),
-            Some(tag)
-        ));
+    fn json_log(msg: &str, agent: Option<&str>) -> String {
+        let agent_field = agent.map_or_else(String::new, |a| format!(r#","agent":"{a}""#));
+        format!(
+            r#"{{"timestamp":"2026-03-17T09:53:34.350926Z","level":"INFO","fields":{{"message":"{msg}"{agent_field}}},"target":"oven_cli::test"}}"#
+        )
     }
 
     #[test]
-    fn no_filter_shows_all() {
-        assert!(should_show_line("any line at all", None, None));
+    fn format_log_line_basic() {
+        let line = json_log("agent starting", Some("reviewer"));
+        let formatted = format_log_line(&line, None).unwrap();
+        assert!(formatted.contains("09:53:34"));
+        assert!(formatted.contains("agent starting"));
+        assert!(formatted.contains("agent=reviewer"));
+        // Should NOT contain full module path
+        assert!(!formatted.contains("oven_cli"));
     }
 
     #[test]
-    fn filter_matches_substring() {
-        assert!(should_show_line(
-            "agent=reviewer cycle=1",
-            Some("reviewer"),
-            Some("agent=reviewer")
-        ));
+    fn format_log_line_suppresses_waiting() {
+        let line = json_log("no actionable issues, waiting", None);
+        assert!(format_log_line(&line, None).is_none());
+    }
+
+    #[test]
+    fn format_log_line_agent_filter() {
+        let line = json_log("starting", Some("implementer"));
+        // Filter for reviewer should exclude implementer
+        assert!(format_log_line(&line, Some("reviewer")).is_none());
+        // Filter for implementer should include
+        assert!(format_log_line(&line, Some("implementer")).is_some());
+    }
+
+    #[test]
+    fn format_log_line_no_agent_passes_filter() {
+        // Lines without an agent field should always pass the agent filter
+        let line = json_log("pipeline started", None);
+        assert!(format_log_line(&line, Some("reviewer")).is_some());
+    }
+
+    #[test]
+    fn format_log_line_non_json_returns_none() {
+        assert!(format_log_line("not json at all", None).is_none());
+    }
+
+    #[test]
+    fn format_log_line_error_level() {
+        let line = r#"{"timestamp":"2026-03-17T10:00:00Z","level":"ERROR","fields":{"message":"pipeline failed"},"target":"test"}"#;
+        let formatted = format_log_line(line, None).unwrap();
+        assert!(formatted.contains("ERR"));
     }
 
     #[test]
