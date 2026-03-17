@@ -91,7 +91,7 @@ mod tests {
             GraphContextNode {
                 number: 10,
                 title: "Refactor auth".to_string(),
-                state: "in_flight".to_string(),
+                state: crate::db::graph::NodeState::InFlight,
                 area: "auth".to_string(),
                 predicted_files: vec!["src/auth.rs".to_string(), "src/middleware.rs".to_string()],
                 has_migration: false,
@@ -100,7 +100,7 @@ mod tests {
             GraphContextNode {
                 number: 11,
                 title: "Add migration".to_string(),
-                state: "awaiting_merge".to_string(),
+                state: crate::db::graph::NodeState::AwaitingMerge,
                 area: "db".to_string(),
                 predicted_files: vec!["src/db/mod.rs".to_string()],
                 has_migration: true,

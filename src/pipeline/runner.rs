@@ -406,7 +406,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
             .map(|ifl| GraphContextNode {
                 number: ifl.number,
                 title: ifl.title.clone(),
-                state: "in_flight".to_string(),
+                state: crate::db::graph::NodeState::InFlight,
                 area: ifl.area.clone(),
                 predicted_files: ifl.predicted_files.clone(),
                 has_migration: ifl.has_migration,
@@ -416,7 +416,7 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
         graph_context.extend(deferred_snapshot.iter().map(|d| GraphContextNode {
             number: d.metadata.number,
             title: d.metadata.title.clone(),
-            state: "pending".to_string(),
+            state: crate::db::graph::NodeState::Pending,
             area: d.metadata.area.clone(),
             predicted_files: d.metadata.predicted_files.clone(),
             has_migration: d.metadata.has_migration,

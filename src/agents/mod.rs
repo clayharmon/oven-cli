@@ -254,7 +254,7 @@ pub struct PlannedNode {
 pub struct GraphContextNode {
     pub number: u32,
     pub title: String,
-    pub state: String,
+    pub state: crate::db::graph::NodeState,
     pub area: String,
     pub predicted_files: Vec<String>,
     pub has_migration: bool,
