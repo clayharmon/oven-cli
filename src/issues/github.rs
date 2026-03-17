@@ -80,7 +80,7 @@ mod tests {
         mock.expect_run_gh().returning(|_, _| {
             Box::pin(async {
                 Ok(CommandOutput {
-                    stdout: r#"[{"number":1,"title":"Fix bug","body":"details","labels":[]}]"#
+                    stdout: r#"[{"number":1,"title":"Fix bug","body":"details","labels":[],"author":{"login":"me"}}]"#
                         .to_string(),
                     stderr: String::new(),
                     success: true,
@@ -96,6 +96,7 @@ mod tests {
         assert_eq!(issues[0].number, 1);
         assert_eq!(issues[0].source, IssueOrigin::Github);
         assert!(issues[0].target_repo.is_none());
+        assert_eq!(issues[0].author.as_deref(), Some("me"));
     }
 
     #[tokio::test]

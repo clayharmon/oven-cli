@@ -102,6 +102,9 @@ fn validate_issue_authors(
             Some(author) if author != current_user => {
                 mismatches.push((issue.number, author.as_str()));
             }
+            None => {
+                mismatches.push((issue.number, "<unknown>"));
+            }
             _ => {}
         }
     }
@@ -257,9 +260,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_authors_skips_none_author() {
+    fn validate_authors_rejects_none_author() {
         let issues = vec![make_pipeline_issue(1, None)];
-        assert!(validate_issue_authors(&issues, "alice").is_ok());
+        let err = validate_issue_authors(&issues, "alice").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("issue #1"));
+        assert!(msg.contains("<unknown>"));
+        assert!(msg.contains("--trust"));
     }
 
     #[test]
