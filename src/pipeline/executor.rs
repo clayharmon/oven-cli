@@ -370,9 +370,23 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // 1. Implement
         self.update_status(run_id, RunStatus::Implementing).await?;
         let impl_prompt = agents::implementer::build_prompt(ctx)?;
-        self.run_agent(run_id, AgentRole::Implementer, &impl_prompt, worktree_path, 1).await?;
+        let impl_result =
+            self.run_agent(run_id, AgentRole::Implementer, &impl_prompt, worktree_path, 1).await?;
 
         git::push_branch(worktree_path, &ctx.branch).await?;
+
+        // 1b. Update PR description and mark ready for review
+        if let Some(pr_number) = ctx.pr_number {
+            let body = build_pr_body(&impl_result.output, ctx);
+            if let Err(e) =
+                self.github.edit_pr_in(pr_number, &pr_title(ctx), &body, target_dir).await
+            {
+                warn!(run_id = %run_id, error = %e, "failed to update PR description");
+            }
+            if let Err(e) = self.github.mark_pr_ready_in(pr_number, target_dir).await {
+                warn!(run_id = %run_id, error = %e, "failed to mark PR ready");
+            }
+        }
 
         // 2. Review-fix loop
         let clean = self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
@@ -629,6 +643,53 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
     comment
 }
 
+/// Build a PR title using the issue metadata.
+fn pr_title(ctx: &AgentContext) -> String {
+    if ctx.issue_source == "github" {
+        format!("fix(#{}): {}", ctx.issue_number, ctx.issue_title)
+    } else {
+        format!("fix: {}", ctx.issue_title)
+    }
+}
+
+/// Build a full PR body from the implementer's output and issue context.
+fn build_pr_body(impl_output: &str, ctx: &AgentContext) -> String {
+    let issue_ref = if ctx.issue_source == "github" {
+        format!("Resolves #{}", ctx.issue_number)
+    } else {
+        format!("From local issue #{}", ctx.issue_number)
+    };
+
+    let summary = extract_impl_summary(impl_output);
+
+    let mut body = String::new();
+    let _ = writeln!(body, "{issue_ref}\n");
+    let _ = writeln!(body, "{summary}");
+    let _ = writeln!(body, "---");
+    let _ = write!(body, "Automated by [oven](https://github.com/clayharmon/oven-cli)");
+    body
+}
+
+/// Extract the summary section from implementer output.
+///
+/// Looks for the conventional `## Changes Made` heading that the implementer
+/// template requests. Falls back to the full output (truncated) if the heading
+/// isn't found.
+fn extract_impl_summary(output: &str) -> String {
+    if let Some(idx) = output.find("## Changes Made") {
+        let summary = output[idx..].trim();
+        if summary.len() <= 4000 {
+            return summary.to_string();
+        }
+        return truncate(summary, 4000);
+    }
+    // Fallback: no structured summary found
+    if output.trim().is_empty() {
+        return String::from("*No implementation summary available.*");
+    }
+    truncate(output.trim(), 2000)
+}
+
 fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
     Run {
         id: run_id.to_string(),
@@ -730,6 +791,108 @@ mod tests {
         assert!(result.ends_with("..."));
         assert!(result.starts_with("你好"));
         assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn extract_impl_summary_finds_changes_made() {
+        let output = "Some preamble text\n\n## Changes Made\n- src/foo.rs: added bar\n\n## Tests Added\n- tests/foo.rs: bar test\n";
+        let summary = extract_impl_summary(output);
+        assert!(summary.starts_with("## Changes Made"));
+        assert!(summary.contains("added bar"));
+        assert!(summary.contains("## Tests Added"));
+    }
+
+    #[test]
+    fn extract_impl_summary_fallback_on_no_heading() {
+        let output = "just some raw agent output with no structure";
+        let summary = extract_impl_summary(output);
+        assert!(summary.contains("just some raw agent output"));
+    }
+
+    #[test]
+    fn extract_impl_summary_empty_output() {
+        assert_eq!(extract_impl_summary(""), "*No implementation summary available.*");
+        assert_eq!(extract_impl_summary("   "), "*No implementation summary available.*");
+    }
+
+    #[test]
+    fn build_pr_body_github_issue() {
+        let ctx = AgentContext {
+            issue_number: 42,
+            issue_title: "fix the thing".to_string(),
+            issue_body: String::new(),
+            branch: "oven/issue-42".to_string(),
+            pr_number: Some(10),
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        let body = build_pr_body("## Changes Made\n- added stuff", &ctx);
+        assert!(body.contains("Resolves #42"));
+        assert!(body.contains("## Changes Made"));
+        assert!(body.contains("Automated by [oven]"));
+    }
+
+    #[test]
+    fn build_pr_body_local_issue() {
+        let ctx = AgentContext {
+            issue_number: 7,
+            issue_title: "local thing".to_string(),
+            issue_body: String::new(),
+            branch: "oven/issue-7".to_string(),
+            pr_number: Some(10),
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "local".to_string(),
+            base_branch: "main".to_string(),
+        };
+        let body = build_pr_body("raw output", &ctx);
+        assert!(body.contains("From local issue #7"));
+    }
+
+    #[test]
+    fn pr_title_github() {
+        let ctx = AgentContext {
+            issue_number: 42,
+            issue_title: "fix the thing".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "github".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "fix(#42): fix the thing");
+    }
+
+    #[test]
+    fn pr_title_local() {
+        let ctx = AgentContext {
+            issue_number: 7,
+            issue_title: "local thing".to_string(),
+            issue_body: String::new(),
+            branch: String::new(),
+            pr_number: None,
+            test_command: None,
+            lint_command: None,
+            review_findings: None,
+            cycle: 1,
+            target_repo: None,
+            issue_source: "local".to_string(),
+            base_branch: "main".to_string(),
+        };
+        assert_eq!(pr_title(&ctx), "fix: local thing");
     }
 
     #[test]
