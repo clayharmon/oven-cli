@@ -698,6 +698,7 @@ mod tests {
             body: String::new(),
             source: crate::issues::IssueOrigin::Github,
             target_repo: None,
+            author: None,
         }
     }
 

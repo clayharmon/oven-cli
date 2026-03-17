@@ -75,7 +75,7 @@ impl<R: CommandRunner> GhClient<R> {
                     "--author",
                     "@me",
                     "--json",
-                    "number,title,body,labels",
+                    "number,title,body,labels,author",
                     "--state",
                     "open",
                     "--limit",
@@ -104,7 +104,7 @@ impl<R: CommandRunner> GhClient<R> {
                     "view",
                     &issue_number.to_string(),
                     "--json",
-                    "number,title,body,labels",
+                    "number,title,body,labels,author",
                 ]),
                 &self.repo_dir,
             )
@@ -114,6 +114,17 @@ impl<R: CommandRunner> GhClient<R> {
 
         let issue: Issue = serde_json::from_str(&output.stdout).context("parsing issue JSON")?;
         Ok(issue)
+    }
+
+    /// Fetch the authenticated GitHub user's login.
+    pub async fn get_current_user(&self) -> Result<String> {
+        let output = self
+            .runner
+            .run_gh(&Self::s(&["api", "user", "--jq", ".login"]), &self.repo_dir)
+            .await
+            .context("fetching current user")?;
+        Self::check_output(&output, "fetch current user")?;
+        Ok(output.stdout.trim().to_string())
     }
 
     /// Post a comment on an issue.
@@ -216,6 +227,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_issue_parses_author_login() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"number":10,"title":"Auth","body":"b","labels":[],"author":{"login":"alice"}}"#
+                        .to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let issue = client.get_issue(10).await.unwrap();
+
+        assert_eq!(issue.author.as_ref().unwrap().login, "alice");
+    }
+
+    #[tokio::test]
+    async fn get_issue_handles_missing_author() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"number":11,"title":"No author","body":"b","labels":[]}"#
+                        .to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let issue = client.get_issue(11).await.unwrap();
+
+        assert!(issue.author.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_current_user_returns_login() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"api".to_string()));
+            assert!(args.contains(&"user".to_string()));
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: "octocat\n".to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let user = client.get_current_user().await.unwrap();
+
+        assert_eq!(user, "octocat");
+    }
+
+    #[tokio::test]
     async fn comment_on_issue_succeeds() {
         let mut mock = MockCommandRunner::new();
         mock.expect_run_gh().returning(|_, _| {
@@ -262,7 +334,13 @@ mod tests {
     }
 
     fn make_issue(body: &str) -> Issue {
-        Issue { number: 1, title: "Test".to_string(), body: body.to_string(), labels: vec![] }
+        Issue {
+            number: 1,
+            title: "Test".to_string(),
+            body: body.to_string(),
+            labels: vec![],
+            author: None,
+        }
     }
 
     #[test]

@@ -140,6 +140,7 @@ impl IssueProvider for LocalIssueProvider {
                         body: ticket.body,
                         source: IssueOrigin::Local,
                         target_repo: ticket.target_repo,
+                        author: None,
                     });
                 }
             }
@@ -159,6 +160,7 @@ impl IssueProvider for LocalIssueProvider {
             body: ticket.body,
             source: IssueOrigin::Local,
             target_repo: ticket.target_repo,
+            author: None,
         })
     }
 
@@ -269,6 +271,19 @@ mod tests {
 
         assert_eq!(issue.number, 42);
         assert_eq!(issue.title, "Specific");
+    }
+
+    #[tokio::test]
+    async fn get_issue_author_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let issues_dir = dir.path().join(".oven").join("issues");
+
+        create_issue_file(&issues_dir, 7, &issue_content(7, "Local", "open", &["o-ready"]));
+
+        let provider = LocalIssueProvider::new(dir.path());
+        let issue = provider.get_issue(7).await.unwrap();
+
+        assert!(issue.author.is_none());
     }
 
     #[tokio::test]

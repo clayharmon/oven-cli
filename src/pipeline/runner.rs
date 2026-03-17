@@ -526,6 +526,7 @@ mod tests {
             body: String::new(),
             source: IssueOrigin::Github,
             target_repo: None,
+            author: None,
         }
     }
 
@@ -772,6 +773,7 @@ mod tests {
             body: "body".to_string(),
             source: IssueOrigin::Github,
             target_repo: None,
+            author: None,
         }];
 
         // plan_issues returns None for unparseable output

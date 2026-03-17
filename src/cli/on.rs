@@ -76,11 +76,44 @@ pub async fn run(args: OnArgs, global: &GlobalOpts) -> Result<()> {
             fetched.push(issue);
         }
 
+        // Author validation for explicit IDs with GitHub issue source
+        if !args.trust && config.project.issue_source == IssueSource::Github {
+            let current_user = executor.github.get_current_user().await?;
+            validate_issue_authors(&fetched, &current_user)?;
+        }
+
         runner::run_batch(&executor, fetched, config.pipeline.max_parallel as usize, args.merge)
             .await?;
     } else {
         // Polling mode
         runner::polling_loop(executor, args.merge, cancel_token).await?;
+    }
+
+    Ok(())
+}
+
+fn validate_issue_authors(
+    issues: &[crate::issues::PipelineIssue],
+    current_user: &str,
+) -> Result<()> {
+    let mut mismatches = Vec::new();
+    for issue in issues {
+        match &issue.author {
+            Some(author) if author != current_user => {
+                mismatches.push((issue.number, author.as_str()));
+            }
+            _ => {}
+        }
+    }
+
+    if !mismatches.is_empty() {
+        let details: Vec<String> = mismatches
+            .iter()
+            .map(|(num, author)| {
+                format!("issue #{num} was created by \"{author}\", not \"{current_user}\"")
+            })
+            .collect();
+        anyhow::bail!("{}. Use --trust to override.", details.join("; "));
     }
 
     Ok(())
@@ -102,6 +135,9 @@ fn spawn_detached(project_dir: &std::path::Path, args: &OnArgs, run_id: &str) ->
     }
     if args.merge {
         cmd_args.push("-m".to_string());
+    }
+    if args.trust {
+        cmd_args.push("--trust".to_string());
     }
     cmd_args.extend(["--run-id".to_string(), run_id.to_string()]);
 
@@ -178,5 +214,56 @@ mod tests {
     fn parse_invalid_id_fails() {
         let result = parse_issue_ids("1,abc,3");
         assert!(result.is_err());
+    }
+
+    fn make_pipeline_issue(number: u32, author: Option<&str>) -> crate::issues::PipelineIssue {
+        crate::issues::PipelineIssue {
+            number,
+            title: format!("Issue #{number}"),
+            body: String::new(),
+            source: crate::issues::IssueOrigin::Github,
+            target_repo: None,
+            author: author.map(String::from),
+        }
+    }
+
+    #[test]
+    fn validate_authors_passes_when_all_match() {
+        let issues =
+            vec![make_pipeline_issue(1, Some("alice")), make_pipeline_issue(2, Some("alice"))];
+        assert!(validate_issue_authors(&issues, "alice").is_ok());
+    }
+
+    #[test]
+    fn validate_authors_fails_on_mismatch() {
+        let issues =
+            vec![make_pipeline_issue(1, Some("alice")), make_pipeline_issue(2, Some("bob"))];
+        let err = validate_issue_authors(&issues, "alice").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("issue #2"));
+        assert!(msg.contains("bob"));
+        assert!(msg.contains("alice"));
+        assert!(msg.contains("--trust"));
+    }
+
+    #[test]
+    fn validate_authors_fails_fast_on_multiple_mismatches() {
+        let issues =
+            vec![make_pipeline_issue(1, Some("eve")), make_pipeline_issue(2, Some("mallory"))];
+        let err = validate_issue_authors(&issues, "alice").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("issue #1"));
+        assert!(msg.contains("issue #2"));
+    }
+
+    #[test]
+    fn validate_authors_skips_none_author() {
+        let issues = vec![make_pipeline_issue(1, None)];
+        assert!(validate_issue_authors(&issues, "alice").is_ok());
+    }
+
+    #[test]
+    fn validate_authors_empty_issues() {
+        assert!(validate_issue_authors(&[], "alice").is_ok());
     }
 }
