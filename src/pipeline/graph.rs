@@ -234,8 +234,21 @@ impl DependencyGraph {
     }
 
     /// Persist the full graph state to the database, replacing any existing data for
-    /// this session.
+    /// this session. Runs inside a transaction so a crash mid-save cannot leave a
+    /// partial graph.
     pub fn save_to_db(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE").context("starting graph save transaction")?;
+
+        let result = self.save_to_db_inner(conn);
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").context("committing graph save transaction")?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    fn save_to_db_inner(&self, conn: &Connection) -> Result<()> {
         graph::delete_session(conn, &self.session_id)?;
         for node in self.nodes.values() {
             let row = GraphNodeRow {
@@ -535,5 +548,28 @@ mod tests {
         let mut ready = g.ready_issues();
         ready.sort_unstable();
         assert_eq!(ready, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn save_to_db_is_atomic_on_success() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut g = DependencyGraph::new("atomic-test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_edge(2, 1);
+
+        g.save_to_db(&conn).unwrap();
+
+        // Overwrite with a different graph to verify the delete+insert is atomic
+        let mut g2 = DependencyGraph::new("atomic-test");
+        g2.add_node(make_node(10));
+        g2.save_to_db(&conn).unwrap();
+
+        let loaded = DependencyGraph::from_db(&conn, "atomic-test").unwrap();
+        // Old nodes should be gone, only node 10 remains
+        assert_eq!(loaded.node_count(), 1);
+        assert!(loaded.contains(10));
+        assert!(!loaded.contains(1));
+        assert!(!loaded.contains(2));
     }
 }
