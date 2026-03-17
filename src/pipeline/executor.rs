@@ -210,7 +210,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     ///
     /// Returns `(target_dir, is_multi_repo)`. When multi-repo is disabled or no target
     /// is specified, falls back to `self.repo_dir`.
-    fn resolve_target_dir(&self, target_repo: Option<&String>) -> Result<(PathBuf, bool)> {
+    pub(crate) fn resolve_target_dir(
+        &self,
+        target_repo: Option<&String>,
+    ) -> Result<(PathBuf, bool)> {
         if !self.config.multi_repo.enabled {
             return Ok((self.repo_dir.clone(), false));
         }

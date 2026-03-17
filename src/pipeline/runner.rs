@@ -260,8 +260,19 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
         };
         let run_id = node.run_id.clone().unwrap_or_default();
         let issue = node.issue.clone();
+        let target_repo = node.target_repo.clone();
 
-        let pr_state = match executor.github.get_pr_state(pr_number).await {
+        // Resolve which repo directory to query for PR state.
+        // Multi-repo PRs live in the target repo, not the god repo.
+        let pr_repo_dir = match executor.resolve_target_dir(target_repo.as_ref()) {
+            Ok((dir, _)) => dir,
+            Err(e) => {
+                warn!(issue = num, error = %e, "failed to resolve target dir for PR state check");
+                continue;
+            }
+        };
+
+        let pr_state = match executor.github.get_pr_state_in(pr_number, &pr_repo_dir).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(issue = num, pr = pr_number, error = %e, "failed to check PR state");
@@ -447,6 +458,7 @@ fn standalone_node(issue: &PipelineIssue) -> GraphNode {
         state: NodeState::Pending,
         pr_number: None,
         run_id: None,
+        target_repo: issue.target_repo.clone(),
         issue: Some(issue.clone()),
     }
 }
@@ -895,6 +907,7 @@ mod tests {
                 pr_number: Some(42),
                 run_id: Some("run-1".to_string()),
                 issue: None,
+                target_repo: None,
             };
             node.state = NodeState::Pending;
             graph.add_node(node);

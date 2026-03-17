@@ -23,6 +23,9 @@ pub struct GraphNode {
     pub pr_number: Option<u32>,
     pub run_id: Option<String>,
     pub issue: Option<PipelineIssue>,
+    /// Target repo name for multi-repo routing. Persisted separately from `issue`
+    /// so it survives DB round-trips (where `issue` is `None`).
+    pub target_repo: Option<String>,
 }
 
 /// Directed acyclic graph tracking issue dependencies.
@@ -263,6 +266,7 @@ impl DependencyGraph {
                 pr_number: row.pr_number,
                 run_id: row.run_id.clone(),
                 issue: None,
+                target_repo: row.target_repo.clone(),
             });
         }
         for (from, to) in &db_edges {
@@ -293,6 +297,7 @@ impl DependencyGraph {
                 predicted_files: node.predicted_files.clone(),
                 has_migration: node.has_migration,
                 complexity: node.complexity.clone(),
+                target_repo: node.target_repo.clone(),
             };
             graph::insert_node(&tx, &self.session_id, &row)?;
         }
@@ -397,6 +402,7 @@ fn node_from_planned(node: &PlannedNode, issue: Option<&PipelineIssue>) -> Graph
         state: NodeState::Pending,
         pr_number: None,
         run_id: None,
+        target_repo: issue.and_then(|i| i.target_repo.clone()),
         issue: issue.cloned(),
     }
 }
@@ -432,6 +438,7 @@ mod tests {
             pr_number: None,
             run_id: None,
             issue: None,
+            target_repo: None,
         }
     }
 
