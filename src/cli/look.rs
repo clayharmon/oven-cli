@@ -139,13 +139,18 @@ fn print_run_status(
     println!();
 }
 
-/// Truncate a string to a single line of at most `max` chars.
+/// Truncate a string to a single line of at most `max` bytes, appending "..." if truncated.
+/// Always cuts at a valid UTF-8 character boundary to avoid panics on multi-byte input.
 fn truncate_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("");
     if line.len() <= max {
         line.to_string()
     } else {
-        format!("{}...", &line[..max.saturating_sub(3)])
+        let mut end = max.saturating_sub(3);
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &line[..end])
     }
 }
 
@@ -412,6 +417,15 @@ mod tests {
         let result = truncate_line(&long, 20);
         assert_eq!(result.len(), 20);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_line_multibyte_does_not_panic() {
+        // Emoji is 4 bytes; slicing at a non-boundary would panic without the fix
+        let s = "😀😀😀😀😀😀";
+        let result = truncate_line(s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 10);
     }
 
     #[test]

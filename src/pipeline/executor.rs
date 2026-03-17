@@ -441,9 +441,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
                 let (mut addressed, disputed): (Vec<_>, Vec<_>) =
                     all_resolved.into_iter().partition(|f| {
-                        f.dispute_reason
-                            .as_deref()
-                            .is_some_and(|r| r.starts_with("ADDRESSED: "))
+                        f.dispute_reason.as_deref().is_some_and(|r| r.starts_with("ADDRESSED: "))
                     });
 
                 // Strip the "ADDRESSED: " prefix so the template gets clean action text
