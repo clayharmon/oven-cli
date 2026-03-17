@@ -12,7 +12,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::executor::PipelineExecutor;
+use super::executor::{PipelineExecutor, PipelineOutcome};
 use crate::{
     agents::{GraphContextNode, InFlightIssue, PlannerGraphOutput},
     issues::PipelineIssue,
@@ -39,7 +39,7 @@ struct SchedulerState {
     semaphore: Arc<Semaphore>,
     in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>>,
     deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-    tasks: JoinSet<(u32, Result<()>)>,
+    tasks: JoinSet<(u32, Result<PipelineOutcome>)>,
 }
 
 /// Run the pipeline for a batch of issues using planner-driven sequencing.
@@ -172,16 +172,25 @@ async fn run_issues_parallel<R: CommandRunner + 'static>(
         let complexity = complexity_map.and_then(|m| m.get(&issue.number).cloned());
         tasks.spawn(async move {
             let number = issue.number;
-            let result = exec.run_issue_with_complexity(&issue, auto_merge, complexity).await;
+            let result = exec.run_issue_pipeline(&issue, auto_merge, complexity).await;
+            let outcome = match result {
+                Ok(outcome) => {
+                    if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
+                        warn!(issue = number, error = %e, "finalize_merge failed");
+                    }
+                    Ok(outcome)
+                }
+                Err(e) => Err(e),
+            };
             drop(permit);
-            (number, result)
+            (number, outcome)
         });
     }
 
     let mut had_errors = false;
     while let Some(join_result) = tasks.join_next().await {
         match join_result {
-            Ok((number, Ok(()))) => {
+            Ok((number, Ok(_outcome))) => {
                 info!(issue = number, "pipeline completed successfully");
             }
             Ok((number, Err(e))) => {
@@ -201,9 +210,9 @@ async fn run_issues_parallel<R: CommandRunner + 'static>(
     Ok(())
 }
 
-fn handle_task_result(result: Result<(u32, Result<()>), tokio::task::JoinError>) {
+fn handle_task_result(result: Result<(u32, Result<PipelineOutcome>), tokio::task::JoinError>) {
     match result {
-        Ok((number, Ok(()))) => {
+        Ok((number, Ok(_outcome))) => {
             info!(issue = number, "pipeline completed successfully");
         }
         Ok((number, Err(e))) => {
@@ -446,7 +455,16 @@ async fn spawn_issues<R: CommandRunner + 'static>(
                     return (number, Err(anyhow::anyhow!("semaphore closed: {e}")));
                 }
             };
-            let result = exec.run_issue_with_complexity(&issue, auto_merge, complexity).await;
+            let result = exec.run_issue_pipeline(&issue, auto_merge, complexity).await;
+            let outcome = match result {
+                Ok(outcome) => {
+                    if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
+                        warn!(issue = number, error = %e, "finalize_merge failed");
+                    }
+                    Ok(outcome)
+                }
+                Err(e) => Err(e),
+            };
             in_fl.lock().await.remove(&number);
             // Clear this issue from deferred awaiting sets so dependents can be promoted
             {
@@ -456,7 +474,7 @@ async fn spawn_issues<R: CommandRunner + 'static>(
                 }
             }
             drop(permit);
-            (number, result)
+            (number, outcome)
         });
     }
 }
@@ -658,7 +676,14 @@ mod tests {
 
     #[test]
     fn handle_task_result_does_not_panic_on_success() {
-        handle_task_result(Ok((1, Ok(()))));
+        use super::PipelineOutcome;
+        let outcome = PipelineOutcome {
+            run_id: "test-run".to_string(),
+            pr_number: 1,
+            worktree_path: PathBuf::from("/tmp/wt"),
+            target_dir: PathBuf::from("/tmp"),
+        };
+        handle_task_result(Ok((1, Ok(outcome))));
     }
 
     #[test]
