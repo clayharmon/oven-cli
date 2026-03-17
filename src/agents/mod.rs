@@ -182,7 +182,7 @@ impl InFlightIssue {
     }
 }
 
-/// Structured output from the planner agent.
+/// Structured output from the planner agent (legacy batch format).
 #[derive(Debug, Deserialize)]
 pub struct PlannerOutput {
     pub batches: Vec<Batch>,
@@ -219,11 +219,98 @@ const fn default_full() -> Complexity {
     Complexity::Full
 }
 
+/// Structured output from the planner agent (DAG format with explicit dependencies).
+#[derive(Debug, Deserialize)]
+pub struct PlannerGraphOutput {
+    pub nodes: Vec<PlannedNode>,
+    #[serde(default)]
+    pub total_issues: u32,
+    #[serde(default)]
+    pub parallel_capacity: u32,
+}
+
+/// A single issue node in the planner's DAG output.
+#[derive(Debug, Deserialize)]
+pub struct PlannedNode {
+    pub number: u32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub area: String,
+    #[serde(default)]
+    pub predicted_files: Vec<String>,
+    #[serde(default)]
+    pub has_migration: bool,
+    #[serde(default = "default_full")]
+    pub complexity: Complexity,
+    #[serde(default)]
+    pub depends_on: Vec<u32>,
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+/// Context passed to the planner about existing graph state.
+#[derive(Debug, Clone)]
+pub struct GraphContextNode {
+    pub number: u32,
+    pub title: String,
+    pub state: String,
+    pub area: String,
+    pub predicted_files: Vec<String>,
+    pub has_migration: bool,
+    pub depends_on: Vec<u32>,
+}
+
 /// Parse structured planner output from the planner's text response.
 ///
-/// Falls back to `None` if the output is unparseable.
+/// Tries the new DAG format first, falls back to the legacy batch format
+/// (converting batches into dependency edges).
 pub fn parse_planner_output(text: &str) -> Option<PlannerOutput> {
     extract_json(text)
+}
+
+/// Parse planner output as a DAG. Tries the new format first, converts
+/// legacy batch format into equivalent DAG nodes if needed.
+pub fn parse_planner_graph_output(text: &str) -> Option<PlannerGraphOutput> {
+    // Try new DAG format first
+    if let Some(output) = extract_json::<PlannerGraphOutput>(text) {
+        return Some(output);
+    }
+
+    // Fall back to legacy batch format and convert
+    let legacy: PlannerOutput = extract_json(text)?;
+    Some(batches_to_graph_output(&legacy))
+}
+
+/// Convert a legacy batch-based planner output into a DAG output.
+///
+/// Issues in batch N+1 depend on all issues in batch N (transitive chain).
+fn batches_to_graph_output(legacy: &PlannerOutput) -> PlannerGraphOutput {
+    let mut nodes = Vec::new();
+    let mut prior_batch_issues: Vec<u32> = Vec::new();
+
+    for batch in &legacy.batches {
+        let depends_on = prior_batch_issues.clone();
+        for pi in &batch.issues {
+            nodes.push(PlannedNode {
+                number: pi.number,
+                title: pi.title.clone(),
+                area: pi.area.clone(),
+                predicted_files: pi.predicted_files.clone(),
+                has_migration: pi.has_migration,
+                complexity: pi.complexity.clone(),
+                depends_on: depends_on.clone(),
+                reasoning: batch.reasoning.clone(),
+            });
+        }
+        prior_batch_issues.extend(batch.issues.iter().map(|pi| pi.number));
+    }
+
+    PlannerGraphOutput {
+        total_issues: legacy.total_issues,
+        parallel_capacity: legacy.parallel_capacity,
+        nodes,
+    }
 }
 
 /// Structured output from the reviewer agent.
@@ -548,5 +635,103 @@ That's the plan."#;
         assert_eq!(output.batches[0].issues.len(), 2);
         assert_eq!(output.batches[1].issues.len(), 1);
         assert_eq!(output.total_issues, 3);
+    }
+
+    // --- DAG planner output parsing tests ---
+
+    #[test]
+    fn parse_graph_output_new_format() {
+        let json = r#"{
+            "nodes": [
+                {"number": 1, "title": "A", "area": "cli", "depends_on": [], "complexity": "simple"},
+                {"number": 2, "title": "B", "area": "db", "depends_on": [1], "complexity": "full"}
+            ],
+            "total_issues": 2,
+            "parallel_capacity": 2
+        }"#;
+        let output = parse_planner_graph_output(json).unwrap();
+        assert_eq!(output.nodes.len(), 2);
+        assert!(output.nodes[0].depends_on.is_empty());
+        assert_eq!(output.nodes[1].depends_on, vec![1]);
+    }
+
+    #[test]
+    fn parse_graph_output_falls_back_to_batch_format() {
+        let json = r#"{
+            "batches": [
+                {"batch": 1, "issues": [{"number": 1, "complexity": "simple"}, {"number": 2, "complexity": "simple"}], "reasoning": "ok"},
+                {"batch": 2, "issues": [{"number": 3, "complexity": "full"}], "reasoning": "deps"}
+            ],
+            "total_issues": 3,
+            "parallel_capacity": 2
+        }"#;
+        let output = parse_planner_graph_output(json).unwrap();
+        assert_eq!(output.nodes.len(), 3);
+        // Batch 1 issues have no dependencies
+        assert!(output.nodes[0].depends_on.is_empty());
+        assert!(output.nodes[1].depends_on.is_empty());
+        // Batch 2 issue depends on batch 1 issues
+        let mut deps = output.nodes[2].depends_on.clone();
+        deps.sort_unstable();
+        assert_eq!(deps, vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_graph_output_malformed_returns_none() {
+        assert!(parse_planner_graph_output("garbage").is_none());
+    }
+
+    #[test]
+    fn batches_to_graph_three_batches() {
+        let legacy = PlannerOutput {
+            batches: vec![
+                Batch {
+                    batch: 1,
+                    issues: vec![PlannedIssue {
+                        number: 1,
+                        title: "A".into(),
+                        area: "a".into(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Simple,
+                    }],
+                    reasoning: String::new(),
+                },
+                Batch {
+                    batch: 2,
+                    issues: vec![PlannedIssue {
+                        number: 2,
+                        title: "B".into(),
+                        area: "b".into(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                    }],
+                    reasoning: String::new(),
+                },
+                Batch {
+                    batch: 3,
+                    issues: vec![PlannedIssue {
+                        number: 3,
+                        title: "C".into(),
+                        area: "c".into(),
+                        predicted_files: vec![],
+                        has_migration: false,
+                        complexity: Complexity::Full,
+                    }],
+                    reasoning: String::new(),
+                },
+            ],
+            total_issues: 3,
+            parallel_capacity: 1,
+        };
+
+        let output = batches_to_graph_output(&legacy);
+        assert_eq!(output.nodes.len(), 3);
+        assert!(output.nodes[0].depends_on.is_empty()); // batch 1
+        assert_eq!(output.nodes[1].depends_on, vec![1]); // batch 2
+        let mut deps = output.nodes[2].depends_on.clone();
+        deps.sort_unstable();
+        assert_eq!(deps, vec![1, 2]); // batch 3
     }
 }
