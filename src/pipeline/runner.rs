@@ -1,207 +1,128 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use tokio::{
-    sync::{Mutex, Semaphore},
-    task::JoinSet,
-};
+use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::executor::{PipelineExecutor, PipelineOutcome};
+use super::{
+    executor::{PipelineExecutor, PipelineOutcome},
+    graph::DependencyGraph,
+};
 use crate::{
-    agents::{GraphContextNode, InFlightIssue, PlannerGraphOutput},
+    agents::Complexity,
+    db::graph::NodeState,
     issues::PipelineIssue,
+    pipeline::{executor::generate_run_id, graph::GraphNode},
     process::CommandRunner,
 };
 
-/// An issue the planner has evaluated and placed in a later batch.
-///
-/// Stored across poll cycles so we skip re-invoking the planner for issues whose
-/// dependency chain is already known. The `awaiting` set tracks which issue numbers
-/// must complete before this issue can be promoted to in-flight.
-#[derive(Debug, Clone)]
-struct DeferredIssue {
-    issue: PipelineIssue,
-    metadata: InFlightIssue,
-    awaiting: HashSet<u32>,
-}
-
 /// Shared mutable state for the polling scheduler.
 ///
-/// Groups the semaphore, in-flight map, deferred map, and task set that are
-/// threaded through every poll cycle and spawn call.
+/// The `DependencyGraph` is the single source of truth for issue states,
+/// dependency edges, and scheduling decisions.
 struct SchedulerState {
+    graph: DependencyGraph,
     semaphore: Arc<Semaphore>,
-    in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>>,
-    deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>>,
     tasks: JoinSet<(u32, Result<PipelineOutcome>)>,
 }
 
 /// Run the pipeline for a batch of issues using planner-driven sequencing.
 ///
 /// Used for the explicit-IDs path (`oven on 42,43`). Calls the planner with no
-/// in-flight context, then runs batches sequentially (issues within each batch
-/// run in parallel). Falls back to all-parallel if the planner fails.
+/// in-flight context, builds a `DependencyGraph`, then runs layers sequentially
+/// (issues within each layer run in parallel). Falls back to all-parallel if the
+/// planner fails.
 pub async fn run_batch<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
     issues: Vec<PipelineIssue>,
     max_parallel: usize,
     auto_merge: bool,
 ) -> Result<()> {
-    if let Some(plan) = executor.plan_issues(&issues, &[]).await {
+    let session_id = generate_run_id();
+    let mut graph = if let Some(plan) = executor.plan_issues(&issues, &[]).await {
         info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
-        run_dag_layers(executor, &issues, &plan, max_parallel, auto_merge).await
+        DependencyGraph::from_planner_output(&session_id, &plan, &issues)
     } else {
         warn!("planner failed, falling back to all-parallel execution");
-        run_issues_parallel(executor, issues, None, max_parallel, auto_merge).await
-    }
-}
-
-/// Compute topological layers from a DAG: nodes with no unsatisfied dependencies form
-/// layer 1, nodes depending only on layer 1 form layer 2, etc.
-///
-/// Each layer is a vec of `PlannedNode` references. Nodes with unresolvable dependencies
-/// (cycles or missing nodes) are forced into the final layer.
-fn topological_layers(plan: &PlannerGraphOutput) -> Vec<Vec<&crate::agents::PlannedNode>> {
-    use std::collections::VecDeque;
-
-    let mut layers = Vec::new();
-    let mut assigned: HashSet<u32> = HashSet::new();
-    let mut remaining: VecDeque<&crate::agents::PlannedNode> = plan.nodes.iter().collect();
-
-    while !remaining.is_empty() {
-        let mut current_layer = Vec::new();
-        let mut next_remaining = VecDeque::new();
-
-        for node in remaining {
-            if node.depends_on.iter().all(|d| assigned.contains(d)) {
-                current_layer.push(node);
-            } else {
-                next_remaining.push_back(node);
-            }
+        let mut g = DependencyGraph::new(&session_id);
+        for issue in &issues {
+            g.add_node(standalone_node(issue));
         }
+        g
+    };
 
-        if current_layer.is_empty() {
-            // Remaining nodes have unresolvable deps, force them into final layer
-            for node in next_remaining {
-                current_layer.push(node);
-            }
-            next_remaining = VecDeque::new();
-        }
+    save_graph(&graph, executor).await;
 
-        for node in &current_layer {
-            assigned.insert(node.number);
-        }
-
-        layers.push(current_layer);
-        remaining = next_remaining;
-    }
-
-    layers
-}
-
-/// Run DAG layers in sequence: wait for layer N to complete before starting layer N+1.
-/// Issues within each layer run in parallel.
-async fn run_dag_layers<R: CommandRunner + 'static>(
-    executor: &Arc<PipelineExecutor<R>>,
-    issues: &[PipelineIssue],
-    plan: &PlannerGraphOutput,
-    max_parallel: usize,
-    auto_merge: bool,
-) -> Result<()> {
-    let issue_map: HashMap<u32, &PipelineIssue> = issues.iter().map(|i| (i.number, i)).collect();
-    let layers = topological_layers(plan);
-
-    for (idx, layer) in layers.iter().enumerate() {
-        let layer_issues: Vec<PipelineIssue> = layer
-            .iter()
-            .filter_map(|node| issue_map.get(&node.number).map(|i| (*i).clone()))
-            .collect();
-
-        if layer_issues.is_empty() {
-            continue;
-        }
-
-        let reasoning = layer.first().map_or("", |n| &n.reasoning);
-        info!(
-            layer = idx + 1,
-            count = layer_issues.len(),
-            reasoning = %reasoning,
-            "starting layer"
-        );
-
-        let complexity_map: HashMap<u32, crate::agents::Complexity> =
-            layer.iter().map(|n| (n.number, n.complexity.clone())).collect();
-        run_issues_parallel(
-            executor,
-            layer_issues,
-            Some(&complexity_map),
-            max_parallel,
-            auto_merge,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-/// Run a set of issues in parallel behind a semaphore. If `complexity_map` is provided,
-/// each issue uses its planner-assigned complexity; otherwise complexity defaults to None.
-async fn run_issues_parallel<R: CommandRunner + 'static>(
-    executor: &Arc<PipelineExecutor<R>>,
-    issues: Vec<PipelineIssue>,
-    complexity_map: Option<&HashMap<u32, crate::agents::Complexity>>,
-    max_parallel: usize,
-    auto_merge: bool,
-) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(max_parallel));
-    let mut tasks = JoinSet::new();
-
-    for issue in issues {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
-        let exec = Arc::clone(executor);
-        let complexity = complexity_map.and_then(|m| m.get(&issue.number).cloned());
-        tasks.spawn(async move {
-            let number = issue.number;
-            let result = exec.run_issue_pipeline(&issue, auto_merge, complexity).await;
-            let outcome = match result {
-                Ok(outcome) => {
-                    if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
-                        warn!(issue = number, error = %e, "finalize_merge failed");
-                    }
-                    Ok(outcome)
-                }
-                Err(e) => Err(e),
-            };
-            drop(permit);
-            (number, outcome)
-        });
-    }
-
     let mut had_errors = false;
-    while let Some(join_result) = tasks.join_next().await {
-        match join_result {
-            Ok((number, Ok(_outcome))) => {
-                info!(issue = number, "pipeline completed successfully");
-            }
-            Ok((number, Err(e))) => {
-                error!(issue = number, error = %e, "pipeline failed for issue");
-                had_errors = true;
-            }
-            Err(e) => {
-                error!(error = %e, "pipeline task panicked");
-                had_errors = true;
+
+    while !graph.all_terminal() {
+        let ready = graph.ready_issues();
+        if ready.is_empty() {
+            warn!("no ready issues but graph is not terminal, breaking to avoid infinite loop");
+            break;
+        }
+
+        let mut tasks: JoinSet<(u32, Result<PipelineOutcome>)> = JoinSet::new();
+
+        for num in &ready {
+            graph.transition(*num, NodeState::InFlight);
+        }
+        save_graph(&graph, executor).await;
+
+        for num in ready {
+            let node = graph.node(num).expect("ready issue must exist in graph");
+            let issue = node.issue.clone().expect("batch issues have issue attached");
+            let complexity = node.complexity.parse::<Complexity>().ok();
+            let sem = Arc::clone(&semaphore);
+            let exec = Arc::clone(executor);
+
+            tasks.spawn(async move {
+                let permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (num, Err(anyhow::anyhow!("semaphore closed: {e}"))),
+                };
+                let result = exec.run_issue_pipeline(&issue, auto_merge, complexity).await;
+                let outcome = match result {
+                    Ok(outcome) => {
+                        if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
+                            warn!(issue = num, error = %e, "finalize_merge failed");
+                        }
+                        Ok(outcome)
+                    }
+                    Err(e) => Err(e),
+                };
+                drop(permit);
+                (num, outcome)
+            });
+        }
+
+        while let Some(join_result) = tasks.join_next().await {
+            match join_result {
+                Ok((number, Ok(ref outcome))) => {
+                    info!(issue = number, "pipeline completed successfully");
+                    graph.set_pr_number(number, outcome.pr_number);
+                    graph.set_run_id(number, &outcome.run_id);
+                    graph.transition(number, NodeState::Merged);
+                }
+                Ok((number, Err(ref e))) => {
+                    error!(issue = number, error = %e, "pipeline failed for issue");
+                    graph.transition(number, NodeState::Failed);
+                    let blocked = graph.propagate_failure(number);
+                    for b in &blocked {
+                        warn!(issue = b, blocked_by = number, "transitively failed");
+                    }
+                    had_errors = true;
+                }
+                Err(e) => {
+                    error!(error = %e, "pipeline task panicked");
+                    had_errors = true;
+                }
             }
         }
+
+        save_graph(&graph, executor).await;
     }
 
     if had_errors {
@@ -210,29 +131,12 @@ async fn run_issues_parallel<R: CommandRunner + 'static>(
     Ok(())
 }
 
-fn handle_task_result(result: Result<(u32, Result<PipelineOutcome>), tokio::task::JoinError>) {
-    match result {
-        Ok((number, Ok(_outcome))) => {
-            info!(issue = number, "pipeline completed successfully");
-        }
-        Ok((number, Err(e))) => {
-            error!(issue = number, error = %e, "pipeline failed for issue");
-        }
-        Err(e) => {
-            error!(error = %e, "pipeline task panicked");
-        }
-    }
-}
-
 /// Poll for new issues and run them through the pipeline.
 ///
 /// Unlike `run_batch`, this function continuously polls for new issues even while
-/// existing pipelines are running. Uses a shared semaphore and `JoinSet` that persist
-/// across poll cycles, with in-flight and deferred tracking to prevent double-spawning
-/// and avoid re-invoking the planner for issues whose dependency chain is already known.
-///
-/// Deferred issues (batch 2+) are stored locally and promoted automatically when their
-/// dependencies complete, saving planner tokens on subsequent poll cycles.
+/// existing pipelines are running. The `DependencyGraph` is the single source of
+/// truth: `ready_issues()` drives scheduling, `transition()` replaces manual map
+/// mutations, and `propagate_failure()` handles dependency cascades.
 pub async fn polling_loop<R: CommandRunner + 'static>(
     executor: Arc<PipelineExecutor<R>>,
     auto_merge: bool,
@@ -241,10 +145,13 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
     let poll_interval = Duration::from_secs(executor.config.pipeline.poll_interval);
     let max_parallel = executor.config.pipeline.max_parallel as usize;
     let ready_label = executor.config.labels.ready.clone();
+
+    // Try loading an existing graph session (crash recovery), or create a new one.
+    let graph = load_or_create_graph(&executor).await;
+
     let mut sched = SchedulerState {
+        graph,
         semaphore: Arc::new(Semaphore::new(max_parallel)),
-        in_flight: Arc::new(Mutex::new(HashMap::new())),
-        deferred: Arc::new(Mutex::new(HashMap::new())),
         tasks: JoinSet::new(),
     };
 
@@ -254,16 +161,14 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
         tokio::select! {
             () = cancel_token.cancelled() => {
                 info!("shutdown signal received, waiting for in-flight pipelines");
-                while let Some(result) = sched.tasks.join_next().await {
-                    handle_task_result(result);
-                }
+                drain_tasks(&mut sched, &executor).await;
                 break;
             }
             () = tokio::time::sleep(poll_interval) => {
                 poll_and_spawn(&executor, &ready_label, &mut sched, auto_merge).await;
             }
             Some(result) = sched.tasks.join_next(), if !sched.tasks.is_empty() => {
-                handle_task_result(result);
+                handle_task_result(result, &mut sched.graph, &executor).await;
             }
         }
     }
@@ -271,45 +176,71 @@ pub async fn polling_loop<R: CommandRunner + 'static>(
     Ok(())
 }
 
-/// Remove deferred entries for issues no longer in the ready list and clear
-/// their numbers from other deferred issues' awaiting sets.
-async fn clean_stale_deferred(
-    deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-    ready_numbers: &HashSet<u32>,
+/// Load an existing active graph session from DB, or create a new empty one.
+async fn load_or_create_graph<R: CommandRunner>(
+    executor: &Arc<PipelineExecutor<R>>,
+) -> DependencyGraph {
+    let conn = executor.db.lock().await;
+    match crate::db::graph::get_active_session(&conn) {
+        Ok(Some(session_id)) => match DependencyGraph::from_db(&conn, &session_id) {
+            Ok(graph) => {
+                info!(session_id = %session_id, nodes = graph.node_count(), "resumed existing graph session");
+                return graph;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to load graph session, starting fresh");
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "failed to check for active graph session");
+        }
+    }
+    let session_id = generate_run_id();
+    info!(session_id = %session_id, "starting new graph session");
+    DependencyGraph::new(&session_id)
+}
+
+/// Drain remaining tasks on shutdown.
+async fn drain_tasks<R: CommandRunner>(
+    sched: &mut SchedulerState,
+    executor: &Arc<PipelineExecutor<R>>,
 ) {
-    let mut def_guard = deferred.lock().await;
-    let stale: HashSet<u32> =
-        def_guard.keys().filter(|num| !ready_numbers.contains(num)).copied().collect();
-    if !stale.is_empty() {
-        info!(count = stale.len(), "removing stale deferred issues");
-        def_guard.retain(|num, _| !stale.contains(num));
-        for d in def_guard.values_mut() {
-            d.awaiting.retain(|n| !stale.contains(n));
-        }
+    while let Some(result) = sched.tasks.join_next().await {
+        handle_task_result(result, &mut sched.graph, executor).await;
     }
 }
 
-/// Promote deferred issues whose awaiting sets have fully cleared.
-async fn promote_deferred(
-    deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-) -> Vec<(PipelineIssue, InFlightIssue)> {
-    let mut promoted = Vec::new();
-    let mut def_guard = deferred.lock().await;
-    let ready: Vec<u32> =
-        def_guard.iter().filter(|(_, d)| d.awaiting.is_empty()).map(|(num, _)| *num).collect();
-    for num in ready {
-        if let Some(d) = def_guard.remove(&num) {
-            info!(issue = num, "promoting deferred issue (dependencies cleared)");
-            promoted.push((d.issue, d.metadata));
+/// Process a completed pipeline task: update graph state and persist.
+async fn handle_task_result<R: CommandRunner>(
+    result: Result<(u32, Result<PipelineOutcome>), tokio::task::JoinError>,
+    graph: &mut DependencyGraph,
+    executor: &Arc<PipelineExecutor<R>>,
+) {
+    match result {
+        Ok((number, Ok(ref outcome))) => {
+            info!(issue = number, "pipeline completed successfully");
+            graph.set_pr_number(number, outcome.pr_number);
+            graph.set_run_id(number, &outcome.run_id);
+            graph.transition(number, NodeState::AwaitingMerge);
+        }
+        Ok((number, Err(ref e))) => {
+            error!(issue = number, error = %e, "pipeline failed for issue");
+            graph.transition(number, NodeState::Failed);
+            let blocked = graph.propagate_failure(number);
+            for b in &blocked {
+                warn!(issue = b, blocked_by = number, "transitively failed");
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "pipeline task panicked");
+            return;
         }
     }
-    promoted
+    save_graph(graph, executor).await;
 }
 
-/// Single poll cycle: promote ready deferred issues, plan genuinely new ones, and spawn.
-///
-/// Only invokes the planner for issues not already tracked in `in_flight` or `deferred`.
-/// Deferred issues whose `awaiting` set has cleared are promoted without a planner call.
+/// Single poll cycle: plan new issues, promote ready ones, and spawn tasks.
 async fn poll_and_spawn<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
     ready_label: &str,
@@ -325,70 +256,32 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
     };
 
     let ready_numbers: HashSet<u32> = ready_issues.iter().map(|i| i.number).collect();
-    clean_stale_deferred(&sched.deferred, &ready_numbers).await;
 
-    // Snapshot in-flight and deferred state, then filter to genuinely new issues
-    let (in_flight_numbers, in_flight_snapshot) = {
-        let guard = sched.in_flight.lock().await;
-        let numbers: HashSet<u32> = guard.keys().copied().collect();
-        let snapshot: Vec<InFlightIssue> = guard.values().cloned().collect();
-        drop(guard);
-        (numbers, snapshot)
-    };
+    // Clean stale nodes: remove Pending nodes whose issues disappeared from the ready list
+    clean_stale_nodes(&mut sched.graph, &ready_numbers);
 
-    let (deferred_numbers, deferred_snapshot) = {
-        let guard = sched.deferred.lock().await;
-        let numbers: HashSet<u32> = guard.keys().copied().collect();
-        let snapshot: Vec<DeferredIssue> = guard.values().cloned().collect();
-        drop(guard);
-        (numbers, snapshot)
-    };
+    // Filter to genuinely new issues not already in the graph
+    let new_issues: Vec<_> =
+        ready_issues.into_iter().filter(|i| !sched.graph.contains(i.number)).collect();
 
-    let new_issues: Vec<_> = ready_issues
-        .into_iter()
-        .filter(|i| !in_flight_numbers.contains(&i.number) && !deferred_numbers.contains(&i.number))
-        .collect();
-
-    let mut to_spawn = promote_deferred(&sched.deferred).await;
-
-    // Only invoke the planner for genuinely new issues
+    // Plan and merge new issues into the graph
     if !new_issues.is_empty() {
         info!(count = new_issues.len(), "found new issues to evaluate");
-
-        let mut graph_context: Vec<GraphContextNode> = in_flight_snapshot
-            .iter()
-            .map(|ifl| GraphContextNode {
-                number: ifl.number,
-                title: ifl.title.clone(),
-                state: crate::db::graph::NodeState::InFlight,
-                area: ifl.area.clone(),
-                predicted_files: ifl.predicted_files.clone(),
-                has_migration: ifl.has_migration,
-                depends_on: vec![],
-            })
-            .collect();
-        graph_context.extend(deferred_snapshot.iter().map(|d| GraphContextNode {
-            number: d.metadata.number,
-            title: d.metadata.title.clone(),
-            state: crate::db::graph::NodeState::Pending,
-            area: d.metadata.area.clone(),
-            predicted_files: d.metadata.predicted_files.clone(),
-            has_migration: d.metadata.has_migration,
-            depends_on: d.awaiting.iter().copied().collect(),
-        }));
+        let graph_context = sched.graph.to_graph_context();
 
         if let Some(plan) = executor.plan_issues(&new_issues, &graph_context).await {
             info!(nodes = plan.nodes.len(), total = plan.total_issues, "planner produced a plan");
-            apply_plan(&new_issues, &plan, &in_flight_numbers, &mut to_spawn, &sched.deferred)
-                .await;
+            sched.graph.merge_planner_output(&plan, &new_issues);
         } else {
-            warn!("planner failed, spawning all new issues immediately");
-            for issue in &new_issues {
-                to_spawn.push((issue.clone(), InFlightIssue::from_issue(issue)));
-            }
+            warn!("planner failed, adding all new issues as independent nodes");
+            add_independent_nodes(&mut sched.graph, &new_issues);
         }
+
+        save_graph(&sched.graph, executor).await;
     }
 
+    // Spawn ready issues
+    let to_spawn = collect_ready_issues(&mut sched.graph);
     if to_spawn.is_empty() {
         if new_issues.is_empty() {
             info!("no actionable issues, waiting");
@@ -396,66 +289,73 @@ async fn poll_and_spawn<R: CommandRunner + 'static>(
         return;
     }
 
-    spawn_issues(to_spawn, executor, sched, auto_merge).await;
+    save_graph(&sched.graph, executor).await;
+    spawn_issues(to_spawn, executor, sched, auto_merge);
 }
 
-/// Apply a DAG planner output: layer-1 issues spawn immediately, later layers are deferred.
-async fn apply_plan(
-    new_issues: &[PipelineIssue],
-    plan: &PlannerGraphOutput,
-    in_flight_numbers: &HashSet<u32>,
-    to_spawn: &mut Vec<(PipelineIssue, InFlightIssue)>,
-    deferred: &Arc<Mutex<HashMap<u32, DeferredIssue>>>,
-) {
-    let (spawn_map, defer_list) = split_graph_plan(plan, in_flight_numbers);
-    let issue_map: HashMap<u32, &PipelineIssue> =
-        new_issues.iter().map(|i| (i.number, i)).collect();
-
-    for issue in new_issues {
-        if let Some(metadata) = spawn_map.get(&issue.number) {
-            to_spawn.push((issue.clone(), metadata.clone()));
+/// Remove graph nodes that are still `Pending` but no longer in the provider's ready list.
+fn clean_stale_nodes(graph: &mut DependencyGraph, ready_numbers: &HashSet<u32>) {
+    let stale: Vec<u32> = graph
+        .all_issues()
+        .into_iter()
+        .filter(|num| {
+            !ready_numbers.contains(num)
+                && graph.node(*num).is_some_and(|n| n.state == NodeState::Pending)
+        })
+        .collect();
+    if !stale.is_empty() {
+        info!(count = stale.len(), "removing stale pending nodes");
+        for num in stale {
+            graph.remove_node(num);
         }
     }
+}
 
-    let mut def_guard = deferred.lock().await;
-    for (number, metadata, awaiting) in defer_list {
-        if let Some(issue) = issue_map.get(&number) {
-            info!(
-                issue = number,
-                awaiting_count = awaiting.len(),
-                "deferring issue (waiting for dependencies)"
-            );
-            def_guard.insert(number, DeferredIssue { issue: (*issue).clone(), metadata, awaiting });
+/// Add issues to the graph as independent nodes (no edges) when the planner fails.
+fn add_independent_nodes(graph: &mut DependencyGraph, issues: &[PipelineIssue]) {
+    for issue in issues {
+        if !graph.contains(issue.number) {
+            graph.add_node(standalone_node(issue));
         }
     }
+}
+
+/// Find ready issues in the graph, transition them to `InFlight`, return spawn data.
+fn collect_ready_issues(graph: &mut DependencyGraph) -> Vec<(u32, PipelineIssue, Complexity)> {
+    let ready = graph.ready_issues();
+    let mut to_spawn = Vec::new();
+
+    for num in ready {
+        let Some(node) = graph.node(num) else { continue };
+        let Some(issue) = node.issue.clone() else {
+            warn!(issue = num, "ready node has no PipelineIssue attached, skipping");
+            continue;
+        };
+        let complexity = node.complexity.parse::<Complexity>().unwrap_or(Complexity::Full);
+        graph.transition(num, NodeState::InFlight);
+        to_spawn.push((num, issue, complexity));
+    }
+
+    to_spawn
 }
 
 /// Spawn pipeline tasks for a set of issues.
-async fn spawn_issues<R: CommandRunner + 'static>(
-    to_spawn: Vec<(PipelineIssue, InFlightIssue)>,
+fn spawn_issues<R: CommandRunner + 'static>(
+    to_spawn: Vec<(u32, PipelineIssue, Complexity)>,
     executor: &Arc<PipelineExecutor<R>>,
     sched: &mut SchedulerState,
     auto_merge: bool,
 ) {
-    for (issue, metadata) in to_spawn {
+    for (number, issue, complexity) in to_spawn {
         let sem = Arc::clone(&sched.semaphore);
         let exec = Arc::clone(executor);
-        let in_fl = Arc::clone(&sched.in_flight);
-        let def = Arc::clone(&sched.deferred);
-        let number = issue.number;
-        let complexity = Some(metadata.complexity.clone());
-
-        in_fl.lock().await.insert(number, metadata);
 
         sched.tasks.spawn(async move {
             let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
-                Err(e) => {
-                    in_fl.lock().await.remove(&number);
-                    return (number, Err(anyhow::anyhow!("semaphore closed: {e}")));
-                }
+                Err(e) => return (number, Err(anyhow::anyhow!("semaphore closed: {e}"))),
             };
-            let result = exec.run_issue_pipeline(&issue, auto_merge, complexity).await;
+            let result = exec.run_issue_pipeline(&issue, auto_merge, Some(complexity)).await;
             let outcome = match result {
                 Ok(outcome) => {
                     if let Err(e) = exec.finalize_merge(&outcome, &issue).await {
@@ -465,63 +365,48 @@ async fn spawn_issues<R: CommandRunner + 'static>(
                 }
                 Err(e) => Err(e),
             };
-            in_fl.lock().await.remove(&number);
-            // Clear this issue from deferred awaiting sets so dependents can be promoted
-            {
-                let mut def_guard = def.lock().await;
-                for d in def_guard.values_mut() {
-                    d.awaiting.remove(&number);
-                }
-            }
             drop(permit);
             (number, outcome)
         });
     }
 }
 
-/// A deferred issue's number, planner metadata, and the set of issues it must wait for.
-type DeferredEntry = (u32, InFlightIssue, HashSet<u32>);
-
-/// Separate a DAG planner output into layer 1 (spawn immediately) and deferred layers.
-///
-/// `in_flight_numbers` are issue numbers currently running -- they are added to the
-/// awaiting set of deferred issues (nodes that depend on them must wait).
-fn split_graph_plan(
-    plan: &PlannerGraphOutput,
-    in_flight_numbers: &HashSet<u32>,
-) -> (HashMap<u32, InFlightIssue>, Vec<DeferredEntry>) {
-    let layers = topological_layers(plan);
-    let mut to_spawn = HashMap::new();
-    let mut to_defer = Vec::new();
-    let mut lower_layers: HashSet<u32> = in_flight_numbers.clone();
-
-    for (idx, layer) in layers.iter().enumerate() {
-        if idx == 0 {
-            for &node in layer {
-                to_spawn.insert(node.number, InFlightIssue::from(node));
-            }
-        } else {
-            for &node in layer {
-                to_defer.push((node.number, InFlightIssue::from(node), lower_layers.clone()));
-            }
-        }
-        for node in layer {
-            lower_layers.insert(node.number);
-        }
+/// Create a `GraphNode` for an issue with no planner metadata.
+fn standalone_node(issue: &PipelineIssue) -> GraphNode {
+    GraphNode {
+        issue_number: issue.number,
+        title: issue.title.clone(),
+        area: String::new(),
+        predicted_files: Vec::new(),
+        has_migration: false,
+        complexity: Complexity::Full.to_string(),
+        state: NodeState::Pending,
+        pr_number: None,
+        run_id: None,
+        issue: Some(issue.clone()),
     }
+}
 
-    (to_spawn, to_defer)
+/// Persist graph state to the database.
+async fn save_graph<R: CommandRunner>(
+    graph: &DependencyGraph,
+    executor: &Arc<PipelineExecutor<R>>,
+) {
+    let conn = executor.db.lock().await;
+    if let Err(e) = graph.save_to_db(&conn) {
+        warn!(error = %e, "failed to persist dependency graph");
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf};
+    use std::path::PathBuf;
 
     use tokio::sync::Mutex;
 
     use super::*;
     use crate::{
-        agents::{Complexity, PlannedNode, PlannerGraphOutput},
+        agents::PlannerGraphOutput,
         config::Config,
         github::GhClient,
         issues::{IssueOrigin, IssueProvider, github::GithubIssueProvider},
@@ -556,6 +441,16 @@ mod tests {
 
     fn make_github_provider(gh: &Arc<GhClient<MockCommandRunner>>) -> Arc<dyn IssueProvider> {
         Arc::new(GithubIssueProvider::new(Arc::clone(gh), "target_repo"))
+    }
+
+    fn make_issue(number: u32) -> PipelineIssue {
+        PipelineIssue {
+            number,
+            title: format!("Issue #{number}"),
+            body: String::new(),
+            source: IssueOrigin::Github,
+            target_repo: None,
+        }
     }
 
     #[tokio::test]
@@ -622,389 +517,141 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn in_flight_map_filters_duplicate_issues() {
-        let in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+    #[test]
+    fn handle_task_success_transitions_to_awaiting_merge() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let executor = {
+                let runner = Arc::new(mock_runner_for_batch());
+                let github =
+                    Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+                let issues = make_github_provider(&github);
+                let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
+                Arc::new(PipelineExecutor {
+                    runner,
+                    github,
+                    issues,
+                    db,
+                    config: Config::default(),
+                    cancel_token: CancellationToken::new(),
+                    repo_dir: PathBuf::from("/tmp"),
+                })
+            };
 
-        // Simulate issue 1 already in flight
-        in_flight.lock().await.insert(
-            1,
-            InFlightIssue {
-                number: 1,
-                title: "Already running".to_string(),
-                area: "auth".to_string(),
-                predicted_files: vec!["src/auth.rs".to_string()],
-                has_migration: false,
-                complexity: Complexity::Full,
-            },
-        );
+            let mut graph = DependencyGraph::new("test");
+            graph.add_node(standalone_node(&make_issue(1)));
+            graph.transition(1, NodeState::InFlight);
 
-        let issues = vec![
-            PipelineIssue {
-                number: 1,
-                title: "Already running".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 2,
-                title: "New issue".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 3,
-                title: "Another new".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-        ];
+            let outcome = PipelineOutcome {
+                run_id: "run-abc".to_string(),
+                pr_number: 42,
+                worktree_path: PathBuf::from("/tmp/wt"),
+                target_dir: PathBuf::from("/tmp"),
+            };
 
-        let guard = in_flight.lock().await;
-        let new_issues: Vec<_> =
-            issues.into_iter().filter(|i| !guard.contains_key(&i.number)).collect();
-        drop(guard);
+            handle_task_result(Ok((1, Ok(outcome))), &mut graph, &executor).await;
 
-        assert_eq!(new_issues.len(), 2);
-        assert_eq!(new_issues[0].number, 2);
-        assert_eq!(new_issues[1].number, 3);
+            assert_eq!(graph.node(1).unwrap().state, NodeState::AwaitingMerge);
+            assert_eq!(graph.node(1).unwrap().pr_number, Some(42));
+            assert_eq!(graph.node(1).unwrap().run_id.as_deref(), Some("run-abc"));
+        });
     }
 
     #[test]
-    fn handle_task_result_does_not_panic_on_success() {
-        use super::PipelineOutcome;
-        let outcome = PipelineOutcome {
-            run_id: "test-run".to_string(),
-            pr_number: 1,
-            worktree_path: PathBuf::from("/tmp/wt"),
-            target_dir: PathBuf::from("/tmp"),
-        };
-        handle_task_result(Ok((1, Ok(outcome))));
-    }
+    fn handle_task_failure_propagates_to_dependents() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let executor = {
+                let runner = Arc::new(mock_runner_for_batch());
+                let github =
+                    Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+                let issues = make_github_provider(&github);
+                let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
+                Arc::new(PipelineExecutor {
+                    runner,
+                    github,
+                    issues,
+                    db,
+                    config: Config::default(),
+                    cancel_token: CancellationToken::new(),
+                    repo_dir: PathBuf::from("/tmp"),
+                })
+            };
 
-    #[test]
-    fn handle_task_result_does_not_panic_on_error() {
-        handle_task_result(Ok((1, Err(anyhow::anyhow!("test error")))));
-    }
-
-    fn make_node(number: u32, title: &str, area: &str, complexity: Complexity) -> PlannedNode {
-        PlannedNode {
-            number,
-            title: title.to_string(),
-            area: area.to_string(),
-            predicted_files: vec![],
-            has_migration: false,
-            complexity,
-            depends_on: vec![],
-            reasoning: String::new(),
-        }
-    }
-
-    #[test]
-    fn split_graph_plan_separates_layers() {
-        let plan = PlannerGraphOutput {
-            nodes: vec![
-                make_node(1, "First", "cli", Complexity::Simple),
-                make_node(2, "Second", "config", Complexity::Full),
-                {
-                    let mut n = make_node(3, "Third", "db", Complexity::Full);
-                    n.depends_on = vec![1, 2];
-                    n.has_migration = true;
-                    n
-                },
-            ],
-            total_issues: 3,
-            parallel_capacity: 2,
-        };
-
-        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
-
-        assert_eq!(spawn_map.len(), 2);
-        assert_eq!(spawn_map.get(&1).unwrap().complexity, Complexity::Simple);
-        assert_eq!(spawn_map.get(&1).unwrap().area, "cli");
-        assert_eq!(spawn_map.get(&2).unwrap().complexity, Complexity::Full);
-
-        assert_eq!(defer_list.len(), 1);
-        let (num, meta, awaiting) = &defer_list[0];
-        assert_eq!(*num, 3);
-        assert_eq!(meta.area, "db");
-        assert!(awaiting.contains(&1));
-        assert!(awaiting.contains(&2));
-        assert_eq!(awaiting.len(), 2);
-    }
-
-    #[test]
-    fn split_graph_plan_empty() {
-        let plan = PlannerGraphOutput { nodes: vec![], total_issues: 0, parallel_capacity: 0 };
-        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
-        assert!(spawn_map.is_empty());
-        assert!(defer_list.is_empty());
-    }
-
-    #[test]
-    fn split_graph_plan_includes_in_flight_in_awaiting() {
-        let plan = PlannerGraphOutput {
-            nodes: vec![make_node(5, "New", "cli", Complexity::Simple), {
-                let mut n = make_node(6, "Depends", "db", Complexity::Full);
-                n.depends_on = vec![5];
-                n.has_migration = true;
-                n
-            }],
-            total_issues: 2,
-            parallel_capacity: 1,
-        };
-
-        let in_flight_nums: HashSet<u32> = [10, 11].into_iter().collect();
-        let (spawn_map, defer_list) = split_graph_plan(&plan, &in_flight_nums);
-
-        assert_eq!(spawn_map.len(), 1);
-        assert!(spawn_map.contains_key(&5));
-
-        assert_eq!(defer_list.len(), 1);
-        let (num, _, awaiting) = &defer_list[0];
-        assert_eq!(*num, 6);
-        assert!(awaiting.contains(&10));
-        assert!(awaiting.contains(&11));
-        assert!(awaiting.contains(&5));
-        assert_eq!(awaiting.len(), 3);
-    }
-
-    #[test]
-    fn split_graph_plan_three_layers_chain_awaiting() {
-        let plan = PlannerGraphOutput {
-            nodes: vec![
-                make_node(1, "A", "a", Complexity::Simple),
-                {
-                    let mut n = make_node(2, "B", "b", Complexity::Full);
-                    n.depends_on = vec![1];
-                    n
-                },
-                {
-                    let mut n = make_node(3, "C", "c", Complexity::Full);
-                    n.depends_on = vec![2];
-                    n
-                },
-            ],
-            total_issues: 3,
-            parallel_capacity: 1,
-        };
-
-        let (spawn_map, defer_list) = split_graph_plan(&plan, &HashSet::new());
-
-        assert_eq!(spawn_map.len(), 1);
-        assert!(spawn_map.contains_key(&1));
-
-        assert_eq!(defer_list.len(), 2);
-        let (_, _, awaiting_2) = &defer_list[0];
-        assert_eq!(*awaiting_2, HashSet::from([1]));
-        let (_, _, awaiting_3) = &defer_list[1];
-        assert_eq!(*awaiting_3, HashSet::from([1, 2]));
-    }
-
-    #[tokio::test]
-    async fn deferred_issues_filtered_from_new_issues() {
-        let in_flight: Arc<Mutex<HashMap<u32, InFlightIssue>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        in_flight.lock().await.insert(
-            1,
-            InFlightIssue {
-                number: 1,
-                title: "Running".to_string(),
-                area: "auth".to_string(),
-                predicted_files: vec![],
-                has_migration: false,
-                complexity: Complexity::Full,
-            },
-        );
-
-        deferred.lock().await.insert(
-            2,
-            DeferredIssue {
-                issue: PipelineIssue {
-                    number: 2,
-                    title: "Waiting".to_string(),
-                    body: String::new(),
-                    source: IssueOrigin::Github,
-                    target_repo: None,
-                },
-                metadata: InFlightIssue {
-                    number: 2,
-                    title: "Waiting".to_string(),
-                    area: "db".to_string(),
-                    predicted_files: vec![],
-                    has_migration: false,
-                    complexity: Complexity::Full,
-                },
-                awaiting: HashSet::from([1]),
-            },
-        );
-
-        let issues = vec![
-            PipelineIssue {
-                number: 1,
-                title: "Running".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 2,
-                title: "Waiting".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-            PipelineIssue {
-                number: 3,
-                title: "New".to_string(),
-                body: String::new(),
-                source: IssueOrigin::Github,
-                target_repo: None,
-            },
-        ];
-
-        let ifl = in_flight.lock().await;
-        let def = deferred.lock().await;
-        let new_issues: Vec<_> = issues
-            .into_iter()
-            .filter(|i| !ifl.contains_key(&i.number) && !def.contains_key(&i.number))
-            .collect();
-        drop(ifl);
-        drop(def);
-
-        assert_eq!(new_issues.len(), 1);
-        assert_eq!(new_issues[0].number, 3);
-    }
-
-    #[tokio::test]
-    async fn deferred_promotion_when_awaiting_clears() {
-        let deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        deferred.lock().await.insert(
-            3,
-            DeferredIssue {
-                issue: PipelineIssue {
-                    number: 3,
-                    title: "Deferred".to_string(),
-                    body: String::new(),
-                    source: IssueOrigin::Github,
-                    target_repo: None,
-                },
-                metadata: InFlightIssue {
-                    number: 3,
-                    title: "Deferred".to_string(),
-                    area: "db".to_string(),
-                    predicted_files: vec![],
-                    has_migration: true,
-                    complexity: Complexity::Full,
-                },
-                awaiting: HashSet::from([1, 2]),
-            },
-        );
-
-        // Issue 1 completes
-        {
-            let mut guard = deferred.lock().await;
-            for d in guard.values_mut() {
-                d.awaiting.remove(&1);
-            }
-        }
-
-        // Still waiting on issue 2
-        assert!(
-            deferred.lock().await.values().all(|d| !d.awaiting.is_empty()),
-            "should not be promotable yet"
-        );
-
-        // Issue 2 completes
-        {
-            let mut guard = deferred.lock().await;
-            for d in guard.values_mut() {
-                d.awaiting.remove(&2);
-            }
-        }
-
-        // Now issue 3 is promotable
-        {
-            let guard = deferred.lock().await;
-            let promotable: Vec<u32> =
-                guard.iter().filter(|(_, d)| d.awaiting.is_empty()).map(|(n, _)| *n).collect();
-            assert_eq!(promotable, vec![3]);
-            drop(guard);
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_deferred_issues_cleaned_up() {
-        let deferred: Arc<Mutex<HashMap<u32, DeferredIssue>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        {
-            let mut guard = deferred.lock().await;
-            guard.insert(
-                2,
-                DeferredIssue {
-                    issue: PipelineIssue {
-                        number: 2,
-                        title: "Two".to_string(),
-                        body: String::new(),
-                        source: IssueOrigin::Github,
-                        target_repo: None,
-                    },
-                    metadata: InFlightIssue {
-                        number: 2,
-                        title: "Two".to_string(),
+            let plan = PlannerGraphOutput {
+                nodes: vec![
+                    crate::agents::PlannedNode {
+                        number: 1,
+                        title: "Root".to_string(),
                         area: "a".to_string(),
                         predicted_files: vec![],
                         has_migration: false,
                         complexity: Complexity::Full,
+                        depends_on: vec![],
+                        reasoning: String::new(),
                     },
-                    awaiting: HashSet::from([1]),
-                },
-            );
-            guard.insert(
-                3,
-                DeferredIssue {
-                    issue: PipelineIssue {
-                        number: 3,
-                        title: "Three".to_string(),
-                        body: String::new(),
-                        source: IssueOrigin::Github,
-                        target_repo: None,
-                    },
-                    metadata: InFlightIssue {
-                        number: 3,
-                        title: "Three".to_string(),
+                    crate::agents::PlannedNode {
+                        number: 2,
+                        title: "Dep".to_string(),
                         area: "b".to_string(),
                         predicted_files: vec![],
                         has_migration: false,
                         complexity: Complexity::Full,
+                        depends_on: vec![1],
+                        reasoning: String::new(),
                     },
-                    awaiting: HashSet::from([1, 2]),
-                },
-            );
-        }
+                ],
+                total_issues: 2,
+                parallel_capacity: 1,
+            };
+            let issues = vec![make_issue(1), make_issue(2)];
+            let mut graph = DependencyGraph::from_planner_output("test", &plan, &issues);
+            graph.transition(1, NodeState::InFlight);
 
-        // Issue 2 no longer in ready list (closed externally)
-        let ready_numbers: HashSet<u32> = HashSet::from([3]);
-        clean_stale_deferred(&deferred, &ready_numbers).await;
+            handle_task_result(
+                Ok((1, Err(anyhow::anyhow!("pipeline failed")))),
+                &mut graph,
+                &executor,
+            )
+            .await;
 
-        let guard = deferred.lock().await;
-        assert!(!guard.contains_key(&2));
-        let d3 = guard.get(&3).unwrap();
-        let has_2 = d3.awaiting.contains(&2);
-        let has_1 = d3.awaiting.contains(&1);
-        drop(guard);
-        assert!(!has_2);
-        assert!(has_1);
+            assert_eq!(graph.node(1).unwrap().state, NodeState::Failed);
+            assert_eq!(graph.node(2).unwrap().state, NodeState::Failed);
+        });
+    }
+
+    #[test]
+    fn stale_node_removed_when_issue_disappears() {
+        let mut graph = DependencyGraph::new("test");
+        graph.add_node(standalone_node(&make_issue(1)));
+        graph.add_node(standalone_node(&make_issue(2)));
+        graph.add_node(standalone_node(&make_issue(3)));
+        graph.transition(2, NodeState::InFlight);
+
+        // Only issue 1 and 2 remain in provider; 3 disappeared
+        let ready_numbers: HashSet<u32> = HashSet::from([1, 2]);
+        clean_stale_nodes(&mut graph, &ready_numbers);
+
+        assert!(graph.contains(1)); // still Pending + in ready list
+        assert!(graph.contains(2)); // InFlight, not removed even if not in ready
+        assert!(!graph.contains(3)); // Pending + not in ready = removed
+    }
+
+    #[test]
+    fn collect_ready_issues_transitions_to_in_flight() {
+        let mut graph = DependencyGraph::new("test");
+        graph.add_node(standalone_node(&make_issue(1)));
+        graph.add_node(standalone_node(&make_issue(2)));
+
+        let spawnable = collect_ready_issues(&mut graph);
+        assert_eq!(spawnable.len(), 2);
+
+        // Both should now be InFlight
+        assert_eq!(graph.node(1).unwrap().state, NodeState::InFlight);
+        assert_eq!(graph.node(2).unwrap().state, NodeState::InFlight);
+
+        // No more ready issues
+        assert!(collect_ready_issues(&mut graph).is_empty());
     }
 
     #[tokio::test]
@@ -1054,5 +701,43 @@ mod tests {
         // plan_issues returns None for unparseable output
         let plan = executor.plan_issues(&issues, &[]).await;
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn graph_persisted_after_state_change() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(Mutex::new(crate::db::open_in_memory().unwrap()));
+            let runner = Arc::new(mock_runner_for_batch());
+            let github =
+                Arc::new(GhClient::new(mock_runner_for_batch(), std::path::Path::new("/tmp")));
+            let issues = make_github_provider(&github);
+            let executor = Arc::new(PipelineExecutor {
+                runner,
+                github,
+                issues,
+                db: Arc::clone(&db),
+                config: Config::default(),
+                cancel_token: CancellationToken::new(),
+                repo_dir: PathBuf::from("/tmp"),
+            });
+
+            let mut graph = DependencyGraph::new("persist-test");
+            graph.add_node(standalone_node(&make_issue(1)));
+            graph.transition(1, NodeState::InFlight);
+
+            let outcome = PipelineOutcome {
+                run_id: "run-1".to_string(),
+                pr_number: 10,
+                worktree_path: PathBuf::from("/tmp/wt"),
+                target_dir: PathBuf::from("/tmp"),
+            };
+            handle_task_result(Ok((1, Ok(outcome))), &mut graph, &executor).await;
+
+            // Load from DB and verify
+            let loaded = DependencyGraph::from_db(&*db.lock().await, "persist-test").unwrap();
+            assert_eq!(loaded.node(1).unwrap().state, NodeState::AwaitingMerge);
+            assert_eq!(loaded.node(1).unwrap().pr_number, Some(10));
+        });
     }
 }
