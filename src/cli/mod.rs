@@ -77,6 +77,9 @@ pub struct LookArgs {
     /// Filter to a specific agent
     #[arg(long)]
     pub agent: Option<String>,
+    /// Show agent progress and status from the database
+    #[arg(long)]
+    pub stream: bool,
 }
 
 #[derive(Args)]

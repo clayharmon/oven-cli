@@ -1,13 +1,22 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 use super::{GlobalOpts, LookArgs};
+use crate::db::{self, AgentRun, ReviewFinding, Run};
 
 pub async fn run(args: LookArgs, _global: &GlobalOpts) -> Result<()> {
     let project_dir = std::env::current_dir().context("getting current directory")?;
+
+    if args.stream {
+        return show_stream(&project_dir, args.agent.as_deref());
+    }
+
     let logs_root = project_dir.join(".oven").join("logs");
 
     let log_dir = if let Some(ref run_id) = args.run_id {
@@ -35,6 +44,110 @@ pub async fn run(args: LookArgs, _global: &GlobalOpts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Query the database and display agent progress for active (or recent) runs.
+fn show_stream(project_dir: &Path, agent_filter: Option<&str>) -> Result<()> {
+    let db_path = project_dir.join(".oven").join("oven.db");
+    if !db_path.exists() {
+        anyhow::bail!("no database found at {}", db_path.display());
+    }
+    let conn = db::open(&db_path)?;
+
+    let mut runs = db::runs::get_active_runs(&conn)?;
+    if runs.is_empty() {
+        // Fall back to the most recent run
+        if let Some(latest) = db::runs::get_latest_run(&conn)? {
+            runs.push(latest);
+        } else {
+            println!("no runs found");
+            return Ok(());
+        }
+    }
+
+    for run in &runs {
+        let agents = db::agent_runs::get_agent_runs_for_run(&conn, &run.id)?;
+        let findings = collect_run_findings(&conn, &agents)?;
+        print_run_status(run, &agents, &findings, agent_filter);
+    }
+
+    Ok(())
+}
+
+/// Collect unresolved findings across all reviewer agent runs for a pipeline run.
+fn collect_run_findings(
+    conn: &rusqlite::Connection,
+    agents: &[AgentRun],
+) -> Result<Vec<ReviewFinding>> {
+    let mut findings = Vec::new();
+    for ar in agents {
+        if ar.agent == "reviewer" {
+            let mut f = db::agent_runs::get_findings_for_agent_run(conn, ar.id)?;
+            findings.append(&mut f);
+        }
+    }
+    Ok(findings)
+}
+
+fn print_run_status(
+    run: &Run,
+    agents: &[AgentRun],
+    findings: &[ReviewFinding],
+    agent_filter: Option<&str>,
+) {
+    let branch = run.branch.as_deref().unwrap_or("--");
+    let pr = run.pr_number.map_or_else(|| "--".to_string(), |n| format!("#{n}"));
+    println!(
+        "issue #{:<6} {} {:>14}  ${:.2}  {}",
+        run.issue_number, pr, run.status, run.cost_usd, branch,
+    );
+
+    for ar in agents {
+        if let Some(filter) = agent_filter {
+            if ar.agent != filter {
+                continue;
+            }
+        }
+        let status_icon = match ar.status.as_str() {
+            "complete" => "done",
+            "running" => "...",
+            "failed" => "FAIL",
+            _ => &ar.status,
+        };
+        let summary =
+            ar.output_summary.as_deref().map(|s| truncate_line(s, 80)).unwrap_or_default();
+        println!(
+            "  {:<14} cycle {:<2} {:<6} {:>3} turns  ${:.2}  {}",
+            ar.agent, ar.cycle, status_icon, ar.turns, ar.cost_usd, summary,
+        );
+    }
+
+    let unresolved: Vec<_> = findings.iter().filter(|f| !f.resolved).collect();
+    if !unresolved.is_empty() {
+        let mut buf = String::new();
+        let _ = writeln!(buf, "  findings ({} unresolved):", unresolved.len());
+        for f in &unresolved {
+            let loc = match (&f.file_path, f.line_number) {
+                (Some(path), Some(line)) => format!(" {path}:{line}"),
+                (Some(path), None) => format!(" {path}"),
+                _ => String::new(),
+            };
+            let _ = writeln!(buf, "    {}/{}{} -- {}", f.severity, f.category, loc, f.message);
+        }
+        print!("{buf}");
+    }
+
+    println!();
+}
+
+/// Truncate a string to a single line of at most `max` chars.
+fn truncate_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("");
+    if line.len() <= max {
+        line.to_string()
+    } else {
+        format!("{}...", &line[..max.saturating_sub(3)])
+    }
 }
 
 /// Find the most recently modified log directory in `.oven/logs/`.
@@ -137,6 +250,7 @@ fn should_show_line(line: &str, agent_filter: Option<&str>, agent_tag: Option<&s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::RunStatus;
 
     #[test]
     fn filter_matches_agent_field() {
@@ -208,5 +322,130 @@ mod tests {
         // PID 99999999 almost certainly doesn't exist
         std::fs::write(oven_dir.join("oven.pid"), "99999999").unwrap();
         assert!(!is_oven_running(tmp.path()));
+    }
+
+    #[test]
+    fn truncate_line_short() {
+        assert_eq!(truncate_line("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_line_long() {
+        let long = "a".repeat(100);
+        let result = truncate_line(&long, 20);
+        assert_eq!(result.len(), 20);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_line_multiline_uses_first() {
+        assert_eq!(truncate_line("first\nsecond\nthird", 80), "first");
+    }
+
+    #[test]
+    fn print_run_status_formats_correctly() {
+        let run = Run {
+            id: "abc12345".to_string(),
+            issue_number: 42,
+            status: RunStatus::Reviewing,
+            pr_number: Some(10),
+            branch: Some("oven/issue-42".to_string()),
+            worktree_path: None,
+            cost_usd: 2.34,
+            auto_merge: false,
+            started_at: "2026-03-15T10:00:00".to_string(),
+            finished_at: None,
+            error_message: None,
+            complexity: "full".to_string(),
+            issue_source: "github".to_string(),
+        };
+        let agents = vec![
+            AgentRun {
+                id: 1,
+                run_id: "abc12345".to_string(),
+                agent: "implementer".to_string(),
+                cycle: 1,
+                status: "complete".to_string(),
+                cost_usd: 1.50,
+                turns: 12,
+                started_at: "2026-03-15T10:00:00".to_string(),
+                finished_at: Some("2026-03-15T10:05:00".to_string()),
+                output_summary: Some("Added auth flow".to_string()),
+                error_message: None,
+                raw_output: None,
+            },
+            AgentRun {
+                id: 2,
+                run_id: "abc12345".to_string(),
+                agent: "reviewer".to_string(),
+                cycle: 1,
+                status: "running".to_string(),
+                cost_usd: 0.84,
+                turns: 5,
+                started_at: "2026-03-15T10:05:00".to_string(),
+                finished_at: None,
+                output_summary: None,
+                error_message: None,
+                raw_output: None,
+            },
+        ];
+        // Smoke test: should not panic
+        print_run_status(&run, &agents, &[], None);
+    }
+
+    #[test]
+    fn print_run_status_with_agent_filter() {
+        let run = Run {
+            id: "abc12345".to_string(),
+            issue_number: 42,
+            status: RunStatus::Reviewing,
+            pr_number: Some(10),
+            branch: Some("oven/issue-42".to_string()),
+            worktree_path: None,
+            cost_usd: 2.34,
+            auto_merge: false,
+            started_at: "2026-03-15T10:00:00".to_string(),
+            finished_at: None,
+            error_message: None,
+            complexity: "full".to_string(),
+            issue_source: "github".to_string(),
+        };
+        let agents = vec![AgentRun {
+            id: 1,
+            run_id: "abc12345".to_string(),
+            agent: "implementer".to_string(),
+            cycle: 1,
+            status: "complete".to_string(),
+            cost_usd: 1.50,
+            turns: 12,
+            started_at: "2026-03-15T10:00:00".to_string(),
+            finished_at: Some("2026-03-15T10:05:00".to_string()),
+            output_summary: Some("ok".to_string()),
+            error_message: None,
+            raw_output: None,
+        }];
+        // Filter to reviewer (which doesn't exist) -- should not panic
+        print_run_status(&run, &agents, &[], Some("reviewer"));
+    }
+
+    #[test]
+    fn show_stream_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = show_stream(tmp.path(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no database"));
+    }
+
+    #[test]
+    fn show_stream_empty_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oven_dir = tmp.path().join(".oven");
+        std::fs::create_dir_all(&oven_dir).unwrap();
+        let db_path = oven_dir.join("oven.db");
+        // Open and immediately close to create the DB with migrations applied
+        drop(db::open(&db_path).unwrap());
+
+        // Should print "no runs found" and succeed
+        show_stream(tmp.path(), None).unwrap();
     }
 }
