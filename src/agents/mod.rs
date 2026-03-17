@@ -219,6 +219,7 @@ pub struct GraphContextNode {
     pub predicted_files: Vec<String>,
     pub has_migration: bool,
     pub depends_on: Vec<u32>,
+    pub target_repo: Option<String>,
 }
 
 /// Parse structured planner output from the planner's text response.

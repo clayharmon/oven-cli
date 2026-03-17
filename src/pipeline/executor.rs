@@ -125,11 +125,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             base_branch: base_branch.clone(),
         };
 
-        let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch).await;
+        let result = self
+            .run_steps(&run_id, &ctx, &worktree.path, auto_merge, &base_branch, &target_dir)
+            .await;
 
         if let Err(ref e) = result {
             // On failure, finalize immediately (no merge to wait for)
-            self.finalize_run(&run_id, issue, pr_number, &result).await?;
+            self.finalize_run(&run_id, issue, pr_number, &result, &target_dir).await?;
             if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
                 warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
             }
@@ -151,7 +153,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         outcome: &PipelineOutcome,
         issue: &PipelineIssue,
     ) -> Result<()> {
-        self.finalize_run(&outcome.run_id, issue, outcome.pr_number, &Ok(())).await?;
+        self.finalize_run(&outcome.run_id, issue, outcome.pr_number, &Ok(()), &outcome.target_dir)
+            .await?;
         if let Err(e) = git::remove_worktree(&outcome.target_dir, &outcome.worktree_path).await {
             warn!(
                 run_id = %outcome.run_id,
@@ -207,7 +210,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     ///
     /// Returns `(target_dir, is_multi_repo)`. When multi-repo is disabled or no target
     /// is specified, falls back to `self.repo_dir`.
-    fn resolve_target_dir(&self, target_repo: Option<&String>) -> Result<(PathBuf, bool)> {
+    pub(crate) fn resolve_target_dir(
+        &self,
+        target_repo: Option<&String>,
+    ) -> Result<(PathBuf, bool)> {
         if !self.config.multi_repo.enabled {
             return Ok((self.repo_dir.clone(), false));
         }
@@ -291,6 +297,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         issue: &PipelineIssue,
         pr_number: u32,
         result: &Result<()>,
+        target_dir: &std::path::Path,
     ) -> Result<()> {
         let (final_status, error_msg) = match result {
             Ok(()) => {
@@ -326,8 +333,13 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             }
             Err(e) => {
                 warn!(run_id = %run_id, error = %e, "pipeline failed");
-                github::safe_comment(&self.github, pr_number, &format!("Pipeline failed: {e:#}"))
-                    .await;
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format!("Pipeline failed: {e:#}"),
+                    target_dir,
+                )
+                .await;
                 let _ = self
                     .issues
                     .transition(
@@ -351,6 +363,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         worktree_path: &std::path::Path,
         auto_merge: bool,
         base_branch: &str,
+        target_dir: &std::path::Path,
     ) -> Result<()> {
         self.check_cancelled()?;
 
@@ -362,7 +375,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         git::push_branch(worktree_path, &ctx.branch).await?;
 
         // 2. Review-fix loop
-        let clean = self.run_review_fix_loop(run_id, ctx, worktree_path).await?;
+        let clean = self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
 
         if !clean {
             anyhow::bail!("unresolved findings after max review cycles");
@@ -379,6 +392,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     &format!(
                         "Pipeline stopped: {e}\n\nPlease rebase manually and re-run the pipeline."
                     ),
+                    target_dir,
                 )
                 .await;
             }
@@ -403,6 +417,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         run_id: &str,
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
+        target_dir: &std::path::Path,
     ) -> Result<bool> {
         for cycle in 1..=3 {
             self.check_cancelled()?;
@@ -422,6 +437,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                             &self.github,
                             pr_number,
                             &format!("Review cycle {cycle} returned unparseable output. Stopping pipeline."),
+                            target_dir,
                         )
                         .await;
                     }
@@ -443,7 +459,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             if cycle == 3 {
                 if let Some(pr_number) = ctx.pr_number {
                     let comment = format_unresolved_comment(&actionable);
-                    github::safe_comment(&self.github, pr_number, &comment).await;
+                    github::safe_comment(&self.github, pr_number, &comment, target_dir).await;
                 } else {
                     warn!(run_id = %run_id, "no PR number, cannot post unresolved findings");
                 }

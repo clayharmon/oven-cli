@@ -67,11 +67,16 @@ pub async fn transition_issue<R: CommandRunner>(
     client.swap_labels(issue_number, from, to).await
 }
 
-/// Post a comment, logging errors instead of propagating them.
+/// Post a comment on a PR in a specific repo, logging errors instead of propagating them.
 ///
 /// Comment failures should never crash the pipeline.
-pub async fn safe_comment<R: CommandRunner>(client: &GhClient<R>, pr_number: u32, body: &str) {
-    if let Err(e) = client.comment_on_pr(pr_number, body).await {
+pub async fn safe_comment<R: CommandRunner>(
+    client: &GhClient<R>,
+    pr_number: u32,
+    body: &str,
+    repo_dir: &Path,
+) {
+    if let Err(e) = client.comment_on_pr_in(pr_number, body, repo_dir).await {
         tracing::warn!("failed to post comment on PR #{pr_number}: {e}");
     }
 }
@@ -115,14 +120,26 @@ mod tests {
     #[tokio::test]
     async fn safe_comment_swallows_errors() {
         let client = GhClient::new(mock_gh_failure(), std::path::Path::new("/tmp"));
-        // Should not panic or return error
-        safe_comment(&client, 42, "test comment").await;
+        safe_comment(&client, 42, "test comment", std::path::Path::new("/tmp")).await;
     }
 
     #[tokio::test]
     async fn safe_comment_succeeds_on_success() {
         let client = GhClient::new(mock_gh_success(), std::path::Path::new("/tmp"));
-        safe_comment(&client, 42, "test comment").await;
+        safe_comment(&client, 42, "test comment", std::path::Path::new("/tmp")).await;
+    }
+
+    #[tokio::test]
+    async fn safe_comment_uses_given_repo_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, std::path::Path::new("/repos/target"));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+        let client = GhClient::new(mock, std::path::Path::new("/repos/god"));
+        safe_comment(&client, 42, "test", std::path::Path::new("/repos/target")).await;
     }
 
     #[test]

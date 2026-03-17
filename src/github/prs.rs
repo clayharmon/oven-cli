@@ -45,39 +45,53 @@ impl<R: CommandRunner> GhClient<R> {
         Ok(pr_number)
     }
 
-    /// Post a comment on a pull request.
+    /// Post a comment on a pull request (in the default repo).
     pub async fn comment_on_pr(&self, pr_number: u32, body: &str) -> Result<()> {
+        self.comment_on_pr_in(pr_number, body, &self.repo_dir).await
+    }
+
+    /// Post a comment on a pull request in a specific repo directory.
+    pub async fn comment_on_pr_in(
+        &self,
+        pr_number: u32,
+        body: &str,
+        repo_dir: &Path,
+    ) -> Result<()> {
         let output = self
             .runner
-            .run_gh(
-                &Self::s(&["pr", "comment", &pr_number.to_string(), "--body", body]),
-                &self.repo_dir,
-            )
+            .run_gh(&Self::s(&["pr", "comment", &pr_number.to_string(), "--body", body]), repo_dir)
             .await
             .context("commenting on PR")?;
         Self::check_output(&output, "comment on PR")?;
         Ok(())
     }
 
-    /// Mark a PR as ready for review (remove draft status).
+    /// Mark a PR as ready for review (in the default repo).
     pub async fn mark_pr_ready(&self, pr_number: u32) -> Result<()> {
+        self.mark_pr_ready_in(pr_number, &self.repo_dir).await
+    }
+
+    /// Mark a PR as ready for review in a specific repo directory.
+    pub async fn mark_pr_ready_in(&self, pr_number: u32, repo_dir: &Path) -> Result<()> {
         let output = self
             .runner
-            .run_gh(&Self::s(&["pr", "ready", &pr_number.to_string()]), &self.repo_dir)
+            .run_gh(&Self::s(&["pr", "ready", &pr_number.to_string()]), repo_dir)
             .await
             .context("marking PR ready")?;
         Self::check_output(&output, "mark PR ready")?;
         Ok(())
     }
 
-    /// Check the merge state of a pull request.
+    /// Check the merge state of a pull request (in the default repo).
     pub async fn get_pr_state(&self, pr_number: u32) -> Result<PrState> {
+        self.get_pr_state_in(pr_number, &self.repo_dir).await
+    }
+
+    /// Check the merge state of a pull request in a specific repo directory.
+    pub async fn get_pr_state_in(&self, pr_number: u32, repo_dir: &Path) -> Result<PrState> {
         let output = self
             .runner
-            .run_gh(
-                &Self::s(&["pr", "view", &pr_number.to_string(), "--json", "state"]),
-                &self.repo_dir,
-            )
+            .run_gh(&Self::s(&["pr", "view", &pr_number.to_string(), "--json", "state"]), repo_dir)
             .await
             .context("checking PR state")?;
         Self::check_output(&output, "check PR state")?;
@@ -97,13 +111,18 @@ impl<R: CommandRunner> GhClient<R> {
         })
     }
 
-    /// Merge a pull request.
+    /// Merge a pull request (in the default repo).
     pub async fn merge_pr(&self, pr_number: u32) -> Result<()> {
+        self.merge_pr_in(pr_number, &self.repo_dir).await
+    }
+
+    /// Merge a pull request in a specific repo directory.
+    pub async fn merge_pr_in(&self, pr_number: u32, repo_dir: &Path) -> Result<()> {
         let output = self
             .runner
             .run_gh(
                 &Self::s(&["pr", "merge", &pr_number.to_string(), "--squash", "--delete-branch"]),
-                &self.repo_dir,
+                repo_dir,
             )
             .await
             .context("merging PR")?;
@@ -270,5 +289,69 @@ mod tests {
         let result = client.merge_pr(42).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("merge conflict"));
+    }
+
+    #[tokio::test]
+    async fn comment_on_pr_in_uses_given_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, Path::new("/repos/backend"));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/repos/god"));
+        let result = client.comment_on_pr_in(42, "comment", Path::new("/repos/backend")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_pr_state_in_uses_given_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, Path::new("/repos/backend"));
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"state":"MERGED"}"#.to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/repos/god"));
+        let state = client.get_pr_state_in(42, Path::new("/repos/backend")).await.unwrap();
+        assert_eq!(state, crate::github::PrState::Merged);
+    }
+
+    #[tokio::test]
+    async fn mark_pr_ready_in_uses_given_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, Path::new("/repos/backend"));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/repos/god"));
+        let result = client.mark_pr_ready_in(42, Path::new("/repos/backend")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn merge_pr_in_uses_given_dir() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, dir| {
+            assert_eq!(dir, Path::new("/repos/backend"));
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/repos/god"));
+        let result = client.merge_pr_in(42, Path::new("/repos/backend")).await;
+        assert!(result.is_ok());
     }
 }

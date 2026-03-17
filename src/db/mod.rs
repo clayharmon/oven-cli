@@ -88,6 +88,7 @@ CREATE INDEX idx_graph_nodes_state ON graph_nodes(state);
 CREATE INDEX idx_graph_edges_session ON graph_edges(session_id);
 CREATE INDEX idx_graph_edges_to ON graph_edges(to_issue, session_id);",
         ),
+        M::up("ALTER TABLE graph_nodes ADD COLUMN target_repo TEXT;"),
     ])
 });
 

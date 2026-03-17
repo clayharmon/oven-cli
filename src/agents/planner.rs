@@ -96,6 +96,7 @@ mod tests {
                 predicted_files: vec!["src/auth.rs".to_string(), "src/middleware.rs".to_string()],
                 has_migration: false,
                 depends_on: vec![],
+                target_repo: None,
             },
             GraphContextNode {
                 number: 11,
@@ -105,6 +106,7 @@ mod tests {
                 predicted_files: vec!["src/db/mod.rs".to_string()],
                 has_migration: true,
                 depends_on: vec![10],
+                target_repo: Some("backend".to_string()),
             },
         ];
 
@@ -120,5 +122,11 @@ mod tests {
         assert!(prompt.contains("state: awaiting_merge"));
         assert!(prompt.contains("has_migration: true"));
         assert!(prompt.contains("#10"));
+        // target_repo only shown when set
+        assert!(prompt.contains("target_repo: backend"));
+        // node 10 has no target_repo, so it should not appear for that node
+        let auth_section =
+            prompt.split("#10: Refactor auth").nth(1).unwrap().split('#').next().unwrap();
+        assert!(!auth_section.contains("target_repo"));
     }
 }

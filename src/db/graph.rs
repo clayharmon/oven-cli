@@ -51,6 +51,7 @@ pub struct GraphNodeRow {
     pub predicted_files: Vec<String>,
     pub has_migration: bool,
     pub complexity: String,
+    pub target_repo: Option<String>,
 }
 
 pub fn insert_node(conn: &Connection, session_id: &str, node: &GraphNodeRow) -> Result<()> {
@@ -59,8 +60,8 @@ pub fn insert_node(conn: &Connection, session_id: &str, node: &GraphNodeRow) -> 
     conn.execute(
         "INSERT OR REPLACE INTO graph_nodes \
          (issue_number, session_id, state, pr_number, run_id, title, area, \
-          predicted_files, has_migration, complexity) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          predicted_files, has_migration, complexity, target_repo) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             node.issue_number,
             session_id,
@@ -72,6 +73,7 @@ pub fn insert_node(conn: &Connection, session_id: &str, node: &GraphNodeRow) -> 
             files_json,
             node.has_migration,
             node.complexity,
+            node.target_repo,
         ],
     )
     .context("inserting graph node")?;
@@ -139,7 +141,7 @@ pub fn get_nodes(conn: &Connection, session_id: &str) -> Result<Vec<GraphNodeRow
     let mut stmt = conn
         .prepare(
             "SELECT issue_number, session_id, state, pr_number, run_id, title, area, \
-             predicted_files, has_migration, complexity \
+             predicted_files, has_migration, complexity, target_repo \
              FROM graph_nodes WHERE session_id = ?1 ORDER BY issue_number",
         )
         .context("preparing get_nodes")?;
@@ -165,6 +167,7 @@ pub fn get_nodes(conn: &Connection, session_id: &str) -> Result<Vec<GraphNodeRow
                 predicted_files: serde_json::from_str(&files_json).unwrap_or_default(),
                 has_migration: row.get(8)?,
                 complexity: row.get(9)?,
+                target_repo: row.get(10)?,
             })
         })
         .context("querying graph nodes")?;
@@ -236,6 +239,7 @@ mod tests {
             predicted_files: vec!["src/main.rs".to_string()],
             has_migration: false,
             complexity: "full".to_string(),
+            target_repo: None,
         }
     }
 

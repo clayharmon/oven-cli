@@ -1597,6 +1597,7 @@ fn graph_planner_output_to_dag() {
             pr_number: None,
             run_id: None,
             issue: None,
+            target_repo: None,
         });
     }
     for node in &output.nodes {
@@ -1640,6 +1641,7 @@ fn graph_legacy_batch_format_converts_to_dag() {
             pr_number: None,
             run_id: None,
             issue: None,
+            target_repo: None,
         });
     }
     for node in &output.nodes {
@@ -1709,5 +1711,6 @@ fn make_graph_node(num: u32, title: &str) -> GraphNode {
         pr_number: None,
         run_id: None,
         issue: None,
+        target_repo: None,
     }
 }
