@@ -179,6 +179,46 @@ impl DependencyGraph {
         })
     }
 
+    /// Propagate failure from a node to all transitive dependents.
+    ///
+    /// Any `Pending` or `InFlight` node reachable via `reverse_edges` from the
+    /// failed node is transitioned to `Failed`. Returns the list of issue
+    /// numbers that were newly failed (excludes the original node).
+    pub fn propagate_failure(&mut self, issue: u32) -> Vec<u32> {
+        use std::collections::VecDeque;
+
+        let mut queue = VecDeque::new();
+        let mut newly_failed = Vec::new();
+
+        // Seed with direct dependents of the failed node
+        if let Some(dependents) = self.reverse_edges.get(&issue) {
+            queue.extend(dependents.iter().copied());
+        }
+
+        let mut visited = HashSet::new();
+        visited.insert(issue);
+
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let dominated = self
+                .nodes
+                .get(&current)
+                .is_some_and(|n| matches!(n.state, NodeState::Pending | NodeState::InFlight));
+            if !dominated {
+                continue;
+            }
+            self.transition(current, NodeState::Failed);
+            newly_failed.push(current);
+            if let Some(dependents) = self.reverse_edges.get(&current) {
+                queue.extend(dependents.iter().copied());
+            }
+        }
+
+        newly_failed
+    }
+
     /// Remove a node and all its edges (for stale issue cleanup).
     pub fn remove_node(&mut self, issue: u32) {
         self.nodes.remove(&issue);
@@ -713,6 +753,95 @@ mod tests {
         assert_eq!(g.dependencies(2), HashSet::from([1]));
         // Node 2 should be ready since node 1 is merged
         assert_eq!(g.ready_issues(), vec![2]);
+    }
+
+    #[test]
+    fn propagate_failure_linear_chain() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_edge(2, 1);
+        g.add_edge(3, 2);
+
+        g.transition(1, NodeState::Failed);
+        let mut failed = g.propagate_failure(1);
+        failed.sort_unstable();
+        assert_eq!(failed, vec![2, 3]);
+        assert_eq!(g.node(2).unwrap().state, NodeState::Failed);
+        assert_eq!(g.node(3).unwrap().state, NodeState::Failed);
+    }
+
+    #[test]
+    fn propagate_failure_diamond() {
+        // 1 is root, 2 and 3 depend on 1, 4 depends on 2 and 3
+        let mut g = DependencyGraph::new("test");
+        for i in 1..=4 {
+            g.add_node(make_node(i));
+        }
+        g.add_edge(2, 1);
+        g.add_edge(3, 1);
+        g.add_edge(4, 2);
+        g.add_edge(4, 3);
+
+        g.transition(1, NodeState::Failed);
+        let mut failed = g.propagate_failure(1);
+        failed.sort_unstable();
+        assert_eq!(failed, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn propagate_failure_partial_branch() {
+        // 1 and 2 are roots, 3 depends on 1, 4 depends on 2
+        let mut g = DependencyGraph::new("test");
+        for i in 1..=4 {
+            g.add_node(make_node(i));
+        }
+        g.add_edge(3, 1);
+        g.add_edge(4, 2);
+
+        g.transition(1, NodeState::Failed);
+        let failed = g.propagate_failure(1);
+        assert_eq!(failed, vec![3]);
+        // Node 4 should still be Pending (unrelated branch)
+        assert_eq!(g.node(4).unwrap().state, NodeState::Pending);
+    }
+
+    #[test]
+    fn propagate_failure_skips_merged() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_edge(2, 1);
+        g.add_edge(3, 2);
+        // Node 2 already merged before 1 fails (unusual but possible)
+        g.transition(2, NodeState::Merged);
+
+        g.transition(1, NodeState::Failed);
+        let failed = g.propagate_failure(1);
+        // Node 2 is merged, skip. Node 3 depends on 2 (merged), not directly on 1.
+        assert!(failed.is_empty());
+        assert_eq!(g.node(2).unwrap().state, NodeState::Merged);
+        assert_eq!(g.node(3).unwrap().state, NodeState::Pending);
+    }
+
+    #[test]
+    fn propagate_failure_returns_newly_failed() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_edge(2, 1);
+        g.add_edge(3, 1);
+
+        g.transition(1, NodeState::Failed);
+        let mut failed = g.propagate_failure(1);
+        failed.sort_unstable();
+        assert_eq!(failed, vec![2, 3]);
+        // Calling again should return empty (already failed)
+        let failed2 = g.propagate_failure(1);
+        assert!(failed2.is_empty());
     }
 
     #[test]
