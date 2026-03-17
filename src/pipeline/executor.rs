@@ -722,12 +722,17 @@ fn build_pr_body(impl_output: &str, ctx: &AgentContext) -> String {
 
 /// Extract the summary section from implementer output.
 ///
-/// Looks for the conventional `## Changes Made` heading that the implementer
-/// template requests. Falls back to the full output (truncated) if the heading
-/// isn't found.
+/// Looks for `## PR Template` (repo-specific PR template) or `## Changes Made`
+/// (default format) headings. Falls back to the full output (truncated) if
+/// neither heading is found.
 fn extract_impl_summary(output: &str) -> String {
-    if let Some(idx) = output.find("## Changes Made") {
+    // Prefer a filled-out PR template if the implementer found one
+    let idx = output.find("## PR Template").or_else(|| output.find("## Changes Made"));
+
+    if let Some(idx) = idx {
         let summary = output[idx..].trim();
+        // Strip the "## PR Template" heading itself so the body reads cleanly
+        let summary = summary.strip_prefix("## PR Template").map_or(summary, |s| s.trim_start());
         if summary.len() <= 4000 {
             return summary.to_string();
         }
@@ -850,6 +855,16 @@ mod tests {
         assert!(summary.starts_with("## Changes Made"));
         assert!(summary.contains("added bar"));
         assert!(summary.contains("## Tests Added"));
+    }
+
+    #[test]
+    fn extract_impl_summary_prefers_pr_template() {
+        let output = "Preamble\n\n## PR Template\n## Summary\n- Added auth flow\n\n## Testing\n- Unit tests pass\n";
+        let summary = extract_impl_summary(output);
+        // Should strip the "## PR Template" heading
+        assert!(!summary.contains("## PR Template"));
+        assert!(summary.starts_with("## Summary"));
+        assert!(summary.contains("Added auth flow"));
     }
 
     #[test]

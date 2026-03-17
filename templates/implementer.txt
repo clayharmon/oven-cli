@@ -86,7 +86,11 @@ Do NOT stop until all commands pass. Maximum 5 fix attempts per command -- if st
 
 ## Output
 
-When done, provide a summary:
+Check if a PR template exists at `.github/PULL_REQUEST_TEMPLATE.md` (or `.github/pull_request_template.md`).
+
+If a PR template exists, fill it out as your summary -- keep the template's headings and structure, and fill in each section with content from your implementation. Start your output with `## PR Template` so the pipeline can detect it.
+
+If no PR template exists, provide this default summary:
 
 ```
 ## Changes Made
