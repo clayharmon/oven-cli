@@ -805,11 +805,9 @@ fn extract_impl_summary(output: &str) -> String {
         }
         return truncate(summary, 4000);
     }
-    // Fallback: no structured summary found
-    if output.trim().is_empty() {
-        return String::from("*No implementation summary available.*");
-    }
-    truncate(output.trim(), 2000)
+    // Fallback: no structured summary found. Don't dump raw agent narration
+    // (stream-of-consciousness "Let me read..." text) into the PR body.
+    String::from("*No implementation summary available. See commit history for details.*")
 }
 
 fn new_run(run_id: &str, issue: &PipelineIssue, auto_merge: bool) -> Run {
@@ -938,13 +936,17 @@ mod tests {
     fn extract_impl_summary_fallback_on_no_heading() {
         let output = "just some raw agent output with no structure";
         let summary = extract_impl_summary(output);
-        assert!(summary.contains("just some raw agent output"));
+        assert_eq!(
+            summary,
+            "*No implementation summary available. See commit history for details.*"
+        );
     }
 
     #[test]
     fn extract_impl_summary_empty_output() {
-        assert_eq!(extract_impl_summary(""), "*No implementation summary available.*");
-        assert_eq!(extract_impl_summary("   "), "*No implementation summary available.*");
+        let placeholder = "*No implementation summary available. See commit history for details.*";
+        assert_eq!(extract_impl_summary(""), placeholder);
+        assert_eq!(extract_impl_summary("   "), placeholder);
     }
 
     #[test]
@@ -985,8 +987,9 @@ mod tests {
             issue_source: "local".to_string(),
             base_branch: "main".to_string(),
         };
-        let body = build_pr_body("raw output", &ctx);
+        let body = build_pr_body("## Changes Made\n- did local stuff", &ctx);
         assert!(body.contains("From local issue #7"));
+        assert!(body.contains("## Changes Made"));
     }
 
     #[test]
