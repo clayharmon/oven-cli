@@ -8,7 +8,12 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 pub fn init_stderr_only() {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("oven_cli=info")))
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .with_timer(fmt::time::time()),
+        )
         .init();
 }
 
@@ -28,7 +33,12 @@ pub fn init_with_file(log_dir: &Path, verbose: bool) -> WorkerGuard {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .with_timer(fmt::time::time()),
+        )
         .with(fmt::layer().json().with_writer(non_blocking))
         .init();
 
