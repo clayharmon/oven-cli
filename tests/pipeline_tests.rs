@@ -357,6 +357,7 @@ fn make_github_issue(number: u32, title: &str, body: &str) -> PipelineIssue {
         body: body.to_string(),
         source: IssueOrigin::Github,
         target_repo: None,
+        author: None,
     }
 }
 
@@ -961,6 +962,7 @@ async fn e2e_multi_repo_routes_to_target() {
         body: "Fix the auth bug in backend service.".to_string(),
         source: IssueOrigin::Github,
         target_repo: Some("backend".to_string()),
+        author: None,
     };
 
     let result = executor.run_issue(&issue, false).await;
@@ -1056,6 +1058,7 @@ async fn e2e_multi_repo_missing_repo_config_errors() {
         body: "This should fail.".to_string(),
         source: IssueOrigin::Github,
         target_repo: Some("nonexistent".to_string()),
+        author: None,
     };
 
     let result = executor.run_issue(&issue, false).await;
@@ -1079,6 +1082,7 @@ fn multi_repo_disabled_ignores_frontmatter() {
         body: "Body".to_string(),
         source: IssueOrigin::Github,
         target_repo: Some("some-repo".to_string()),
+        author: None,
     };
     assert!(issue.target_repo.is_some());
 }
@@ -1092,6 +1096,7 @@ fn make_local_issue(number: u32, title: &str, body: &str) -> PipelineIssue {
         body: body.to_string(),
         source: IssueOrigin::Local,
         target_repo: None,
+        author: None,
     }
 }
 
@@ -1221,6 +1226,7 @@ async fn e2e_local_issue_with_target_repo() {
         body: "Fix backend.".to_string(),
         source: IssueOrigin::Local,
         target_repo: Some("backend".to_string()),
+        author: None,
     };
 
     let result = executor.run_issue(&issue, false).await;
