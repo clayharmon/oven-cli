@@ -435,7 +435,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
-            let review_prompt = agents::reviewer::build_prompt(ctx)?;
+            let review_prompt = agents::reviewer::build_prompt(ctx, &[])?;
             let review_result = self
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;

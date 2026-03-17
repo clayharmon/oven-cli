@@ -67,6 +67,25 @@ Good: "Fix: add length validation on `name` param in `src/config/mod.rs:42`, max
 
 Every finding must reference a specific file, line, and concrete fix. Vague findings are useless to the fixer agent.
 
+{% if !prior_disputes.is_empty() %}
+## Prior Disputes
+
+The fixer previously examined these findings and determined they cannot be fixed.
+Only re-raise a disputed finding if the fixer's reasoning is **demonstrably wrong**
+(e.g., you can verify the API/prop actually exists by reading the installed dependency's
+type definitions or source code in node_modules/vendor).
+
+If the fixer verified via compilation (tsc, rustc, cargo check) that something does
+not exist, do NOT re-raise -- the compiler is authoritative over the issue spec.
+
+{% for d in prior_disputes -%}
+- **{{ d.severity }}** {{ d.category }}
+{%- if let Some(path) = &d.file_path %} at `{{ path }}
+{%- if let Some(line) = d.line_number %}:{{ line }}{% endif %}`
+{%- endif %}: {{ d.message }}
+  -> **Fixer's reason:** {{ d.dispute_reason.as_deref().unwrap_or("no reason given") }}
+{% endfor -%}
+{% endif %}
 ## Output Format (REQUIRED)
 
 Output your findings as JSON. This format is parsed by the pipeline -- do not deviate:
