@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::GhClient;
+use super::{GhClient, PrState};
 use crate::process::CommandRunner;
 
 impl<R: CommandRunner> GhClient<R> {
@@ -67,6 +67,29 @@ impl<R: CommandRunner> GhClient<R> {
             .context("marking PR ready")?;
         Self::check_output(&output, "mark PR ready")?;
         Ok(())
+    }
+
+    /// Check the merge state of a pull request.
+    pub async fn get_pr_state(&self, pr_number: u32) -> Result<PrState> {
+        let output = self
+            .runner
+            .run_gh(
+                &Self::s(&["pr", "view", &pr_number.to_string(), "--json", "state"]),
+                &self.repo_dir,
+            )
+            .await
+            .context("checking PR state")?;
+        Self::check_output(&output, "check PR state")?;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).context("parsing PR state JSON")?;
+        let state_str = parsed["state"].as_str().unwrap_or("UNKNOWN");
+
+        Ok(match state_str {
+            "MERGED" => PrState::Merged,
+            "CLOSED" => PrState::Closed,
+            _ => PrState::Open,
+        })
     }
 
     /// Merge a pull request.
@@ -151,6 +174,60 @@ mod tests {
         let client = GhClient::new(mock, Path::new("/tmp"));
         let result = client.merge_pr(42).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_pr_state_merged() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"state":"MERGED"}"#.to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let state = client.get_pr_state(42).await.unwrap();
+        assert_eq!(state, crate::github::PrState::Merged);
+    }
+
+    #[tokio::test]
+    async fn get_pr_state_open() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"state":"OPEN"}"#.to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let state = client.get_pr_state(42).await.unwrap();
+        assert_eq!(state, crate::github::PrState::Open);
+    }
+
+    #[tokio::test]
+    async fn get_pr_state_closed() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|_, _| {
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: r#"{"state":"CLOSED"}"#.to_string(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        let state = client.get_pr_state(42).await.unwrap();
+        assert_eq!(state, crate::github::PrState::Closed);
     }
 
     #[tokio::test]

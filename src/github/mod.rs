@@ -9,6 +9,14 @@ use serde::Deserialize;
 
 use crate::process::{CommandOutput, CommandRunner};
 
+/// The merge state of a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
 /// A GitHub issue.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
