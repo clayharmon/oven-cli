@@ -11,13 +11,16 @@ use std::{
 
 use anyhow::Result;
 use oven_cli::{
-    agents::{Complexity, Severity, parse_planner_output, parse_review_output},
+    agents::{
+        Complexity, Severity, parse_planner_graph_output, parse_planner_output, parse_review_output,
+    },
     config::{Config, MultiRepoConfig},
-    db::{self, RunStatus},
+    db::{self, RunStatus, graph as db_graph},
     github::GhClient,
     issues::{IssueOrigin, IssueProvider, PipelineIssue, github::GithubIssueProvider},
     pipeline::{
         executor::{PipelineExecutor, generate_run_id},
+        graph::{DependencyGraph, GraphNode},
         runner,
     },
     process::{AgentResult, CommandOutput, CommandRunner},
@@ -58,7 +61,7 @@ impl CommandRunner for TestRunner {
 
 #[test]
 fn full_happy_path_state_transitions() {
-    // Simulate: Pending -> Implementing -> Reviewing (clean) -> Merging -> Complete
+    // Simulate: Pending -> Implementing -> Reviewing (clean) -> AwaitingMerge -> Merging -> Complete
     let mut status = RunStatus::Pending;
 
     status = status.next(false, 0); // start
@@ -67,7 +70,10 @@ fn full_happy_path_state_transitions() {
     status = status.next(false, 0); // implement done -> review
     assert_eq!(status, RunStatus::Reviewing);
 
-    status = status.next(false, 1); // clean review -> merge
+    status = status.next(false, 1); // clean review -> awaiting merge
+    assert_eq!(status, RunStatus::AwaitingMerge);
+
+    status = status.next(false, 0); // merge confirmed -> merging
     assert_eq!(status, RunStatus::Merging);
 
     status = status.next(false, 0); // merge done -> complete
@@ -91,7 +97,10 @@ fn one_fix_cycle_path() {
     assert_eq!(status, RunStatus::Reviewing);
 
     // Second review is clean
-    status = status.next(false, 2); // -> Merging
+    status = status.next(false, 2); // -> AwaitingMerge
+    assert_eq!(status, RunStatus::AwaitingMerge);
+
+    status = status.next(false, 0); // -> Merging
     assert_eq!(status, RunStatus::Merging);
 
     status = status.next(false, 0); // -> Complete
@@ -1349,4 +1358,342 @@ async fn merger_runs_when_auto_merge_enabled() {
         agents.contains(&"merger"),
         "merger must run when auto_merge=true, but agents were: {agents:?}"
     );
+}
+
+// -- Dependency Graph integration tests --
+
+#[test]
+fn graph_linear_chain_ready_ordering() {
+    // A depends on B, B depends on C. Only C should be ready initially.
+    let mut g = DependencyGraph::new("test-linear");
+    g.add_node(make_graph_node(1, "C - base"));
+    g.add_node(make_graph_node(2, "B - middle"));
+    g.add_node(make_graph_node(3, "A - top"));
+    g.add_edge(2, 1); // B depends on C
+    g.add_edge(3, 2); // A depends on B
+
+    // Only C is ready
+    assert_eq!(g.ready_issues(), vec![1]);
+
+    // Merge C -> B is ready
+    g.transition(1, db_graph::NodeState::Merged);
+    assert_eq!(g.ready_issues(), vec![2]);
+
+    // Merge B -> A is ready
+    g.transition(2, db_graph::NodeState::Merged);
+    assert_eq!(g.ready_issues(), vec![3]);
+
+    // Merge A -> all done
+    g.transition(3, db_graph::NodeState::Merged);
+    assert!(g.ready_issues().is_empty());
+    assert!(g.all_terminal());
+}
+
+#[test]
+fn graph_diamond_dependency() {
+    // D depends on both B and C. B and C both depend on A.
+    //     A
+    //    / \
+    //   B   C
+    //    \ /
+    //     D
+    let mut g = DependencyGraph::new("test-diamond");
+    g.add_node(make_graph_node(1, "A - root"));
+    g.add_node(make_graph_node(2, "B - left"));
+    g.add_node(make_graph_node(3, "C - right"));
+    g.add_node(make_graph_node(4, "D - bottom"));
+    g.add_edge(2, 1);
+    g.add_edge(3, 1);
+    g.add_edge(4, 2);
+    g.add_edge(4, 3);
+
+    // Only A is ready
+    assert_eq!(g.ready_issues(), vec![1]);
+
+    // Merge A -> B and C are ready (parallel)
+    g.transition(1, db_graph::NodeState::Merged);
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![2, 3]);
+
+    // Merge B -> D still waiting on C
+    g.transition(2, db_graph::NodeState::Merged);
+    assert_eq!(g.ready_issues(), vec![3]);
+
+    // Merge C -> D is ready
+    g.transition(3, db_graph::NodeState::Merged);
+    assert_eq!(g.ready_issues(), vec![4]);
+}
+
+#[test]
+fn graph_failed_dependency_blocks_downstream() {
+    let mut g = DependencyGraph::new("test-blocked");
+    g.add_node(make_graph_node(1, "Base"));
+    g.add_node(make_graph_node(2, "Dependent"));
+    g.add_edge(2, 1);
+
+    g.transition(1, db_graph::NodeState::Failed);
+
+    // Dependent should never be ready
+    assert!(g.ready_issues().is_empty());
+    assert!(g.is_blocked(2));
+    assert!(!g.all_terminal()); // #2 is still pending
+}
+
+#[test]
+fn graph_cycle_detection_prevents_invalid_edges() {
+    let mut g = DependencyGraph::new("test-cycle");
+    g.add_node(make_graph_node(1, "A"));
+    g.add_node(make_graph_node(2, "B"));
+    g.add_node(make_graph_node(3, "C"));
+
+    assert!(g.add_edge(2, 1)); // B depends on A
+    assert!(g.add_edge(3, 2)); // C depends on B
+    assert!(!g.add_edge(1, 3)); // A depends on C would create cycle
+}
+
+#[test]
+fn graph_remove_node_unblocks_dependents() {
+    let mut g = DependencyGraph::new("test-remove");
+    g.add_node(make_graph_node(1, "Will be removed"));
+    g.add_node(make_graph_node(2, "Depends on 1"));
+    g.add_node(make_graph_node(3, "Independent"));
+    g.add_edge(2, 1);
+
+    // Only 1 and 3 are ready (2 is waiting on 1)
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![1, 3]);
+
+    // Remove node 1 (e.g., issue closed externally)
+    g.remove_node(1);
+
+    // Now 2 has no dependencies and becomes ready
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![2, 3]);
+}
+
+#[test]
+fn graph_db_roundtrip_preserves_state() {
+    let conn = db::open_in_memory().unwrap();
+    let mut g = DependencyGraph::new("roundtrip-test");
+    g.add_node(make_graph_node(1, "First"));
+    g.add_node(make_graph_node(2, "Second"));
+    g.add_node(make_graph_node(3, "Third"));
+    g.add_edge(2, 1);
+    g.add_edge(3, 1);
+    g.add_edge(3, 2);
+
+    g.transition(1, db_graph::NodeState::Merged);
+    g.set_pr_number(1, 100);
+    g.set_run_id(1, "run-abc");
+
+    g.transition(2, db_graph::NodeState::AwaitingMerge);
+    g.set_pr_number(2, 101);
+
+    g.save_to_db(&conn).unwrap();
+
+    // Load from DB and verify
+    let loaded = DependencyGraph::from_db(&conn, "roundtrip-test").unwrap();
+    assert_eq!(loaded.node_count(), 3);
+
+    let n1 = loaded.node(1).unwrap();
+    assert_eq!(n1.state, db_graph::NodeState::Merged);
+    assert_eq!(n1.pr_number, Some(100));
+    assert_eq!(n1.run_id.as_deref(), Some("run-abc"));
+
+    let n2 = loaded.node(2).unwrap();
+    assert_eq!(n2.state, db_graph::NodeState::AwaitingMerge);
+
+    assert_eq!(loaded.dependencies(3), std::collections::HashSet::from([1, 2]));
+
+    // Only issue 3 should be pending (but blocked until 2 merges)
+    assert!(loaded.ready_issues().is_empty());
+}
+
+#[test]
+fn graph_active_session_detection() {
+    let conn = db::open_in_memory().unwrap();
+
+    // No sessions yet
+    assert!(db_graph::get_active_session(&conn).unwrap().is_none());
+
+    // Add session with pending node
+    let mut g = DependencyGraph::new("active-sess");
+    g.add_node(make_graph_node(1, "Pending issue"));
+    g.save_to_db(&conn).unwrap();
+
+    assert_eq!(db_graph::get_active_session(&conn).unwrap().as_deref(), Some("active-sess"));
+
+    // Mark everything terminal
+    db_graph::update_node_state(&conn, "active-sess", 1, db_graph::NodeState::Merged).unwrap();
+    assert!(db_graph::get_active_session(&conn).unwrap().is_none());
+}
+
+#[test]
+fn graph_awaiting_merge_tracking() {
+    let mut g = DependencyGraph::new("test-await");
+    g.add_node(make_graph_node(1, "First"));
+    g.add_node(make_graph_node(2, "Second"));
+    g.add_node(make_graph_node(3, "Third"));
+
+    assert!(g.awaiting_merge().is_empty());
+
+    g.transition(1, db_graph::NodeState::AwaitingMerge);
+    g.transition(2, db_graph::NodeState::AwaitingMerge);
+
+    let mut awaiting = g.awaiting_merge();
+    awaiting.sort_unstable();
+    assert_eq!(awaiting, vec![1, 2]);
+
+    // Issue 3 is still pending and depends on nobody, so it's ready
+    assert_eq!(g.ready_issues(), vec![3]);
+}
+
+#[test]
+fn graph_planner_output_to_dag() {
+    let json = r#"{
+        "nodes": [
+            {"number": 10, "title": "Auth", "area": "auth", "depends_on": [], "complexity": "full"},
+            {"number": 11, "title": "OAuth", "area": "auth", "depends_on": [10], "complexity": "full"},
+            {"number": 12, "title": "Docs", "area": "docs", "depends_on": [], "complexity": "simple"}
+        ],
+        "total_issues": 3,
+        "parallel_capacity": 2
+    }"#;
+
+    let output = parse_planner_graph_output(json).unwrap();
+    assert_eq!(output.nodes.len(), 3);
+    assert!(output.nodes[0].depends_on.is_empty());
+    assert_eq!(output.nodes[1].depends_on, vec![10]);
+    assert!(output.nodes[2].depends_on.is_empty());
+
+    // Build a graph from this output
+    let mut g = DependencyGraph::new("planner-test");
+    for node in &output.nodes {
+        g.add_node(GraphNode {
+            issue_number: node.number,
+            title: node.title.clone(),
+            area: node.area.clone(),
+            predicted_files: node.predicted_files.clone(),
+            has_migration: node.has_migration,
+            complexity: node.complexity.to_string(),
+            state: db_graph::NodeState::Pending,
+            pr_number: None,
+            run_id: None,
+            issue: None,
+        });
+    }
+    for node in &output.nodes {
+        for dep in &node.depends_on {
+            assert!(g.add_edge(node.number, *dep));
+        }
+    }
+
+    // Auth and Docs are ready. OAuth waits for Auth.
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![10, 12]);
+}
+
+#[test]
+fn graph_legacy_batch_format_converts_to_dag() {
+    let json = r#"{
+        "batches": [
+            {"batch": 1, "issues": [{"number": 1, "complexity": "simple"}, {"number": 2}], "reasoning": "independent"},
+            {"batch": 2, "issues": [{"number": 3, "complexity": "full"}], "reasoning": "depends on 1"}
+        ],
+        "total_issues": 3,
+        "parallel_capacity": 2
+    }"#;
+
+    // Legacy format should still parse via graph parser
+    let output = parse_planner_graph_output(json).unwrap();
+    assert_eq!(output.nodes.len(), 3);
+
+    // Build graph
+    let mut g = DependencyGraph::new("legacy-test");
+    for node in &output.nodes {
+        g.add_node(GraphNode {
+            issue_number: node.number,
+            title: node.title.clone(),
+            area: node.area.clone(),
+            predicted_files: vec![],
+            has_migration: false,
+            complexity: node.complexity.to_string(),
+            state: db_graph::NodeState::Pending,
+            pr_number: None,
+            run_id: None,
+            issue: None,
+        });
+    }
+    for node in &output.nodes {
+        for dep in &node.depends_on {
+            g.add_edge(node.number, *dep);
+        }
+    }
+
+    // Issues 1 and 2 are ready (batch 1, no deps)
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![1, 2]);
+
+    // Issue 3 depends on both 1 and 2
+    assert_eq!(g.dependencies(3), std::collections::HashSet::from([1, 2]));
+}
+
+#[test]
+fn graph_display_shows_blocked_state() {
+    let mut g = DependencyGraph::new("display-test");
+    g.add_node(make_graph_node(1, "Base issue"));
+    g.add_node(make_graph_node(2, "Blocked issue"));
+    g.add_edge(2, 1);
+    g.transition(1, db_graph::NodeState::Failed);
+
+    let lines = g.display_lines();
+    let output = lines.join("\n");
+    assert!(output.contains("blocked"), "display should show 'blocked' for failed deps: {output}");
+    assert!(output.contains("depends on: #1"));
+}
+
+#[test]
+fn graph_independent_issues_all_parallel() {
+    let mut g = DependencyGraph::new("test-parallel");
+    for i in 1..=5 {
+        g.add_node(make_graph_node(i, &format!("Independent #{i}")));
+    }
+
+    // All 5 should be ready since there are no edges
+    let mut ready = g.ready_issues();
+    ready.sort_unstable();
+    assert_eq!(ready, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn graph_in_flight_nodes_not_ready() {
+    let mut g = DependencyGraph::new("test-inflight");
+    g.add_node(make_graph_node(1, "In flight"));
+    g.add_node(make_graph_node(2, "Waiting"));
+    g.add_edge(2, 1);
+
+    g.transition(1, db_graph::NodeState::InFlight);
+
+    // Neither should be ready: 1 is in flight, 2 is waiting on 1
+    assert!(g.ready_issues().is_empty());
+}
+
+fn make_graph_node(num: u32, title: &str) -> GraphNode {
+    GraphNode {
+        issue_number: num,
+        title: title.to_string(),
+        area: "test".to_string(),
+        predicted_files: vec![],
+        has_migration: false,
+        complexity: "full".to_string(),
+        state: db_graph::NodeState::Pending,
+        pr_number: None,
+        run_id: None,
+        issue: None,
+    }
 }
