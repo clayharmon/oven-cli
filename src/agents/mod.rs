@@ -297,7 +297,7 @@ pub fn parse_planner_graph_output(text: &str) -> Option<PlannerGraphOutput> {
 
 /// Convert a legacy batch-based planner output into a DAG output.
 ///
-/// Issues in batch N+1 depend on all issues in batch N (transitive chain).
+/// Issues in batch N+1 depend on all issues in batches 1..N (cumulative).
 fn batches_to_graph_output(legacy: &PlannerOutput) -> PlannerGraphOutput {
     let mut nodes = Vec::new();
     let mut prior_batch_issues: Vec<u32> = Vec::new();
