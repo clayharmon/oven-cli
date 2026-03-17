@@ -4,7 +4,7 @@ Oven (`oven-cli` on crates.io, `oven` binary) is a Rust CLI that orchestrates Cl
 
 ## What this project does
 
-Users label GitHub issues (or local issues) with `o-ready`. Oven's planner agent picks them up (oldest first), creates a draft PR, and runs a pipeline of Claude Code agents against that PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The planner continuously polls for new issues and can parallelize work mid-run.
+Users label GitHub issues (or local issues) with `o-ready`. Oven picks them up (oldest first), plans them as a dependency graph (DAG), creates draft PRs, and runs a pipeline of Claude Code agents against each PR: implement -> review -> fix (up to 2 cycles) -> merge. All agent comments go on the PR, not the issue. The runner continuously polls for new issues and can parallelize independent work mid-run.
 
 Issue source is configurable: GitHub (default) or local `.oven/issues/` files. PRs are always created on GitHub regardless of issue source. Local issue PRs say "From local issue #N" instead of "Resolves #N".
 
@@ -12,19 +12,19 @@ Issue source is configurable: GitHub (default) or local `.oven/issues/` files. P
 
 ### CLI commands (clap)
 - `oven prep` - scaffold project (recipe.toml, .claude/agents/, .oven/)
-- `oven on [IDS]` - start pipeline. IDS are comma-separated issue numbers. Flags: `-d` (detached), `-m` (auto-merge). Prints a run ID (8 hex chars from uuid).
+- `oven on [IDS]` - start pipeline. IDS are comma-separated issue numbers. Flags: `-d` (detached), `-m` (auto-merge), `--trust` (skip author validation). Prints a run ID (8 hex chars from uuid).
 - `oven off` - kill detached process (reads .oven/oven.pid)
 - `oven look [RUN_ID]` - view logs. Tails if active, dumps if done. `--agent <NAME>` filters.
-- `oven report [RUN_ID]` - cost, runtime, summary. `--all` for history, `--json` for machine output.
+- `oven report [RUN_ID]` - cost, runtime, summary. `--all` for history, `--json` for machine output, `--graph` for dependency graph.
 - `oven clean` - remove worktrees, logs, merged branches. `--only-logs`, `--only-trees`, `--only-branches`.
 - `oven ticket create|list|view|close|label|edit` - local issue management in .oven/issues/
 
 ### Agents (5, all invoked via `claude -p --output-format stream-json`)
-1. **Planner** - read-only. Decides batching/parallelization, creates draft PRs, continuously re-evaluates. Outputs JSON with `batches` array, each with `issues` and `complexity` (simple/full).
-2. **Implementer** - full access. Writes code + tests in a worktree.
-3. **Reviewer** - read-only. Code quality + security + simplify in one pass. Outputs structured findings (critical/warning/info).
-4. **Fixer** - full access. Addresses critical + warning findings from reviewer.
-5. **Merger** - gh CLI. Marks PR ready-for-review, merges if -m flag.
+1. **Planner** - read-only. Analyzes issues and produces a dependency graph (DAG) with `nodes` and `depends_on` edges. Each node has issue metadata, complexity, and predicted files. Also accepts `graph_context` about in-flight issues for incremental re-planning. Legacy `batches` format auto-converts to DAG.
+2. **Implementer** - full access. Writes code + tests in a worktree. PR is marked ready-for-review and description is filled after implementation.
+3. **Reviewer** - read-only. Code quality + security + simplify in one pass. Outputs structured findings (critical/warning/info). Receives prior disputed findings to avoid re-raising them.
+4. **Fixer** - full access. Addresses critical + warning findings from reviewer. Outputs structured JSON with resolved/disputed findings and a summary.
+5. **Merger** - gh CLI. Merges the PR and closes the linked issue.
 
 ### Agent tool scoping
 | Agent | Allowed tools |
@@ -36,7 +36,7 @@ Issue source is configurable: GitHub (default) or local `.oven/issues/` files. P
 | Merger | Bash |
 
 ### Review-fix loop
-Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. If still broken, stop and comment on PR with what's unresolved. No resume, no retry on format/parse errors. Clean and start over.
+Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. The fixer can dispute findings it believes are incorrect; disputed findings are passed back to the reviewer so they aren't re-raised. If still broken after max cycles, stop and comment on PR with unresolved findings. No resume, no retry on format/parse errors. Clean and start over.
 
 Hard caps: per-cycle cap (2 fix rounds), cost cap (configurable per-pipeline budget), turn cap (max turns per agent invocation).
 
@@ -60,8 +60,11 @@ Issues in a "god repo" can target other repos via `target_repo` frontmatter (in 
 ### Labels
 `o-ready`, `o-cooking`, `o-complete`, `o-failed`
 
+### Dependency graph
+The planner outputs a DAG of issues with explicit `depends_on` edges. The runner executes issues layer-by-layer: all issues with no unmet dependencies run in parallel, then the next layer, etc. Cycle detection prevents invalid graphs. The graph is persisted to SQLite (`graph_nodes` + `graph_edges` tables) so it survives restarts.
+
 ### Continuous polling
-Polling loop spawns tasks non-blocking with a shared `JoinSet` and `Semaphore` across poll cycles. In-flight `HashSet` prevents double-spawning. Labels (`o-ready` -> `o-cooking`) provide GitHub-level dedup.
+Polling loop spawns tasks non-blocking with a shared `JoinSet` and `Semaphore` across poll cycles. In-flight tracking prevents double-spawning. Labels (`o-ready` -> `o-cooking`) provide GitHub-level dedup. The runner polls PR merge state for `AwaitingMerge` nodes to detect external merges.
 
 ## Tech stack
 - Rust (edition 2024), tokio async runtime
@@ -93,6 +96,7 @@ src/
     mod.rs                  connection setup, migrations, pragmas
     runs.rs                 pipeline run CRUD
     agent_runs.rs           agent execution records
+    graph.rs                dependency graph persistence (nodes + edges)
   git/
     mod.rs                  worktree management, branch ops
   process/
@@ -115,11 +119,12 @@ src/
     fixer.rs
     merger.rs
   pipeline/
-    mod.rs                  orchestration, polling loop
+    mod.rs                  module declarations
+    graph.rs                in-memory dependency graph, cycle detection, layer scheduling
+    runner.rs               orchestration, polling loop, DAG-driven batch execution
     state.rs                status transitions, state machine
-    executor.rs             step execution, review-fix loop
+    executor.rs             step execution, review-fix loop, PR description building
   logging.rs                tracing setup (file + stderr)
-  errors.rs                 thiserror types
 templates/
   planner.txt               askama prompt templates per agent
   implementer.txt
@@ -156,7 +161,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
@@ -206,11 +210,12 @@ missing_panics_doc = "allow"
 
 ## Code conventions
 - No unnecessary abstractions. Three similar lines > premature helper function.
-- Error handling: anyhow for application errors, thiserror for library errors.
-- No unwrap() in non-test code. Use `.context("what you were doing")?` for rich errors.
+- Error handling: anyhow for all errors. Use `.context("what you were doing")?` for rich errors.
+- No unwrap() in non-test code.
 - `unsafe` is forbidden via lint. No exceptions.
 - All SQL queries use parameterized statements with `params![]`. Never interpolate.
 - Keep modules focused. One responsibility per file.
+- The bread emoji (🍞) is used in PR comments and footers as the project's brand mark. No other emojis in code or user-facing output.
 - Run `cargo clippy` and `cargo +nightly fmt` before committing.
 
 ## Testing
