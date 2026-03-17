@@ -52,7 +52,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
         run_batches_sequentially(executor, &issues, &legacy, max_parallel, auto_merge).await
     } else {
         warn!("planner failed, falling back to all-parallel execution");
-        run_all_parallel(executor, issues, max_parallel, auto_merge).await
+        run_issues_parallel(executor, issues, None, max_parallel, auto_merge).await
     }
 }
 
@@ -149,22 +149,30 @@ async fn run_batches_sequentially<R: CommandRunner + 'static>(
             "starting batch"
         );
 
-        run_single_batch(executor, batch_issues, &batch.issues, max_parallel, auto_merge).await?;
+        let complexity_map: HashMap<u32, crate::agents::Complexity> =
+            batch.issues.iter().map(|pi| (pi.number, pi.complexity.clone())).collect();
+        run_issues_parallel(
+            executor,
+            batch_issues,
+            Some(&complexity_map),
+            max_parallel,
+            auto_merge,
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-/// Run a single batch of issues in parallel with complexity from planner output.
-async fn run_single_batch<R: CommandRunner + 'static>(
+/// Run a set of issues in parallel behind a semaphore. If `complexity_map` is provided,
+/// each issue uses its planner-assigned complexity; otherwise complexity defaults to None.
+async fn run_issues_parallel<R: CommandRunner + 'static>(
     executor: &Arc<PipelineExecutor<R>>,
     issues: Vec<PipelineIssue>,
-    planned: &[crate::agents::PlannedIssue],
+    complexity_map: Option<&HashMap<u32, crate::agents::Complexity>>,
     max_parallel: usize,
     auto_merge: bool,
 ) -> Result<()> {
-    let complexity_map: HashMap<u32, crate::agents::Complexity> =
-        planned.iter().map(|pi| (pi.number, pi.complexity.clone())).collect();
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut tasks = JoinSet::new();
 
@@ -175,55 +183,10 @@ async fn run_single_batch<R: CommandRunner + 'static>(
             .await
             .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
         let exec = Arc::clone(executor);
-        let complexity = complexity_map.get(&issue.number).cloned();
+        let complexity = complexity_map.and_then(|m| m.get(&issue.number).cloned());
         tasks.spawn(async move {
             let number = issue.number;
             let result = exec.run_issue_with_complexity(&issue, auto_merge, complexity).await;
-            drop(permit);
-            (number, result)
-        });
-    }
-
-    let mut had_errors = false;
-    while let Some(join_result) = tasks.join_next().await {
-        match join_result {
-            Ok((number, Err(e))) => {
-                error!(issue = number, error = %e, "pipeline failed for issue");
-                had_errors = true;
-            }
-            Err(e) => {
-                error!(error = %e, "pipeline task panicked");
-                had_errors = true;
-            }
-            Ok((number, Ok(()))) => {
-                info!(issue = number, "pipeline completed successfully");
-            }
-        }
-    }
-
-    if had_errors { Err(anyhow::anyhow!("one or more pipelines failed in batch")) } else { Ok(()) }
-}
-
-/// Fallback: run all issues in parallel behind a semaphore (no planner guidance).
-async fn run_all_parallel<R: CommandRunner + 'static>(
-    executor: &Arc<PipelineExecutor<R>>,
-    issues: Vec<PipelineIssue>,
-    max_parallel: usize,
-    auto_merge: bool,
-) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(max_parallel));
-    let mut tasks = JoinSet::new();
-
-    for issue in issues {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
-        let exec = Arc::clone(executor);
-        tasks.spawn(async move {
-            let number = issue.number;
-            let result = exec.run_issue(&issue, auto_merge).await;
             drop(permit);
             (number, result)
         });
@@ -247,7 +210,7 @@ async fn run_all_parallel<R: CommandRunner + 'static>(
     }
 
     if had_errors {
-        anyhow::bail!("one or more pipelines failed");
+        anyhow::bail!("one or more pipelines failed in batch");
     }
     Ok(())
 }
