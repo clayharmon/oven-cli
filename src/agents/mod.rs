@@ -317,6 +317,38 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// Structured output from the fixer agent.
+#[derive(Debug, Deserialize, Default)]
+pub struct FixerOutput {
+    #[serde(default)]
+    pub addressed: Vec<FixerAction>,
+    #[serde(default)]
+    pub disputed: Vec<FixerDispute>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FixerAction {
+    /// 1-indexed finding number from the fixer prompt's `<review_findings>` list.
+    pub finding: u32,
+    pub action: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FixerDispute {
+    /// 1-indexed finding number from the fixer prompt's `<review_findings>` list.
+    pub finding: u32,
+    pub reason: String,
+}
+
+/// Parse structured fixer output from the fixer's text response.
+///
+/// Returns a default (empty) `FixerOutput` if parsing fails. We don't want
+/// a fixer parse failure to block the pipeline, and this preserves backward
+/// compatibility with fixers that produce prose-only output.
+pub fn parse_fixer_output(text: &str) -> FixerOutput {
+    extract_json::<FixerOutput>(text).unwrap_or_default()
+}
+
 /// Parse structured review output from the reviewer's text response.
 ///
 /// The JSON may be wrapped in markdown code fences. Returns an error if the
@@ -394,6 +426,11 @@ mod tests {
         fn parse_review_output_never_panics(text in "\\PC{0,500}") {
             // parse_review_output should never panic on any input (may return Err)
             let _ = parse_review_output(&text);
+        }
+
+        #[test]
+        fn parse_fixer_output_never_panics(text in "\\PC{0,500}") {
+            let _ = parse_fixer_output(&text);
         }
 
         #[test]
@@ -694,5 +731,56 @@ That's the plan."#;
         let mut deps = output.nodes[2].depends_on.clone();
         deps.sort_unstable();
         assert_eq!(deps, vec![1, 2]); // batch 3
+    }
+
+    // --- Fixer output parsing tests ---
+
+    #[test]
+    fn parse_fixer_output_valid_json() {
+        let json = r#"{"addressed":[{"finding":1,"action":"fixed"}],"disputed":[{"finding":2,"reason":"prop does not exist in v2"}]}"#;
+        let output = parse_fixer_output(json);
+        assert_eq!(output.addressed.len(), 1);
+        assert_eq!(output.addressed[0].finding, 1);
+        assert_eq!(output.disputed.len(), 1);
+        assert_eq!(output.disputed[0].finding, 2);
+        assert_eq!(output.disputed[0].reason, "prop does not exist in v2");
+    }
+
+    #[test]
+    fn parse_fixer_output_in_code_fences() {
+        let text = "I fixed everything.\n\n```json\n{\"addressed\":[{\"finding\":1,\"action\":\"added test\"}],\"disputed\":[]}\n```\n\nDone.";
+        let output = parse_fixer_output(text);
+        assert_eq!(output.addressed.len(), 1);
+        assert!(output.disputed.is_empty());
+    }
+
+    #[test]
+    fn parse_fixer_output_missing_disputed_defaults_empty() {
+        let json = r#"{"addressed":[{"finding":1,"action":"fixed"}]}"#;
+        let output = parse_fixer_output(json);
+        assert_eq!(output.addressed.len(), 1);
+        assert!(output.disputed.is_empty());
+    }
+
+    #[test]
+    fn parse_fixer_output_missing_addressed_defaults_empty() {
+        let json = r#"{"disputed":[{"finding":1,"reason":"API removed"}]}"#;
+        let output = parse_fixer_output(json);
+        assert!(output.addressed.is_empty());
+        assert_eq!(output.disputed.len(), 1);
+    }
+
+    #[test]
+    fn parse_fixer_output_garbage_returns_default() {
+        let output = parse_fixer_output("This is just prose, no JSON here.");
+        assert!(output.addressed.is_empty());
+        assert!(output.disputed.is_empty());
+    }
+
+    #[test]
+    fn parse_fixer_output_empty_returns_default() {
+        let output = parse_fixer_output("");
+        assert!(output.addressed.is_empty());
+        assert!(output.disputed.is_empty());
     }
 }
