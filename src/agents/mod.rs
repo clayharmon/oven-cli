@@ -352,14 +352,21 @@ pub fn parse_fixer_output(text: &str) -> FixerOutput {
 /// Parse structured review output from the reviewer's text response.
 ///
 /// The JSON may be wrapped in markdown code fences. If the output is
-/// unparseable, returns empty findings (treated as a clean review) rather
-/// than failing the pipeline. This matches the fixer's forgiving behavior.
+/// unparseable, returns a single warning finding instead of failing the
+/// pipeline. This ensures unreviewed code never silently passes through
+/// while still keeping the pipeline alive for human follow-up.
 pub fn parse_review_output(text: &str) -> ReviewOutput {
     extract_json(text).unwrap_or_else(|| {
-        tracing::warn!("reviewer returned unparseable output, treating as clean review");
+        tracing::warn!("reviewer returned unparseable output, emitting warning finding");
         ReviewOutput {
-            findings: vec![],
-            summary: "review output unparseable, treated as clean".to_string(),
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                category: "review-parse".to_string(),
+                file_path: None,
+                line_number: None,
+                message: "reviewer output was unparseable -- manual review recommended".to_string(),
+            }],
+            summary: "review output unparseable, manual review recommended".to_string(),
         }
     })
 }
@@ -430,10 +437,9 @@ mod tests {
 
         #[test]
         fn parse_review_output_never_panics(text in "\\PC{0,500}") {
-            // parse_review_output should never panic on any input
-            let output = parse_review_output(&text);
-            // Must always return a valid ReviewOutput (possibly empty)
-            let _ = output.findings;
+            // parse_review_output should never panic on any input and always
+            // returns a valid ReviewOutput (either parsed or warning fallback)
+            let _ = parse_review_output(&text);
         }
 
         #[test]
@@ -535,18 +541,21 @@ That's it."#;
     }
 
     #[test]
-    fn parse_review_output_no_json_returns_empty() {
+    fn parse_review_output_no_json_returns_warning() {
         let text = "The code looks great, no issues found.";
         let output = parse_review_output(text);
-        assert!(output.findings.is_empty());
+        assert_eq!(output.findings.len(), 1);
+        assert_eq!(output.findings[0].severity, Severity::Warning);
+        assert_eq!(output.findings[0].category, "review-parse");
         assert!(output.summary.contains("unparseable"));
     }
 
     #[test]
-    fn parse_review_output_malformed_json_returns_empty() {
+    fn parse_review_output_malformed_json_returns_warning() {
         let text = r#"{"findings": [{"broken json"#;
         let output = parse_review_output(text);
-        assert!(output.findings.is_empty());
+        assert_eq!(output.findings.len(), 1);
+        assert_eq!(output.findings[0].severity, Severity::Warning);
     }
 
     // --- Planner output parsing tests ---
