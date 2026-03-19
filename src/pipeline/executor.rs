@@ -14,10 +14,10 @@ use crate::{
     },
     config::Config,
     db::{self, AgentRun, ReviewFinding, Run, RunStatus},
-    git,
+    git::{self, RebaseOutcome},
     github::{self, GhClient},
     issues::{IssueOrigin, IssueProvider, PipelineIssue},
-    process::CommandRunner,
+    process::{self, CommandRunner},
 };
 
 /// The result of running an issue through the pipeline (before merge).
@@ -385,29 +385,43 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             }
         }
 
-        // 2. Review-fix loop
-        let clean = self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
-
-        if !clean {
-            anyhow::bail!("unresolved findings after max review cycles");
+        // 1c. Post implementation comment on PR
+        if let Some(pr_number) = ctx.pr_number {
+            let summary = extract_impl_summary(&impl_result.output);
+            github::safe_comment(
+                &self.github,
+                pr_number,
+                &format_impl_comment(&summary),
+                target_dir,
+            )
+            .await;
         }
+
+        // 2. Review-fix loop (posts its own step comments on the PR)
+        self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
 
         // 3. Rebase onto base branch to resolve any conflicts from parallel merges
         self.check_cancelled()?;
         info!(run_id = %run_id, base = %ctx.base_branch, "rebasing onto base branch");
-        if let Err(e) = git::rebase_on_base(worktree_path, &ctx.base_branch).await {
-            if let Some(pr_number) = ctx.pr_number {
-                github::safe_comment(
-                    &self.github,
-                    pr_number,
-                    &format_rebase_failure(&e),
-                    target_dir,
-                )
-                .await;
-            }
-            return Err(e);
+        let rebase_outcome =
+            self.rebase_with_agent_fallback(run_id, ctx, worktree_path, target_dir).await?;
+
+        if let Some(pr_number) = ctx.pr_number {
+            github::safe_comment(
+                &self.github,
+                pr_number,
+                &format_rebase_comment(&rebase_outcome),
+                target_dir,
+            )
+            .await;
         }
+
+        if let RebaseOutcome::Failed(ref msg) = rebase_outcome {
+            anyhow::bail!("rebase failed: {msg}");
+        }
+
         git::force_push_branch(worktree_path, &ctx.branch).await?;
+
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
             self.check_cancelled()?;
@@ -415,6 +429,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             self.update_status(run_id, RunStatus::Merging).await?;
             let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
             self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
+
+            if let Some(pr_number) = ctx.pr_number {
+                github::safe_comment(&self.github, pr_number, &format_merge_comment(), target_dir)
+                    .await;
+            }
+        } else if let Some(pr_number) = ctx.pr_number {
+            github::safe_comment(&self.github, pr_number, &format_ready_comment(), target_dir)
+                .await;
         }
 
         Ok(())
@@ -426,68 +448,59 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         ctx: &AgentContext,
         worktree_path: &std::path::Path,
         target_dir: &std::path::Path,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         for cycle in 1..=3 {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
 
-            // On cycles 2+, include prior resolved findings so the reviewer sees
-            // what was addressed (fixed) and what was disputed (rejected) by the fixer.
-            let (prior_addressed, prior_disputes) = if cycle > 1 {
-                let conn = self.db.lock().await;
-                let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
-                drop(conn);
-
-                let (mut addressed, disputed): (Vec<_>, Vec<_>) =
-                    all_resolved.into_iter().partition(|f| {
-                        f.dispute_reason.as_deref().is_some_and(|r| r.starts_with("ADDRESSED: "))
-                    });
-
-                // Strip the "ADDRESSED: " prefix so the template gets clean action text
-                for f in &mut addressed {
-                    if let Some(ref mut reason) = f.dispute_reason {
-                        if let Some(stripped) = reason.strip_prefix("ADDRESSED: ") {
-                            *reason = stripped.to_string();
-                        }
-                    }
-                }
-
-                (addressed, disputed)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (prior_addressed, prior_disputes) =
+                self.gather_prior_findings(run_id, cycle).await?;
 
             let review_prompt =
                 agents::reviewer::build_prompt(ctx, &prior_addressed, &prior_disputes)?;
-            let review_result = self
-                .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
-                .await?;
 
-            let review_output = match parse_review_output(&review_result.output) {
-                Ok(output) => output,
+            // Reviewer failure: skip review and continue (don't kill pipeline)
+            let review_result = match self
+                .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
+                .await
+            {
+                Ok(result) => result,
                 Err(e) => {
-                    warn!(run_id = %run_id, cycle, error = %e, "review output unparseable, treating as failed review");
+                    warn!(run_id = %run_id, cycle, error = %e, "reviewer agent failed, skipping review");
                     if let Some(pr_number) = ctx.pr_number {
                         github::safe_comment(
                             &self.github,
                             pr_number,
-                            &format_review_parse_failure(cycle),
+                            &format_review_skipped_comment(cycle, &e),
                             target_dir,
                         )
                         .await;
                     }
-                    anyhow::bail!("reviewer returned unparseable output in cycle {cycle}");
+                    return Ok(());
                 }
             };
+
+            let review_output = parse_review_output(&review_result.output);
             self.store_findings(run_id, &review_output.findings).await?;
 
             let actionable: Vec<_> =
                 review_output.findings.iter().filter(|f| f.severity != Severity::Info).collect();
 
+            // Post review comment on PR
+            if let Some(pr_number) = ctx.pr_number {
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format_review_comment(cycle, &actionable),
+                    target_dir,
+                )
+                .await;
+            }
+
             if actionable.is_empty() {
                 info!(run_id = %run_id, cycle, "review clean");
-                return Ok(true);
+                return Ok(());
             }
 
             info!(run_id = %run_id, cycle, findings = actionable.len(), "review found issues");
@@ -499,31 +512,105 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 } else {
                     warn!(run_id = %run_id, "no PR number, cannot post unresolved findings");
                 }
-                return Ok(false);
+                return Ok(());
             }
 
-            // Fix
-            self.check_cancelled()?;
-            self.update_status(run_id, RunStatus::Fixing).await?;
-
-            let unresolved = {
-                let conn = self.db.lock().await;
-                db::agent_runs::get_unresolved_findings(&conn, run_id)?
-            };
-
-            let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
-            let fix_result =
-                self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await?;
-
-            // Parse fixer output and mark disputed + addressed findings as resolved
-            let fixer_output = parse_fixer_output(&fix_result.output);
-            self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
-            self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
-
-            git::push_branch(worktree_path, &ctx.branch).await?;
+            self.run_fix_step(run_id, ctx, worktree_path, target_dir, cycle).await?;
         }
 
-        Ok(false)
+        Ok(())
+    }
+
+    /// Gather prior addressed and disputed findings for review cycles 2+.
+    async fn gather_prior_findings(
+        &self,
+        run_id: &str,
+        cycle: u32,
+    ) -> Result<(Vec<ReviewFinding>, Vec<ReviewFinding>)> {
+        if cycle <= 1 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let conn = self.db.lock().await;
+        let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
+        drop(conn);
+
+        let (mut addressed, disputed): (Vec<_>, Vec<_>) = all_resolved.into_iter().partition(|f| {
+            f.dispute_reason.as_deref().is_some_and(|r| r.starts_with("ADDRESSED: "))
+        });
+
+        // Strip the "ADDRESSED: " prefix so the template gets clean action text
+        for f in &mut addressed {
+            if let Some(ref mut reason) = f.dispute_reason {
+                if let Some(stripped) = reason.strip_prefix("ADDRESSED: ") {
+                    *reason = stripped.to_string();
+                }
+            }
+        }
+
+        Ok((addressed, disputed))
+    }
+
+    /// Run the fixer agent for a given cycle, process its output, and push.
+    ///
+    /// If the fixer agent fails, posts a comment on the PR and returns `Ok(())`
+    /// so the caller can continue to the next review cycle.
+    async fn run_fix_step(
+        &self,
+        run_id: &str,
+        ctx: &AgentContext,
+        worktree_path: &std::path::Path,
+        target_dir: &std::path::Path,
+        cycle: u32,
+    ) -> Result<()> {
+        self.check_cancelled()?;
+        self.update_status(run_id, RunStatus::Fixing).await?;
+
+        let unresolved = {
+            let conn = self.db.lock().await;
+            db::agent_runs::get_unresolved_findings(&conn, run_id)?
+        };
+
+        let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
+
+        // Fixer failure: skip fix (caller continues to next review cycle)
+        let fix_result =
+            match self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(run_id = %run_id, cycle, error = %e, "fixer agent failed, skipping fix");
+                    if let Some(pr_number) = ctx.pr_number {
+                        github::safe_comment(
+                            &self.github,
+                            pr_number,
+                            &format_fix_skipped_comment(cycle, &e),
+                            target_dir,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+            };
+
+        // Parse fixer output and mark disputed + addressed findings as resolved
+        let fixer_output = parse_fixer_output(&fix_result.output);
+        self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
+        self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
+
+        // Post fix comment on PR
+        if let Some(pr_number) = ctx.pr_number {
+            github::safe_comment(
+                &self.github,
+                pr_number,
+                &format_fix_comment(cycle, &fixer_output),
+                target_dir,
+            )
+            .await;
+        }
+
+        git::push_branch(worktree_path, &ctx.branch).await?;
+        Ok(())
     }
 
     /// Process fixer disputes by marking corresponding review findings as resolved.
@@ -619,6 +706,102 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
+    /// Rebase with fallbacks, including agent-assisted conflict resolution.
+    ///
+    /// Chain: rebase -> merge -> implementer agent resolves conflicts -> fail.
+    async fn rebase_with_agent_fallback(
+        &self,
+        run_id: &str,
+        ctx: &AgentContext,
+        worktree_path: &std::path::Path,
+        target_dir: &std::path::Path,
+    ) -> Result<RebaseOutcome> {
+        let outcome = git::rebase_with_fallbacks(worktree_path, &ctx.base_branch).await;
+
+        let conflicting_files = match outcome {
+            RebaseOutcome::MergeConflicts(ref files) => files.clone(),
+            other => return Ok(other),
+        };
+
+        info!(
+            run_id = %run_id,
+            files = ?conflicting_files,
+            "rebase and merge failed, attempting agent conflict resolution"
+        );
+
+        // Post a comment so the PR shows what's happening
+        if let Some(pr_number) = ctx.pr_number {
+            github::safe_comment(
+                &self.github,
+                pr_number,
+                &format!(
+                    "### Resolving merge conflicts\n\n\
+                     Rebase and merge both failed. Attempting agent-assisted resolution \
+                     for {} conflicting file{}: {}{COMMENT_FOOTER}",
+                    conflicting_files.len(),
+                    if conflicting_files.len() == 1 { "" } else { "s" },
+                    conflicting_files
+                        .iter()
+                        .map(|f| format!("`{f}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                target_dir,
+            )
+            .await;
+        }
+
+        let conflict_prompt = format!(
+            "You are resolving merge conflicts. The following files have unresolved \
+             merge conflicts (<<<<<<< / ======= / >>>>>>> markers):\n\n{}\n\n\
+             Open each file, find the conflict markers, and resolve them by choosing \
+             the correct code. Remove all conflict markers. Do NOT add new features \
+             or refactor -- just resolve the conflicts so the code compiles and tests pass.\n\n\
+             After resolving, run any test/lint commands if available:\n\
+             - Test: {}\n\
+             - Lint: {}",
+            conflicting_files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+            ctx.test_command.as_deref().unwrap_or("(none)"),
+            ctx.lint_command.as_deref().unwrap_or("(none)"),
+        );
+
+        match self
+            .run_agent(run_id, AgentRole::Implementer, &conflict_prompt, worktree_path, 1)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(run_id = %run_id, error = %e, "conflict resolution agent failed");
+                git::abort_merge(worktree_path).await;
+                return Ok(RebaseOutcome::Failed(format!(
+                    "agent conflict resolution failed: {e:#}"
+                )));
+            }
+        }
+
+        // Check if conflicts are actually resolved
+        let remaining = git::conflicting_files(worktree_path).await;
+        if remaining.is_empty() {
+            if let Err(e) = git::commit_merge(worktree_path, &conflicting_files).await {
+                git::abort_merge(worktree_path).await;
+                return Ok(RebaseOutcome::Failed(format!("failed to commit resolution: {e:#}")));
+            }
+            info!(run_id = %run_id, "agent resolved merge conflicts");
+            Ok(RebaseOutcome::AgentResolved)
+        } else {
+            warn!(
+                run_id = %run_id,
+                remaining = ?remaining,
+                "agent did not resolve all conflicts"
+            );
+            git::abort_merge(worktree_path).await;
+            Ok(RebaseOutcome::Failed(format!(
+                "agent could not resolve conflicts in: {}",
+                remaining.join(", ")
+            )))
+        }
+    }
+
     async fn run_agent(
         &self,
         run_id: &str,
@@ -638,7 +821,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             max_turns: Some(self.config.pipeline.turn_limit),
         };
 
-        let result = invoke_agent(self.runner.as_ref(), &invocation).await;
+        let result = process::run_with_retry(self.runner.as_ref(), &invocation).await;
 
         match &result {
             Ok(agent_result) => {
@@ -730,7 +913,7 @@ const COMMENT_FOOTER: &str =
 
 fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
     let mut comment = String::from(
-        "## Pipeline stopped: unresolved review findings\n\n\
+        "### Unresolved review findings\n\n\
          The review-fix loop ran 2 cycles but these findings remain unresolved.\n",
     );
 
@@ -745,7 +928,7 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
             Severity::Warning => "Warning",
             Severity::Info => unreachable!("loop only iterates Critical and Warning"),
         };
-        let _ = writeln!(comment, "\n### {heading}\n");
+        let _ = writeln!(comment, "\n#### {heading}\n");
         for f in group {
             let loc = match (&f.file_path, f.line_number) {
                 (Some(path), Some(line)) => format!(" in `{path}:{line}`"),
@@ -760,33 +943,121 @@ fn format_unresolved_comment(actionable: &[&agents::Finding]) -> String {
     comment
 }
 
+fn format_impl_comment(summary: &str) -> String {
+    format!("### Implementation complete\n\n{summary}{COMMENT_FOOTER}")
+}
+
+fn format_review_comment(cycle: u32, actionable: &[&agents::Finding]) -> String {
+    if actionable.is_empty() {
+        return format!(
+            "### Review complete (cycle {cycle})\n\n\
+             Clean review, no actionable findings.{COMMENT_FOOTER}"
+        );
+    }
+
+    let mut comment = format!(
+        "### Review complete (cycle {cycle})\n\n\
+         **{count} finding{s}:**\n",
+        count = actionable.len(),
+        s = if actionable.len() == 1 { "" } else { "s" },
+    );
+
+    for f in actionable {
+        let loc = match (&f.file_path, f.line_number) {
+            (Some(path), Some(line)) => format!(" in `{path}:{line}`"),
+            (Some(path), None) => format!(" in `{path}`"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            comment,
+            "- [{sev}] **{cat}**{loc} -- {msg}",
+            sev = f.severity,
+            cat = f.category,
+            msg = f.message,
+        );
+    }
+
+    comment.push_str(COMMENT_FOOTER);
+    comment
+}
+
+fn format_fix_comment(cycle: u32, fixer: &agents::FixerOutput) -> String {
+    let addressed = fixer.addressed.len();
+    let disputed = fixer.disputed.len();
+    format!(
+        "### Fix complete (cycle {cycle})\n\n\
+         **Addressed:** {addressed} finding{a_s}\n\
+         **Disputed:** {disputed} finding{d_s}{COMMENT_FOOTER}",
+        a_s = if addressed == 1 { "" } else { "s" },
+        d_s = if disputed == 1 { "" } else { "s" },
+    )
+}
+
+fn format_review_skipped_comment(cycle: u32, error: &anyhow::Error) -> String {
+    format!(
+        "### Review skipped (cycle {cycle})\n\n\
+         Reviewer agent encountered an error. Continuing without review.\n\n\
+         **Error:** {error:#}{COMMENT_FOOTER}"
+    )
+}
+
+fn format_fix_skipped_comment(cycle: u32, error: &anyhow::Error) -> String {
+    format!(
+        "### Fix skipped (cycle {cycle})\n\n\
+         Fixer agent encountered an error. Continuing to next cycle.\n\n\
+         **Error:** {error:#}{COMMENT_FOOTER}"
+    )
+}
+
+fn format_rebase_comment(outcome: &RebaseOutcome) -> String {
+    match outcome {
+        RebaseOutcome::Clean => {
+            format!("### Rebase\n\nRebased onto base branch cleanly.{COMMENT_FOOTER}")
+        }
+        RebaseOutcome::MergeFallback => {
+            format!(
+                "### Rebase\n\n\
+                 Rebase had conflicts, fell back to a merge commit.{COMMENT_FOOTER}"
+            )
+        }
+        RebaseOutcome::AgentResolved => {
+            format!(
+                "### Rebase\n\n\
+                 Rebase and merge both had conflicts. Agent resolved them.{COMMENT_FOOTER}"
+            )
+        }
+        RebaseOutcome::MergeConflicts(_) => {
+            format!(
+                "### Rebase\n\n\
+                 Merge conflicts present (awaiting resolution).{COMMENT_FOOTER}"
+            )
+        }
+        RebaseOutcome::Failed(msg) => {
+            format!(
+                "### Rebase failed\n\n\
+                 Could not rebase or merge onto the base branch.\n\n\
+                 **Error:** {msg}{COMMENT_FOOTER}"
+            )
+        }
+    }
+}
+
+fn format_ready_comment() -> String {
+    format!(
+        "### Ready for review\n\nPipeline complete. This PR is ready for manual review.{COMMENT_FOOTER}"
+    )
+}
+
+fn format_merge_comment() -> String {
+    format!("### Merged\n\nPipeline complete. PR has been merged.{COMMENT_FOOTER}")
+}
+
 fn format_pipeline_failure(e: &anyhow::Error) -> String {
     format!(
         "## Pipeline failed\n\n\
          **Error:** {e:#}\n\n\
          The pipeline hit an unrecoverable error. Check the run logs for detail, \
          or re-run the pipeline.\
-         {COMMENT_FOOTER}"
-    )
-}
-
-fn format_rebase_failure(e: &anyhow::Error) -> String {
-    format!(
-        "## Pipeline stopped: rebase conflict\n\n\
-         Could not rebase onto the base branch. This usually happens when another \
-         PR merged while this pipeline was running.\n\n\
-         **Error:** {e}\n\n\
-         Rebase manually and re-run the pipeline.\
-         {COMMENT_FOOTER}"
-    )
-}
-
-fn format_review_parse_failure(cycle: u32) -> String {
-    format!(
-        "## Pipeline stopped: review output error\n\n\
-         The reviewer agent returned output that could not be parsed as structured \
-         findings (cycle {cycle}). This usually means the reviewer produced malformed JSON.\n\n\
-         Re-run the pipeline to try again.\
          {COMMENT_FOOTER}"
     )
 }
@@ -1145,8 +1416,8 @@ mod tests {
         ];
         let refs: Vec<_> = findings.iter().collect();
         let comment = format_unresolved_comment(&refs);
-        assert!(comment.contains("### Critical"));
-        assert!(comment.contains("### Warning"));
+        assert!(comment.contains("#### Critical"));
+        assert!(comment.contains("#### Warning"));
         assert!(comment.contains("**bug** in `src/main.rs:42` -- null pointer"));
         assert!(comment.contains("**style** -- missing docs"));
         assert!(comment.contains("Automated by [oven]"));
@@ -1163,8 +1434,8 @@ mod tests {
         }];
         let refs: Vec<_> = findings.iter().collect();
         let comment = format_unresolved_comment(&refs);
-        assert!(!comment.contains("### Critical"));
-        assert!(comment.contains("### Warning"));
+        assert!(!comment.contains("#### Critical"));
+        assert!(comment.contains("#### Warning"));
     }
 
     #[test]
@@ -1177,19 +1448,82 @@ mod tests {
     }
 
     #[test]
-    fn format_rebase_failure_includes_error() {
-        let err = anyhow::anyhow!("merge conflict in src/config/mod.rs");
-        let comment = format_rebase_failure(&err);
-        assert!(comment.contains("## Pipeline stopped: rebase conflict"));
-        assert!(comment.contains("merge conflict"));
-        assert!(comment.contains("Rebase manually"));
+    fn format_impl_comment_includes_summary() {
+        let comment = format_impl_comment("Added login endpoint with tests");
+        assert!(comment.contains("### Implementation complete"));
+        assert!(comment.contains("Added login endpoint with tests"));
+        assert!(comment.contains("Automated by [oven]"));
     }
 
     #[test]
-    fn format_review_parse_failure_includes_cycle() {
-        let comment = format_review_parse_failure(2);
-        assert!(comment.contains("## Pipeline stopped: review output error"));
-        assert!(comment.contains("cycle 2"));
-        assert!(comment.contains("Re-run the pipeline"));
+    fn format_review_comment_clean() {
+        let comment = format_review_comment(1, &[]);
+        assert!(comment.contains("### Review complete (cycle 1)"));
+        assert!(comment.contains("Clean review"));
+    }
+
+    #[test]
+    fn format_review_comment_with_findings() {
+        let findings = [agents::Finding {
+            severity: Severity::Critical,
+            category: "bug".to_string(),
+            file_path: Some("src/main.rs".to_string()),
+            line_number: Some(42),
+            message: "null pointer".to_string(),
+        }];
+        let refs: Vec<_> = findings.iter().collect();
+        let comment = format_review_comment(1, &refs);
+        assert!(comment.contains("### Review complete (cycle 1)"));
+        assert!(comment.contains("1 finding"));
+        assert!(comment.contains("[critical]"));
+        assert!(comment.contains("`src/main.rs:42`"));
+    }
+
+    #[test]
+    fn format_fix_comment_counts() {
+        let fixer = agents::FixerOutput {
+            addressed: vec![
+                agents::FixerAction { finding: 1, action: "fixed it".to_string() },
+                agents::FixerAction { finding: 2, action: "also fixed".to_string() },
+            ],
+            disputed: vec![agents::FixerDispute { finding: 3, reason: "not a bug".to_string() }],
+        };
+        let comment = format_fix_comment(1, &fixer);
+        assert!(comment.contains("### Fix complete (cycle 1)"));
+        assert!(comment.contains("Addressed:** 2 findings"));
+        assert!(comment.contains("Disputed:** 1 finding\n"));
+    }
+
+    #[test]
+    fn format_rebase_comment_variants() {
+        let clean = format_rebase_comment(&RebaseOutcome::Clean);
+        assert!(clean.contains("Rebased onto base branch cleanly"));
+
+        let merge = format_rebase_comment(&RebaseOutcome::MergeFallback);
+        assert!(merge.contains("fell back to a merge commit"));
+
+        let agent = format_rebase_comment(&RebaseOutcome::AgentResolved);
+        assert!(agent.contains("Agent resolved them"));
+
+        let conflicts =
+            format_rebase_comment(&RebaseOutcome::MergeConflicts(vec!["foo.rs".into()]));
+        assert!(conflicts.contains("awaiting resolution"));
+
+        let failed = format_rebase_comment(&RebaseOutcome::Failed("conflict in foo.rs".into()));
+        assert!(failed.contains("Rebase failed"));
+        assert!(failed.contains("conflict in foo.rs"));
+    }
+
+    #[test]
+    fn format_ready_comment_content() {
+        let comment = format_ready_comment();
+        assert!(comment.contains("### Ready for review"));
+        assert!(comment.contains("manual review"));
+    }
+
+    #[test]
+    fn format_merge_comment_content() {
+        let comment = format_merge_comment();
+        assert!(comment.contains("### Merged"));
     }
 }

@@ -120,10 +120,10 @@ fn max_fix_cycles_path() {
     status = status.next(false, 1); // -> Reviewing
     assert_eq!(status, RunStatus::Reviewing);
 
-    // Cycle 2: still findings -> Failed (max exceeded)
-    status = status.next(true, 2); // -> Failed
-    assert_eq!(status, RunStatus::Failed);
-    assert!(status.is_terminal());
+    // Cycle 2: still findings -> AwaitingMerge (unresolved findings posted on PR)
+    status = status.next(true, 2); // -> AwaitingMerge
+    assert_eq!(status, RunStatus::AwaitingMerge);
+    assert!(!status.is_terminal());
 }
 
 // -- DB integration tests --
@@ -201,7 +201,7 @@ fn review_output_with_mixed_severities() {
         "summary": "3 findings"
     }"#;
 
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert_eq!(output.findings.len(), 3);
 
     let critical: Vec<_> =
@@ -216,7 +216,7 @@ fn review_output_with_mixed_severities() {
 #[test]
 fn review_output_empty_findings_array() {
     let json = r#"{"findings": [], "summary": "all clean"}"#;
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert!(output.findings.is_empty());
     assert_eq!(output.summary, "all clean");
 }
@@ -228,7 +228,7 @@ fn review_output_with_extra_fields_is_forward_compatible() {
         "summary": "ok",
         "metadata": {"version": "2.0"}
     }"#;
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert_eq!(output.findings.len(), 1);
 }
 
