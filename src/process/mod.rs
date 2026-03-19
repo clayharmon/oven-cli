@@ -18,9 +18,15 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "timeout",
     "rate limit",
     "rate_limit",
-    "502",
-    "503",
-    "429",
+    "http 502",
+    "http 503",
+    "http 429",
+    " 502 ",
+    " 503 ",
+    " 429 ",
+    "(502)",
+    "(503)",
+    "(429)",
     "overloaded",
     "econnrefused",
 ];
@@ -209,6 +215,9 @@ mod tests {
         assert!(!is_transient_error("permission denied"));
         assert!(!is_transient_error("invalid JSON in response"));
         assert!(!is_transient_error("authentication failed"));
+        // Bare numbers should not match (e.g. port numbers, IDs)
+        assert!(!is_transient_error("listening on port 5029"));
+        assert!(!is_transient_error("record id 4291 not found"));
         assert!(!is_transient_error(""));
     }
 }
