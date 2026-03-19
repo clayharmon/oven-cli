@@ -120,10 +120,10 @@ fn max_fix_cycles_path() {
     status = status.next(false, 1); // -> Reviewing
     assert_eq!(status, RunStatus::Reviewing);
 
-    // Cycle 2: still findings -> Failed (max exceeded)
-    status = status.next(true, 2); // -> Failed
-    assert_eq!(status, RunStatus::Failed);
-    assert!(status.is_terminal());
+    // Cycle 2: still findings -> AwaitingMerge (unresolved findings posted on PR)
+    status = status.next(true, 2); // -> AwaitingMerge
+    assert_eq!(status, RunStatus::AwaitingMerge);
+    assert!(!status.is_terminal());
 }
 
 // -- DB integration tests --

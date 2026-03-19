@@ -5,7 +5,8 @@ impl RunStatus {
     ///
     /// - After implementing, always review.
     /// - If reviewer finds issues and we haven't hit max cycles, fix.
-    /// - If reviewer finds issues at max cycles, fail.
+    /// - If reviewer finds issues at max cycles, move to awaiting merge (unresolved
+    ///   findings are posted on the PR for human review, not treated as failure).
     /// - Clean review goes to awaiting merge (waiting for PR to be merged).
     /// - After fixing, go back to reviewing.
     /// - After awaiting merge, proceed to merging.
@@ -16,7 +17,6 @@ impl RunStatus {
             Self::Pending => Self::Implementing,
             Self::Implementing | Self::Fixing => Self::Reviewing,
             Self::Reviewing if has_findings && cycle < 2 => Self::Fixing,
-            Self::Reviewing if has_findings => Self::Failed,
             Self::Reviewing => Self::AwaitingMerge,
             Self::AwaitingMerge => Self::Merging,
             Self::Merging => Self::Complete,
@@ -61,8 +61,8 @@ mod tests {
         }
 
         #[test]
-        fn reviewing_with_findings_past_max_always_fails(cycle in 2..50u32) {
-            assert_eq!(RunStatus::Reviewing.next(true, cycle), RunStatus::Failed);
+        fn reviewing_with_findings_past_max_awaits_merge(cycle in 2..50u32) {
+            assert_eq!(RunStatus::Reviewing.next(true, cycle), RunStatus::AwaitingMerge);
         }
 
         #[test]
@@ -97,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn findings_at_max_cycles_to_failed() {
-        assert_eq!(RunStatus::Reviewing.next(true, 2), RunStatus::Failed);
+    fn findings_at_max_cycles_to_awaiting_merge() {
+        assert_eq!(RunStatus::Reviewing.next(true, 2), RunStatus::AwaitingMerge);
     }
 
     #[test]
