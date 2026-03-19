@@ -4,8 +4,26 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{io::AsyncWriteExt, process::Command};
+use tracing::warn;
 
 use self::stream::parse_stream;
+use crate::agents::AgentInvocation;
+
+const MAX_RETRIES: u32 = 2;
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
+const TRANSIENT_PATTERNS: &[&str] = &[
+    "connection reset",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "rate limit",
+    "rate_limit",
+    "502",
+    "503",
+    "429",
+    "overloaded",
+    "econnrefused",
+];
 
 /// Result from a Claude agent invocation.
 #[derive(Debug, Clone)]
@@ -114,6 +132,46 @@ impl CommandRunner for RealCommandRunner {
     }
 }
 
+/// Check whether an error message indicates a transient failure worth retrying.
+pub fn is_transient_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    TRANSIENT_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Invoke an agent with retry logic for transient failures.
+///
+/// Retries up to `MAX_RETRIES` times (with backoff) when the error message
+/// matches known transient patterns (connection resets, rate limits, 5xx, etc.).
+pub async fn run_with_retry<R: CommandRunner>(
+    runner: &R,
+    invocation: &AgentInvocation,
+) -> Result<AgentResult> {
+    let mut last_err = None;
+    for attempt in 0..=MAX_RETRIES {
+        match crate::agents::invoke_agent(runner, invocation).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if attempt < MAX_RETRIES && is_transient_error(&msg) {
+                    let delay = RETRY_DELAYS[attempt as usize];
+                    warn!(
+                        attempt = attempt + 1,
+                        max = MAX_RETRIES,
+                        delay_secs = delay.as_secs(),
+                        error = %msg,
+                        "transient agent failure, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_err = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("agent invocation failed after retries")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +187,28 @@ mod tests {
     fn real_command_runner_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RealCommandRunner>();
+    }
+
+    #[test]
+    fn transient_error_detection() {
+        assert!(is_transient_error("connection reset by peer"));
+        assert!(is_transient_error("Connection Refused"));
+        assert!(is_transient_error("request timed out after 30s"));
+        assert!(is_transient_error("rate limit exceeded"));
+        assert!(is_transient_error("rate_limit_error"));
+        assert!(is_transient_error("HTTP 502 Bad Gateway"));
+        assert!(is_transient_error("Service Unavailable (503)"));
+        assert!(is_transient_error("HTTP 429 Too Many Requests"));
+        assert!(is_transient_error("server is overloaded"));
+        assert!(is_transient_error("ECONNREFUSED 127.0.0.1:443"));
+    }
+
+    #[test]
+    fn non_transient_errors_not_matched() {
+        assert!(!is_transient_error("file not found"));
+        assert!(!is_transient_error("permission denied"));
+        assert!(!is_transient_error("invalid JSON in response"));
+        assert!(!is_transient_error("authentication failed"));
+        assert!(!is_transient_error(""));
     }
 }
