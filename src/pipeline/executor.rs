@@ -442,7 +442,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn run_review_fix_loop(
         &self,
         run_id: &str,
@@ -455,31 +454,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
 
-            // On cycles 2+, include prior resolved findings so the reviewer sees
-            // what was addressed (fixed) and what was disputed (rejected) by the fixer.
-            let (prior_addressed, prior_disputes) = if cycle > 1 {
-                let conn = self.db.lock().await;
-                let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
-                drop(conn);
-
-                let (mut addressed, disputed): (Vec<_>, Vec<_>) =
-                    all_resolved.into_iter().partition(|f| {
-                        f.dispute_reason.as_deref().is_some_and(|r| r.starts_with("ADDRESSED: "))
-                    });
-
-                // Strip the "ADDRESSED: " prefix so the template gets clean action text
-                for f in &mut addressed {
-                    if let Some(ref mut reason) = f.dispute_reason {
-                        if let Some(stripped) = reason.strip_prefix("ADDRESSED: ") {
-                            *reason = stripped.to_string();
-                        }
-                    }
-                }
-
-                (addressed, disputed)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (prior_addressed, prior_disputes) =
+                self.gather_prior_findings(run_id, cycle).await?;
 
             let review_prompt =
                 agents::reviewer::build_prompt(ctx, &prior_addressed, &prior_disputes)?;
@@ -539,21 +515,67 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 return Ok(());
             }
 
-            // Fix
-            self.check_cancelled()?;
-            self.update_status(run_id, RunStatus::Fixing).await?;
+            self.run_fix_step(run_id, ctx, worktree_path, target_dir, cycle).await?;
+        }
 
-            let unresolved = {
-                let conn = self.db.lock().await;
-                db::agent_runs::get_unresolved_findings(&conn, run_id)?
-            };
+        Ok(())
+    }
 
-            let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
+    /// Gather prior addressed and disputed findings for review cycles 2+.
+    async fn gather_prior_findings(
+        &self,
+        run_id: &str,
+        cycle: u32,
+    ) -> Result<(Vec<ReviewFinding>, Vec<ReviewFinding>)> {
+        if cycle <= 1 {
+            return Ok((Vec::new(), Vec::new()));
+        }
 
-            // Fixer failure: skip fix and continue to next review cycle
-            let fix_result = match self
-                .run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle)
-                .await
+        let conn = self.db.lock().await;
+        let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
+        drop(conn);
+
+        let (mut addressed, disputed): (Vec<_>, Vec<_>) = all_resolved.into_iter().partition(|f| {
+            f.dispute_reason.as_deref().is_some_and(|r| r.starts_with("ADDRESSED: "))
+        });
+
+        // Strip the "ADDRESSED: " prefix so the template gets clean action text
+        for f in &mut addressed {
+            if let Some(ref mut reason) = f.dispute_reason {
+                if let Some(stripped) = reason.strip_prefix("ADDRESSED: ") {
+                    *reason = stripped.to_string();
+                }
+            }
+        }
+
+        Ok((addressed, disputed))
+    }
+
+    /// Run the fixer agent for a given cycle, process its output, and push.
+    ///
+    /// If the fixer agent fails, posts a comment on the PR and returns `Ok(())`
+    /// so the caller can continue to the next review cycle.
+    async fn run_fix_step(
+        &self,
+        run_id: &str,
+        ctx: &AgentContext,
+        worktree_path: &std::path::Path,
+        target_dir: &std::path::Path,
+        cycle: u32,
+    ) -> Result<()> {
+        self.check_cancelled()?;
+        self.update_status(run_id, RunStatus::Fixing).await?;
+
+        let unresolved = {
+            let conn = self.db.lock().await;
+            db::agent_runs::get_unresolved_findings(&conn, run_id)?
+        };
+
+        let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
+
+        // Fixer failure: skip fix (caller continues to next review cycle)
+        let fix_result =
+            match self.run_agent(run_id, AgentRole::Fixer, &fix_prompt, worktree_path, cycle).await
             {
                 Ok(result) => result,
                 Err(e) => {
@@ -567,29 +589,27 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                         )
                         .await;
                     }
-                    continue;
+                    return Ok(());
                 }
             };
 
-            // Parse fixer output and mark disputed + addressed findings as resolved
-            let fixer_output = parse_fixer_output(&fix_result.output);
-            self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
-            self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
+        // Parse fixer output and mark disputed + addressed findings as resolved
+        let fixer_output = parse_fixer_output(&fix_result.output);
+        self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
+        self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
 
-            // Post fix comment on PR
-            if let Some(pr_number) = ctx.pr_number {
-                github::safe_comment(
-                    &self.github,
-                    pr_number,
-                    &format_fix_comment(cycle, &fixer_output),
-                    target_dir,
-                )
-                .await;
-            }
-
-            git::push_branch(worktree_path, &ctx.branch).await?;
+        // Post fix comment on PR
+        if let Some(pr_number) = ctx.pr_number {
+            github::safe_comment(
+                &self.github,
+                pr_number,
+                &format_fix_comment(cycle, &fixer_output),
+                target_dir,
+            )
+            .await;
         }
 
+        git::push_branch(worktree_path, &ctx.branch).await?;
         Ok(())
     }
 
