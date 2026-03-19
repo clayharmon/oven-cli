@@ -168,14 +168,22 @@ pub enum RebaseOutcome {
     Clean,
     /// Rebase had conflicts, fell back to a merge commit.
     MergeFallback,
-    /// Both rebase and merge failed.
+    /// Both rebase and merge failed. The working tree has unresolved merge
+    /// conflicts -- the caller can attempt agent-assisted resolution before
+    /// calling [`abort_merge`] or committing.
+    MergeConflicts(Vec<String>),
+    /// Agent resolved the merge conflicts after both rebase and merge failed.
+    AgentResolved,
+    /// Unrecoverable failure (e.g. fetch failed).
     Failed(String),
 }
 
 /// Rebase the current branch onto the latest `origin/<base_branch>` with fallbacks.
 ///
 /// Tries rebase first. If that fails (merge conflicts), falls back to a merge
-/// commit. If both fail, returns `Failed` with the error message.
+/// commit. If both fail, returns `MergeConflicts` with the list of conflicting
+/// files -- the working tree is left in a conflicted state so the caller can
+/// attempt agent-assisted resolution.
 pub async fn rebase_with_fallbacks(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
     if let Err(e) = run_git(repo_dir, &["fetch", "origin", base_branch]).await {
         return RebaseOutcome::Failed(format!("failed to fetch {base_branch}: {e}"));
@@ -193,11 +201,30 @@ pub async fn rebase_with_fallbacks(repo_dir: &Path, base_branch: &str) -> Rebase
     if run_git(repo_dir, &["merge", &target, "--no-edit"]).await.is_ok() {
         return RebaseOutcome::MergeFallback;
     }
-    let _ = run_git(repo_dir, &["merge", "--abort"]).await;
 
-    RebaseOutcome::Failed(format!(
-        "merge conflicts with {base_branch} that could not be resolved by rebase or merge"
-    ))
+    // Merge failed with conflicts -- leave the tree in conflict state so the
+    // caller can attempt agent resolution. List the conflicting files.
+    let conflicting = conflicting_files(repo_dir).await;
+    RebaseOutcome::MergeConflicts(conflicting)
+}
+
+/// List files with unresolved merge conflicts.
+pub async fn conflicting_files(repo_dir: &Path) -> Vec<String> {
+    run_git(repo_dir, &["diff", "--name-only", "--diff-filter=U"])
+        .await
+        .map_or_else(|_| vec![], |output| output.lines().map(String::from).collect())
+}
+
+/// Abort an in-progress merge.
+pub async fn abort_merge(repo_dir: &Path) {
+    let _ = run_git(repo_dir, &["merge", "--abort"]).await;
+}
+
+/// Stage all changes and commit (used after agent conflict resolution).
+pub async fn commit_merge(repo_dir: &Path) -> Result<()> {
+    run_git(repo_dir, &["add", "-A"]).await.context("staging resolved conflicts")?;
+    run_git(repo_dir, &["commit", "--no-edit"]).await.context("committing merge resolution")?;
+    Ok(())
 }
 
 /// Get the default branch name (main or master).
@@ -489,12 +516,11 @@ mod tests {
 
         // Rebase will conflict, but merge should succeed (git merge auto-resolves
         // content conflicts differently than rebase in some cases). If both fail,
-        // that's also acceptable for this test -- we just verify the function
-        // doesn't panic and returns a valid outcome.
+        // MergeConflicts is returned with the conflicting files.
         let outcome = rebase_with_fallbacks(dir.path(), &branch).await;
         assert!(
-            matches!(outcome, RebaseOutcome::MergeFallback | RebaseOutcome::Failed(_)),
-            "expected MergeFallback or Failed, got {outcome:?}"
+            matches!(outcome, RebaseOutcome::MergeFallback | RebaseOutcome::MergeConflicts(_)),
+            "expected MergeFallback or MergeConflicts, got {outcome:?}"
         );
     }
 
