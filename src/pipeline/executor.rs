@@ -986,10 +986,10 @@ fn format_fix_comment(cycle: u32, fixer: &agents::FixerOutput) -> String {
     let disputed = fixer.disputed.len();
     format!(
         "### Fix complete (cycle {cycle})\n\n\
-         **Addressed:** {addressed} finding{as}\n\
-         **Disputed:** {disputed} finding{ds}{COMMENT_FOOTER}",
-        as = if addressed == 1 { "" } else { "s" },
-        ds = if disputed == 1 { "" } else { "s" },
+         **Addressed:** {addressed} finding{a_s}\n\
+         **Disputed:** {disputed} finding{d_s}{COMMENT_FOOTER}",
+        a_s = if addressed == 1 { "" } else { "s" },
+        d_s = if disputed == 1 { "" } else { "s" },
     )
 }
 
