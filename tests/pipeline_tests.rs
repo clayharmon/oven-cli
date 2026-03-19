@@ -201,7 +201,7 @@ fn review_output_with_mixed_severities() {
         "summary": "3 findings"
     }"#;
 
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert_eq!(output.findings.len(), 3);
 
     let critical: Vec<_> =
@@ -216,7 +216,7 @@ fn review_output_with_mixed_severities() {
 #[test]
 fn review_output_empty_findings_array() {
     let json = r#"{"findings": [], "summary": "all clean"}"#;
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert!(output.findings.is_empty());
     assert_eq!(output.summary, "all clean");
 }
@@ -228,7 +228,7 @@ fn review_output_with_extra_fields_is_forward_compatible() {
         "summary": "ok",
         "metadata": {"version": "2.0"}
     }"#;
-    let output = parse_review_output(json).unwrap();
+    let output = parse_review_output(json);
     assert_eq!(output.findings.len(), 1);
 }
 

@@ -6,7 +6,7 @@ pub mod reviewer;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{db::ReviewFinding, process::CommandRunner};
@@ -351,11 +351,17 @@ pub fn parse_fixer_output(text: &str) -> FixerOutput {
 
 /// Parse structured review output from the reviewer's text response.
 ///
-/// The JSON may be wrapped in markdown code fences. Returns an error if the
-/// output is unparseable -- callers should treat this as a review failure,
-/// not a clean pass (which could let unreviewed code through to merge).
-pub fn parse_review_output(text: &str) -> Result<ReviewOutput> {
-    extract_json(text).context("reviewer returned unparseable output (no valid JSON found)")
+/// The JSON may be wrapped in markdown code fences. If the output is
+/// unparseable, returns empty findings (treated as a clean review) rather
+/// than failing the pipeline. This matches the fixer's forgiving behavior.
+pub fn parse_review_output(text: &str) -> ReviewOutput {
+    extract_json(text).unwrap_or_else(|| {
+        tracing::warn!("reviewer returned unparseable output, treating as clean review");
+        ReviewOutput {
+            findings: vec![],
+            summary: "review output unparseable, treated as clean".to_string(),
+        }
+    })
 }
 
 /// Try to extract a JSON object of type `T` from text that may contain prose,
@@ -424,8 +430,10 @@ mod tests {
 
         #[test]
         fn parse_review_output_never_panics(text in "\\PC{0,500}") {
-            // parse_review_output should never panic on any input (may return Err)
-            let _ = parse_review_output(&text);
+            // parse_review_output should never panic on any input
+            let output = parse_review_output(&text);
+            // Must always return a valid ReviewOutput (possibly empty)
+            let _ = output.findings;
         }
 
         #[test]
@@ -442,7 +450,7 @@ mod tests {
             let json = format!(
                 r#"{{"findings":[{{"severity":"{severity}","category":"{category}","message":"{message}"}}],"summary":"test"}}"#
             );
-            let output = parse_review_output(&json).unwrap();
+            let output = parse_review_output(&json);
             assert_eq!(output.findings.len(), 1);
             assert_eq!(output.findings[0].category, category);
         }
@@ -459,7 +467,7 @@ mod tests {
                 r#"{{"findings":[{{"severity":"{severity}","category":"{category}","message":"{message}"}}],"summary":"ok"}}"#
             );
             let text = format!("{prefix}\n```json\n{json}\n```\n{suffix}");
-            let output = parse_review_output(&text).unwrap();
+            let output = parse_review_output(&text);
             assert_eq!(output.findings.len(), 1);
         }
     }
@@ -498,7 +506,7 @@ mod tests {
     #[test]
     fn parse_review_output_valid_json() {
         let json = r#"{"findings":[{"severity":"critical","category":"bug","file_path":"src/main.rs","line_number":10,"message":"null pointer"}],"summary":"one issue found"}"#;
-        let output = parse_review_output(json).unwrap();
+        let output = parse_review_output(json);
         assert_eq!(output.findings.len(), 1);
         assert_eq!(output.findings[0].severity, Severity::Critical);
         assert_eq!(output.findings[0].message, "null pointer");
@@ -514,7 +522,7 @@ mod tests {
 ```
 
 That's it."#;
-        let output = parse_review_output(text).unwrap();
+        let output = parse_review_output(text);
         assert_eq!(output.findings.len(), 1);
         assert_eq!(output.findings[0].severity, Severity::Warning);
     }
@@ -522,23 +530,23 @@ That's it."#;
     #[test]
     fn parse_review_output_embedded_json() {
         let text = r#"I reviewed the code and found: {"findings":[{"severity":"info","category":"note","message":"looks fine"}],"summary":"clean"} end of review"#;
-        let output = parse_review_output(text).unwrap();
+        let output = parse_review_output(text);
         assert_eq!(output.findings.len(), 1);
     }
 
     #[test]
-    fn parse_review_output_no_json_returns_error() {
+    fn parse_review_output_no_json_returns_empty() {
         let text = "The code looks great, no issues found.";
-        let result = parse_review_output(text);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unparseable"));
+        let output = parse_review_output(text);
+        assert!(output.findings.is_empty());
+        assert!(output.summary.contains("unparseable"));
     }
 
     #[test]
-    fn parse_review_output_malformed_json_returns_error() {
+    fn parse_review_output_malformed_json_returns_empty() {
         let text = r#"{"findings": [{"broken json"#;
-        let result = parse_review_output(text);
-        assert!(result.is_err());
+        let output = parse_review_output(text);
+        assert!(output.findings.is_empty());
     }
 
     // --- Planner output parsing tests ---

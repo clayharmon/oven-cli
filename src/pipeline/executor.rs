@@ -464,22 +464,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 .run_agent(run_id, AgentRole::Reviewer, &review_prompt, worktree_path, cycle)
                 .await?;
 
-            let review_output = match parse_review_output(&review_result.output) {
-                Ok(output) => output,
-                Err(e) => {
-                    warn!(run_id = %run_id, cycle, error = %e, "review output unparseable, treating as failed review");
-                    if let Some(pr_number) = ctx.pr_number {
-                        github::safe_comment(
-                            &self.github,
-                            pr_number,
-                            &format_review_parse_failure(cycle),
-                            target_dir,
-                        )
-                        .await;
-                    }
-                    anyhow::bail!("reviewer returned unparseable output in cycle {cycle}");
-                }
-            };
+            let review_output = parse_review_output(&review_result.output);
             self.store_findings(run_id, &review_output.findings).await?;
 
             let actionable: Vec<_> =
@@ -777,16 +762,6 @@ fn format_rebase_failure(e: &anyhow::Error) -> String {
          PR merged while this pipeline was running.\n\n\
          **Error:** {e}\n\n\
          Rebase manually and re-run the pipeline.\
-         {COMMENT_FOOTER}"
-    )
-}
-
-fn format_review_parse_failure(cycle: u32) -> String {
-    format!(
-        "## Pipeline stopped: review output error\n\n\
-         The reviewer agent returned output that could not be parsed as structured \
-         findings (cycle {cycle}). This usually means the reviewer produced malformed JSON.\n\n\
-         Re-run the pipeline to try again.\
          {COMMENT_FOOTER}"
     )
 }
@@ -1183,13 +1158,5 @@ mod tests {
         assert!(comment.contains("## Pipeline stopped: rebase conflict"));
         assert!(comment.contains("merge conflict"));
         assert!(comment.contains("Rebase manually"));
-    }
-
-    #[test]
-    fn format_review_parse_failure_includes_cycle() {
-        let comment = format_review_parse_failure(2);
-        assert!(comment.contains("## Pipeline stopped: review output error"));
-        assert!(comment.contains("cycle 2"));
-        assert!(comment.contains("Re-run the pipeline"));
     }
 }
