@@ -782,7 +782,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // Check if conflicts are actually resolved
         let remaining = git::conflicting_files(worktree_path).await;
         if remaining.is_empty() {
-            if let Err(e) = git::commit_merge(worktree_path).await {
+            if let Err(e) = git::commit_merge(worktree_path, &conflicting_files).await {
                 git::abort_merge(worktree_path).await;
                 return Ok(RebaseOutcome::Failed(format!("failed to commit resolution: {e:#}")));
             }

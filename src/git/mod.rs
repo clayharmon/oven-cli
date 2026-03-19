@@ -220,9 +220,15 @@ pub async fn abort_merge(repo_dir: &Path) {
     let _ = run_git(repo_dir, &["merge", "--abort"]).await;
 }
 
-/// Stage all changes and commit (used after agent conflict resolution).
-pub async fn commit_merge(repo_dir: &Path) -> Result<()> {
-    run_git(repo_dir, &["add", "-A"]).await.context("staging resolved conflicts")?;
+/// Stage resolved conflict files and commit (used after agent conflict resolution).
+///
+/// Only stages files that git considers part of the merge (previously conflicting),
+/// rather than `git add -A` which could accidentally stage untracked files the
+/// agent left behind.
+pub async fn commit_merge(repo_dir: &Path, conflicting: &[String]) -> Result<()> {
+    for file in conflicting {
+        run_git(repo_dir, &["add", file]).await.with_context(|| format!("staging {file}"))?;
+    }
     run_git(repo_dir, &["commit", "--no-edit"]).await.context("committing merge resolution")?;
     Ok(())
 }
