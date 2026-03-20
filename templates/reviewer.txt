@@ -102,7 +102,22 @@ not exist, do NOT re-raise -- the compiler is authoritative over the issue spec.
   -> **Fixer's reason:** {{ d.dispute_reason.as_deref().unwrap_or("no reason given") }}
 {% endfor -%}
 {% endif %}
-{% if !prior_addressed.is_empty() || !prior_disputes.is_empty() %}
+{% if !prior_unresolved.is_empty() %}
+## Prior Unresolved Findings
+
+These findings were raised in a previous cycle and sent to the fixer, but the fixer
+did not address or dispute them. Do NOT re-raise these exact findings. If the
+underlying issue genuinely still exists, flag it with a more specific description
+(exact file path, line number, and concrete fix action).
+
+{% for u in prior_unresolved -%}
+- **{{ u.severity }}** {{ u.category }}
+{%- if let Some(path) = &u.file_path %} at `{{ path }}
+{%- if let Some(line) = u.line_number %}:{{ line }}{% endif %}`
+{%- endif %}: {{ u.message }}
+{% endfor -%}
+{% endif %}
+{% if !prior_addressed.is_empty() || !prior_disputes.is_empty() || !prior_unresolved.is_empty() %}
 ## Anti-Goalpost Rules (CRITICAL)
 
 This is review cycle 2+. The following rules are mandatory:
@@ -118,6 +133,19 @@ This is review cycle 2+. The following rules are mandatory:
 4. **Severity must not escalate across cycles.** A concern that was info-level in cycle 1
    cannot become a warning in cycle 2 unless new evidence (failing test, security issue)
    justifies it. "Technically imprecise but correct in practice" is info, not warning.
+{% endif %}
+{% if let Some(ref_sha) = pre_fix_ref %}
+## Cycle 2+ Focus (CRITICAL)
+
+This is a follow-up review after the fixer agent made changes. You MUST scope your review:
+
+1. Run `git diff {{ ref_sha }} HEAD` to see what the fixer changed
+2. Focus new findings ONLY on code the fixer touched or on regressions the fixer introduced
+3. Do NOT re-review unchanged code from the original implementation
+4. Do NOT raise new findings on code that was not modified since the last review
+
+The full diff (`git diff main`) is still available for context, but new findings should
+only target code changed since `{{ ref_sha }}`.
 {% endif %}
 ## Output Format (REQUIRED)
 
