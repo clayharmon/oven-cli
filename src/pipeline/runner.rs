@@ -1,4 +1,9 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -100,7 +105,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
             });
         }
 
-        let mut layer_had_merges = false;
+        let mut merged_target_dirs: HashSet<PathBuf> = HashSet::new();
         while let Some(join_result) = tasks.join_next().await {
             match join_result {
                 Ok((number, Ok(ref outcome))) => {
@@ -109,7 +114,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
                     graph.set_run_id(number, &outcome.run_id);
                     graph.transition(number, NodeState::Merged);
                     if auto_merge {
-                        layer_had_merges = true;
+                        merged_target_dirs.insert(outcome.target_dir.clone());
                     }
                 }
                 Ok((number, Err(ref e))) => {
@@ -130,8 +135,8 @@ pub async fn run_batch<R: CommandRunner + 'static>(
 
         // After merges land on the remote, update the local base branch so the
         // next layer's worktrees fork from post-merge state.
-        if layer_had_merges && !graph.all_terminal() {
-            fetch_base_branch(executor).await;
+        if !merged_target_dirs.is_empty() && !graph.all_terminal() {
+            fetch_base_branches(&merged_target_dirs).await;
         }
 
         save_graph(&graph, executor).await;
@@ -263,7 +268,7 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
         return;
     }
 
-    let mut any_merged = false;
+    let mut merged_target_dirs: HashSet<PathBuf> = HashSet::new();
     for num in awaiting {
         let Some(node) = graph.node(num) else { continue };
         let Some(pr_number) = node.pr_number else {
@@ -315,7 +320,7 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
                     );
                 }
                 graph.transition(num, NodeState::Merged);
-                any_merged = true;
+                merged_target_dirs.insert(pr_repo_dir);
             }
             crate::github::PrState::Closed => {
                 warn!(issue = num, pr = pr_number, "PR closed without merge, marking failed");
@@ -331,10 +336,10 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
         }
     }
 
-    // After merges land, update the local base branch so the next layer's
-    // worktrees fork from post-merge state.
-    if any_merged {
-        fetch_base_branch(executor).await;
+    // After merges land, update each affected repo's base branch so the next
+    // layer's worktrees fork from post-merge state.
+    if !merged_target_dirs.is_empty() {
+        fetch_base_branches(&merged_target_dirs).await;
     }
 
     save_graph(graph, executor).await;
@@ -482,21 +487,39 @@ fn standalone_node(issue: &PipelineIssue) -> GraphNode {
     }
 }
 
-/// Update the local base branch after merges land on the remote.
+/// Update the base branch in every repo where merges landed.
 ///
 /// Without this, new worktrees created for the next layer would fork from a
 /// stale local ref, causing the implementer to work against pre-merge code.
-async fn fetch_base_branch<R: CommandRunner>(executor: &Arc<PipelineExecutor<R>>) {
-    match git::default_branch(&executor.repo_dir).await {
+/// In multi-repo mode, merges may land in different target repos, so we fetch
+/// the base branch in each distinct repo directory.
+async fn fetch_base_branches(repo_dirs: &HashSet<PathBuf>) {
+    for repo_dir in repo_dirs {
+        fetch_base_branch_in(repo_dir).await;
+    }
+}
+
+/// Fetch the base branch for a single repo directory.
+async fn fetch_base_branch_in(repo_dir: &Path) {
+    match git::default_branch(repo_dir).await {
         Ok(branch) => {
-            if let Err(e) = git::fetch_branch(&executor.repo_dir, &branch).await {
-                warn!(error = %e, "failed to fetch base branch after merge");
+            if let Err(e) = git::fetch_branch(repo_dir, &branch).await {
+                warn!(
+                    repo = %repo_dir.display(), error = %e,
+                    "failed to fetch base branch after merge"
+                );
             } else {
-                info!(branch = %branch, "updated local base branch after merge");
+                info!(
+                    repo = %repo_dir.display(), branch = %branch,
+                    "updated base branch after merge"
+                );
             }
         }
         Err(e) => {
-            warn!(error = %e, "failed to detect base branch for post-merge fetch");
+            warn!(
+                repo = %repo_dir.display(), error = %e,
+                "failed to detect base branch for post-merge fetch"
+            );
         }
     }
 }
@@ -1055,5 +1078,72 @@ mod tests {
             assert_eq!(graph.node(1).unwrap().state, NodeState::Merged);
             assert_eq!(graph.ready_issues(), vec![2]);
         });
+    }
+
+    #[tokio::test]
+    async fn fetch_base_branches_handles_multiple_repos() {
+        // Create two independent repos with remotes so `default_branch` and
+        // `fetch_branch` work.
+        async fn repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) {
+            use tokio::process::Command as TokioCmd;
+
+            let dir = tempfile::tempdir().unwrap();
+            for (args, cwd) in [
+                (vec!["init"], dir.path()),
+                (vec!["config", "user.email", "test@test.com"], dir.path()),
+                (vec!["config", "user.name", "Test"], dir.path()),
+            ] {
+                TokioCmd::new("git").args(&args).current_dir(cwd).output().await.unwrap();
+            }
+            tokio::fs::write(dir.path().join("README.md"), "init").await.unwrap();
+            TokioCmd::new("git").args(["add", "."]).current_dir(dir.path()).output().await.unwrap();
+            TokioCmd::new("git")
+                .args(["commit", "-m", "init"])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+
+            let remote = tempfile::tempdir().unwrap();
+            TokioCmd::new("git")
+                .args(["clone", "--bare", dir.path().to_string_lossy().as_ref(), "."])
+                .current_dir(remote.path())
+                .output()
+                .await
+                .unwrap();
+            TokioCmd::new("git")
+                .args(["remote", "add", "origin", remote.path().to_string_lossy().as_ref()])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+            TokioCmd::new("git")
+                .args(["fetch", "origin"])
+                .current_dir(dir.path())
+                .output()
+                .await
+                .unwrap();
+
+            (dir, remote)
+        }
+
+        let (repo_a, _remote_a) = repo_with_remote().await;
+        let (repo_b, _remote_b) = repo_with_remote().await;
+
+        let mut dirs = HashSet::new();
+        dirs.insert(repo_a.path().to_path_buf());
+        dirs.insert(repo_b.path().to_path_buf());
+
+        // Should not panic or error -- just fetches both repos
+        fetch_base_branches(&dirs).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_base_branches_skips_invalid_repo_gracefully() {
+        let mut dirs = HashSet::new();
+        dirs.insert(PathBuf::from("/tmp/nonexistent-repo-12345"));
+
+        // Should log a warning but not panic
+        fetch_base_branches(&dirs).await;
     }
 }
