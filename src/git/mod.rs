@@ -176,8 +176,17 @@ pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
         return RebaseOutcome::Clean;
     }
 
-    // Rebase stopped with conflicts -- leave the tree in mid-rebase state.
+    // Rebase stopped -- check if it's real conflicts or an empty commit.
     let conflicting = conflicting_files(repo_dir).await;
+    if conflicting.is_empty() {
+        // No conflicting files means an empty commit (patch already applied).
+        // Skip it rather than sending an agent to resolve nothing.
+        match skip_empty_rebase_commits(repo_dir).await {
+            Ok(None) => return RebaseOutcome::Clean,
+            Ok(Some(files)) => return RebaseOutcome::RebaseConflicts(files),
+            Err(e) => return RebaseOutcome::Failed(format!("{e:#}")),
+        }
+    }
     RebaseOutcome::RebaseConflicts(conflicting)
 }
 
@@ -191,6 +200,36 @@ pub async fn conflicting_files(repo_dir: &Path) -> Vec<String> {
 /// Abort an in-progress rebase.
 pub async fn abort_rebase(repo_dir: &Path) {
     let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
+}
+
+/// Skip empty commits during a rebase when no conflicting files are present.
+///
+/// During rebase replay, a commit can become empty if its changes are already
+/// present on the target branch. Git stops on these by default. This function
+/// runs `git rebase --skip` in a loop until the rebase completes or real
+/// conflicts appear.
+///
+/// Returns `Ok(None)` if the rebase completed after skipping.
+/// Returns `Ok(Some(files))` if real conflicts appeared after a skip.
+/// Returns `Err` if the maximum number of skips was exhausted.
+async fn skip_empty_rebase_commits(repo_dir: &Path) -> Result<Option<Vec<String>>> {
+    const MAX_SKIPS: u32 = 10;
+    let no_editor = [("GIT_EDITOR", "true")];
+
+    for _ in 0..MAX_SKIPS {
+        if run_git_with_env(repo_dir, &["rebase", "--skip"], &no_editor).await.is_ok() {
+            return Ok(None);
+        }
+
+        // Skip stopped again -- check for real conflicts vs another empty commit.
+        let conflicts = conflicting_files(repo_dir).await;
+        if !conflicts.is_empty() {
+            return Ok(Some(conflicts));
+        }
+    }
+
+    abort_rebase(repo_dir).await;
+    anyhow::bail!("rebase had too many empty commits (skipped {MAX_SKIPS} times)")
 }
 
 /// Stage resolved conflict files and continue the in-progress rebase.
@@ -214,7 +253,8 @@ pub async fn rebase_continue(
     // rebase --continue stopped again -- new conflicts on the next commit.
     let new_conflicts = conflicting_files(repo_dir).await;
     if new_conflicts.is_empty() {
-        anyhow::bail!("rebase --continue failed but no conflicting files found");
+        // Empty commit after continue -- skip it.
+        return skip_empty_rebase_commits(repo_dir).await;
     }
     Ok(Some(new_conflicts))
 }
@@ -519,6 +559,89 @@ mod tests {
         assert!(result.is_none(), "expected rebase to complete, got more conflicts");
 
         // Verify rebase completed (no rebase-merge dir)
+        assert!(!dir.path().join(".git/rebase-merge").exists());
+        assert!(!dir.path().join(".git/rebase-apply").exists());
+    }
+
+    #[tokio::test]
+    async fn start_rebase_skips_empty_commit() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Create a feature branch with a change
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "changed").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature change"]).await.unwrap();
+
+        // Cherry-pick the same change onto base so the feature commit becomes empty
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "changed").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "same change on base"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        // Rebase should skip the empty commit and succeed
+        let outcome = start_rebase(dir.path(), &branch).await;
+        assert!(
+            matches!(outcome, RebaseOutcome::Clean),
+            "expected Clean after skipping empty commit, got {outcome:?}"
+        );
+
+        // Verify rebase completed
+        assert!(!dir.path().join(".git/rebase-merge").exists());
+        assert!(!dir.path().join(".git/rebase-apply").exists());
+    }
+
+    #[tokio::test]
+    async fn rebase_continue_skips_empty_commit_after_real_conflict() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Feature branch: commit 1 changes README, commit 2 changes other.txt
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "feature readme").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature readme"]).await.unwrap();
+
+        tokio::fs::write(dir.path().join("other.txt"), "feature other").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature other"]).await.unwrap();
+
+        // Base branch: conflict on README, cherry-pick the same other.txt change
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "base readme").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base readme"]).await.unwrap();
+
+        tokio::fs::write(dir.path().join("other.txt"), "feature other").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "same other on base"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        // First commit (README) will have a real conflict
+        let outcome = start_rebase(dir.path(), &branch).await;
+        let files = match outcome {
+            RebaseOutcome::RebaseConflicts(f) => f,
+            other => panic!("expected RebaseConflicts, got {other:?}"),
+        };
+        assert!(files.contains(&"README.md".to_string()));
+
+        // Resolve the conflict manually
+        tokio::fs::write(dir.path().join("README.md"), "resolved").await.unwrap();
+
+        // Continue should resolve the conflict, then skip the empty second commit
+        let result = rebase_continue(dir.path(), &files).await.unwrap();
+        assert!(result.is_none(), "expected rebase to complete, got more conflicts");
+
         assert!(!dir.path().join(".git/rebase-merge").exists());
         assert!(!dir.path().join(".git/rebase-apply").exists());
     }
