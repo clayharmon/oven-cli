@@ -24,7 +24,10 @@ fn branch_name(issue_number: u32) -> String {
     format!("oven/issue-{issue_number}-{short_hex}")
 }
 
-/// Create a worktree for the given issue, branching from `base_branch`.
+/// Create a worktree for the given issue, branching from `origin/<base_branch>`.
+///
+/// Uses the remote tracking ref rather than the local branch so that worktrees
+/// always start from the latest remote state (e.g. after PRs are merged).
 pub async fn create_worktree(
     repo_dir: &Path,
     issue_number: u32,
@@ -39,9 +42,10 @@ pub async fn create_worktree(
         tokio::fs::create_dir_all(parent).await.context("creating worktree parent directory")?;
     }
 
+    let start_point = format!("origin/{base_branch}");
     run_git(
         repo_dir,
-        &["worktree", "add", "-b", &branch, &worktree_path.to_string_lossy(), base_branch],
+        &["worktree", "add", "-b", &branch, &worktree_path.to_string_lossy(), &start_point],
     )
     .await
     .context("creating worktree")?;
@@ -131,6 +135,17 @@ pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
 /// Push a branch to origin.
 pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_git(repo_dir, &["push", "origin", branch]).await.context("pushing branch")?;
+    Ok(())
+}
+
+/// Fetch a branch from origin to update the remote tracking ref.
+///
+/// Used between pipeline layers so that new worktrees (which branch from
+/// `origin/<branch>`) start from post-merge state.
+pub async fn fetch_branch(repo_dir: &Path, branch: &str) -> Result<()> {
+    run_git(repo_dir, &["fetch", "origin", branch])
+        .await
+        .with_context(|| format!("fetching {branch} from origin"))?;
     Ok(())
 }
 
@@ -384,9 +399,29 @@ mod tests {
         dir
     }
 
+    /// Create a temp repo with a bare remote so `origin/<branch>` exists.
+    /// Returns (repo dir, remote dir) -- both must be kept alive for the test.
+    async fn init_temp_repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) {
+        let dir = init_temp_repo().await;
+
+        let remote_dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", "--bare", &dir.path().to_string_lossy(), "."])
+            .current_dir(remote_dir.path())
+            .output()
+            .await
+            .unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &remote_dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+        run_git(dir.path(), &["fetch", "origin"]).await.unwrap();
+
+        (dir, remote_dir)
+    }
+
     #[tokio::test]
     async fn create_and_remove_worktree() {
-        let dir = init_temp_repo().await;
+        let (dir, _remote) = init_temp_repo_with_remote().await;
 
         // Detect the current branch name
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
@@ -402,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_worktrees_includes_created() {
-        let dir = init_temp_repo().await;
+        let (dir, _remote) = init_temp_repo_with_remote().await;
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
 
         let _wt = create_worktree(dir.path(), 99, &branch).await.unwrap();
@@ -752,5 +787,113 @@ mod tests {
 
         // Clean up
         abort_rebase(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_branch_updates_remote_tracking_ref() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Set up a bare remote
+        let remote_dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", "--bare", &dir.path().to_string_lossy(), "."])
+            .current_dir(remote_dir.path())
+            .output()
+            .await
+            .unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &remote_dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        // Initial fetch to create the tracking ref
+        run_git(dir.path(), &["fetch", "origin"]).await.unwrap();
+        let before_sha =
+            run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
+
+        // Simulate a remote advance: clone the bare repo, commit, push
+        let other_dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", &remote_dir.path().to_string_lossy(), "."])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::fs::write(other_dir.path().join("remote.txt"), "new content").await.unwrap();
+        run_git(other_dir.path(), &["add", "."]).await.unwrap();
+        run_git(other_dir.path(), &["commit", "-m", "remote commit"]).await.unwrap();
+        run_git(other_dir.path(), &["push", "origin", &branch]).await.unwrap();
+
+        // Remote tracking ref should still be at the old SHA
+        let stale_sha =
+            run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
+        assert_eq!(before_sha, stale_sha);
+
+        // fetch_branch should update the remote tracking ref
+        fetch_branch(dir.path(), &branch).await.unwrap();
+
+        let after_sha =
+            run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
+        assert_ne!(before_sha, after_sha, "origin/{branch} should have advanced after fetch");
+    }
+
+    #[tokio::test]
+    async fn fetch_branch_no_remote_errors() {
+        let dir = init_temp_repo().await;
+        let result = fetch_branch(dir.path(), "main").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_after_fetch_includes_remote_changes() {
+        let (dir, remote_dir) = init_temp_repo_with_remote().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Simulate a remote advance (like a merged PR)
+        let other_dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", &remote_dir.path().to_string_lossy(), "."])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(other_dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::fs::write(other_dir.path().join("merged.txt"), "from merged PR").await.unwrap();
+        run_git(other_dir.path(), &["add", "."]).await.unwrap();
+        run_git(other_dir.path(), &["commit", "-m", "merged PR commit"]).await.unwrap();
+        run_git(other_dir.path(), &["push", "origin", &branch]).await.unwrap();
+
+        // Fetch to update origin/<branch>
+        fetch_branch(dir.path(), &branch).await.unwrap();
+
+        // Create a worktree -- it should include the remote change
+        let wt = create_worktree(dir.path(), 99, &branch).await.unwrap();
+        assert!(
+            wt.path.join("merged.txt").exists(),
+            "worktree should contain the file from the merged PR"
+        );
     }
 }

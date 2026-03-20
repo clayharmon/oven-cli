@@ -12,6 +12,7 @@ use super::{
 use crate::{
     agents::Complexity,
     db::graph::NodeState,
+    git,
     issues::PipelineIssue,
     pipeline::{executor::generate_run_id, graph::GraphNode},
     process::CommandRunner,
@@ -99,6 +100,7 @@ pub async fn run_batch<R: CommandRunner + 'static>(
             });
         }
 
+        let mut layer_had_merges = false;
         while let Some(join_result) = tasks.join_next().await {
             match join_result {
                 Ok((number, Ok(ref outcome))) => {
@@ -106,6 +108,9 @@ pub async fn run_batch<R: CommandRunner + 'static>(
                     graph.set_pr_number(number, outcome.pr_number);
                     graph.set_run_id(number, &outcome.run_id);
                     graph.transition(number, NodeState::Merged);
+                    if auto_merge {
+                        layer_had_merges = true;
+                    }
                 }
                 Ok((number, Err(ref e))) => {
                     error!(issue = number, error = %e, "pipeline failed for issue");
@@ -121,6 +126,12 @@ pub async fn run_batch<R: CommandRunner + 'static>(
                     had_errors = true;
                 }
             }
+        }
+
+        // After merges land on the remote, update the local base branch so the
+        // next layer's worktrees fork from post-merge state.
+        if layer_had_merges && !graph.all_terminal() {
+            fetch_base_branch(executor).await;
         }
 
         save_graph(&graph, executor).await;
@@ -252,6 +263,7 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
         return;
     }
 
+    let mut any_merged = false;
     for num in awaiting {
         let Some(node) = graph.node(num) else { continue };
         let Some(pr_number) = node.pr_number else {
@@ -303,6 +315,7 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
                     );
                 }
                 graph.transition(num, NodeState::Merged);
+                any_merged = true;
             }
             crate::github::PrState::Closed => {
                 warn!(issue = num, pr = pr_number, "PR closed without merge, marking failed");
@@ -316,6 +329,12 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
                 // Still open, keep waiting
             }
         }
+    }
+
+    // After merges land, update the local base branch so the next layer's
+    // worktrees fork from post-merge state.
+    if any_merged {
+        fetch_base_branch(executor).await;
     }
 
     save_graph(graph, executor).await;
@@ -460,6 +479,25 @@ fn standalone_node(issue: &PipelineIssue) -> GraphNode {
         run_id: None,
         target_repo: issue.target_repo.clone(),
         issue: Some(issue.clone()),
+    }
+}
+
+/// Update the local base branch after merges land on the remote.
+///
+/// Without this, new worktrees created for the next layer would fork from a
+/// stale local ref, causing the implementer to work against pre-merge code.
+async fn fetch_base_branch<R: CommandRunner>(executor: &Arc<PipelineExecutor<R>>) {
+    match git::default_branch(&executor.repo_dir).await {
+        Ok(branch) => {
+            if let Err(e) = git::fetch_branch(&executor.repo_dir, &branch).await {
+                warn!(error = %e, "failed to fetch base branch after merge");
+            } else {
+                info!(branch = %branch, "updated local base branch after merge");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to detect base branch for post-merge fetch");
+        }
     }
 }
 
