@@ -810,9 +810,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         let conn = self.db.lock().await;
         for f in findings {
-            let was_touched = f.file_path.as_ref().is_some_and(|fp| {
-                changed_files.iter().any(|cf| cf == fp || cf.ends_with(fp) || fp.ends_with(cf))
-            });
+            let was_touched =
+                f.file_path.as_ref().is_some_and(|fp| changed_files.iter().any(|cf| cf == fp));
 
             let reason = if was_touched {
                 "ADDRESSED: inferred from git -- fixer modified this file (no structured output)"
