@@ -476,4 +476,21 @@ mod tests {
         let client = GhClient::new(mock, Path::new("/tmp"));
         client.merge_pr(42, &MergeStrategy::Rebase).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn merge_pr_does_not_pass_delete_branch() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(
+                !args.contains(&"--delete-branch".to_string()),
+                "merge_pr should not pass --delete-branch, got {args:?}"
+            );
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        client.merge_pr(42, &MergeStrategy::Squash).await.unwrap();
+    }
 }

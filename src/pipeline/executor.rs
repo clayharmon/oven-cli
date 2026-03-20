@@ -261,9 +261,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         let branch = {
             let conn = self.db.lock().await;
-            db::runs::get_run(&conn, run_id)?
-                .and_then(|r| r.branch)
-                .unwrap_or_default()
+            db::runs::get_run(&conn, run_id)?.and_then(|r| r.branch).unwrap_or_default()
         };
 
         Ok(PipelineOutcome {
@@ -459,14 +457,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
-            self.check_cancelled()?;
             let pr_number = ctx.pr_number.context("no PR number for merge step")?;
             self.update_status(run_id, RunStatus::Merging).await?;
 
-            self.github
-                .merge_pr_in(pr_number, &self.config.pipeline.merge_strategy, target_dir)
-                .await?;
-            info!(run_id = %run_id, pr = pr_number, "PR merged");
+            self.merge_with_retry(run_id, ctx, worktree_path, target_dir, pr_number).await?;
 
             // Close the issue for single-repo GitHub issues. Multi-repo and local
             // issues are closed by finalize_run instead (different repo context).
@@ -488,6 +482,55 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
 
         Ok(())
+    }
+
+    /// Attempt to merge a PR, retrying with a fresh rebase when GitHub reports
+    /// the PR as not mergeable (e.g. because a parallel PR landed first).
+    async fn merge_with_retry(
+        &self,
+        run_id: &str,
+        ctx: &AgentContext,
+        worktree_path: &std::path::Path,
+        target_dir: &std::path::Path,
+        pr_number: u32,
+    ) -> Result<()> {
+        const MAX_MERGE_ATTEMPTS: u32 = 3;
+
+        for attempt in 1..=MAX_MERGE_ATTEMPTS {
+            self.check_cancelled()?;
+
+            match self
+                .github
+                .merge_pr_in(pr_number, &self.config.pipeline.merge_strategy, target_dir)
+                .await
+            {
+                Ok(()) => {
+                    info!(run_id = %run_id, pr = pr_number, attempt, "PR merged");
+                    return Ok(());
+                }
+                Err(e) if attempt < MAX_MERGE_ATTEMPTS && is_not_mergeable(&e) => {
+                    warn!(
+                        run_id = %run_id, pr = pr_number, attempt,
+                        "PR not mergeable, re-rebasing and retrying"
+                    );
+
+                    let rebase_outcome = self
+                        .rebase_with_agent_fallback(run_id, ctx, worktree_path, target_dir)
+                        .await?;
+
+                    if let RebaseOutcome::Failed(ref msg) = rebase_outcome {
+                        anyhow::bail!("merge retry rebase failed: {msg}");
+                    }
+
+                    git::force_push_branch(worktree_path, &ctx.branch).await?;
+                    // Brief pause to let GitHub update mergeability state
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => return Err(e.context("merge PR failed")),
+            }
+        }
+
+        anyhow::bail!("PR #{pr_number} not mergeable after {MAX_MERGE_ATTEMPTS} rebase attempts");
     }
 
     async fn run_review_fix_loop(
@@ -1086,6 +1129,16 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         }
         Ok(())
     }
+}
+
+/// Check whether a merge error indicates the PR is not mergeable (stale branch).
+///
+/// GitHub's GraphQL API returns "Pull Request is not mergeable" when the branch
+/// needs updating. This is distinct from permanent errors like "Squash merges
+/// are not allowed" which should not be retried.
+fn is_not_mergeable(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("not mergeable") && !msg.contains("not allowed")
 }
 
 const COMMENT_FOOTER: &str =
@@ -1724,5 +1777,25 @@ mod tests {
     fn format_merge_comment_content() {
         let comment = format_merge_comment();
         assert!(comment.contains("### Merged"));
+    }
+
+    #[test]
+    fn is_not_mergeable_detects_graphql_error() {
+        let err = anyhow::anyhow!("GraphQL: Pull Request is not mergeable (mergePullRequest)");
+        assert!(is_not_mergeable(&err));
+    }
+
+    #[test]
+    fn is_not_mergeable_rejects_not_allowed_errors() {
+        let err = anyhow::anyhow!(
+            "GraphQL: Squash merges are not allowed on this repository. (mergePullRequest)"
+        );
+        assert!(!is_not_mergeable(&err));
+    }
+
+    #[test]
+    fn is_not_mergeable_rejects_unrelated_errors() {
+        let err = anyhow::anyhow!("network timeout");
+        assert!(!is_not_mergeable(&err));
     }
 }
