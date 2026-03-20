@@ -407,6 +407,9 @@ impl DependencyGraph {
         lines.push(String::new());
 
         let box_width = self.compute_box_width();
+        let full_box = box_width + 2;
+        let spacing = 2;
+        let max_per_row = (terminal_width().saturating_sub(4) / (full_box + spacing)).max(1);
 
         for (layer_idx, layer) in layers.iter().enumerate() {
             // Layer header
@@ -418,32 +421,33 @@ impl DependencyGraph {
             }
             lines.push(String::new());
 
-            // Render boxes for this layer
+            // Render boxes for this layer, wrapping into rows
             let boxes: Vec<Vec<String>> =
                 layer.iter().map(|&num| self.render_box(num, box_width)).collect();
 
-            // Merge box lines side by side with spacing
-            let max_height = boxes.iter().map(Vec::len).max().unwrap_or(0);
-            for row in 0..max_height {
-                let mut line = String::from("  ");
-                for (i, b) in boxes.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str("  ");
+            for chunk in boxes.chunks(max_per_row) {
+                let max_height = chunk.iter().map(Vec::len).max().unwrap_or(0);
+                for row in 0..max_height {
+                    let mut line = String::from("  ");
+                    for (i, b) in chunk.iter().enumerate() {
+                        if i > 0 {
+                            line.push_str("  ");
+                        }
+                        if row < b.len() {
+                            line.push_str(&b[row]);
+                        } else {
+                            line.push_str(&" ".repeat(full_box));
+                        }
                     }
-                    if row < b.len() {
-                        line.push_str(&b[row]);
-                    } else {
-                        // Pad with spaces to match box width
-                        line.push_str(&" ".repeat(box_width + 2));
-                    }
+                    lines.push(line);
                 }
-                lines.push(line);
             }
 
             // Draw connectors to next layer if there is one
             if layer_idx + 1 < layers.len() {
                 let next_layer = &layers[layer_idx + 1];
-                let connector_lines = self.render_connectors(layer, next_layer, box_width);
+                let connector_lines =
+                    self.render_connectors(layer, next_layer, box_width, max_per_row);
                 lines.extend(connector_lines);
             }
         }
@@ -528,18 +532,20 @@ impl DependencyGraph {
         from_layer: &[u32],
         to_layer: &[u32],
         box_width: usize,
+        max_per_row: usize,
     ) -> Vec<String> {
         // For each node in to_layer, find which nodes in from_layer it depends on.
         // We draw simple vertical/horizontal pipe connectors.
         let full_box_width = box_width + 2; // include border chars
         let spacing = 2usize;
 
-        // Compute center x position for each node in from_layer and to_layer
+        // Compute center x position for each node, wrapping by max_per_row
         let from_centers: Vec<(u32, usize)> = from_layer
             .iter()
             .enumerate()
             .map(|(i, &num)| {
-                let x = i * (full_box_width + spacing) + full_box_width / 2;
+                let col = i % max_per_row;
+                let x = col * (full_box_width + spacing) + full_box_width / 2;
                 (num, x)
             })
             .collect();
@@ -547,13 +553,14 @@ impl DependencyGraph {
             .iter()
             .enumerate()
             .map(|(i, &num)| {
-                let x = i * (full_box_width + spacing) + full_box_width / 2;
+                let col = i % max_per_row;
+                let x = col * (full_box_width + spacing) + full_box_width / 2;
                 (num, x)
             })
             .collect();
 
-        // Collect all edges between these two layers
-        let mut connections: Vec<(usize, usize)> = Vec::new(); // (from_x, to_x)
+        // Collect all edges between these two layers (dedup for wrapped columns)
+        let mut connections: Vec<(usize, usize)> = Vec::new();
         for &(to_num, to_x) in &to_centers {
             let deps = self.dependencies(to_num);
             for &(from_num, from_x) in &from_centers {
@@ -562,6 +569,8 @@ impl DependencyGraph {
                 }
             }
         }
+        connections.sort_unstable();
+        connections.dedup();
 
         if connections.is_empty() {
             return lines_with_gap(1);
@@ -691,6 +700,10 @@ const fn box_drawing_char(dirs: u8) -> char {
         0b0001 => '\u{2576}', // ╶  right only
         _ => ' ',
     }
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(120)
 }
 
 fn lines_with_gap(count: usize) -> Vec<String> {
@@ -1456,5 +1469,50 @@ mod tests {
         let layers = g.compute_layers();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0], vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn display_layered_wraps_wide_layers() {
+        // Build a graph with many independent nodes so wrapping kicks in
+        // regardless of terminal width.
+        let mut g = DependencyGraph::new("test");
+        for i in 1..=12 {
+            g.add_node(make_named_node(i, &format!("Task {i}"), "area"));
+        }
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+
+        // All nodes should appear
+        for i in 1..=12 {
+            assert!(text.contains(&format!("#{i}")), "missing #{i}");
+        }
+
+        // No single line should exceed the detected terminal width.
+        // Use chars().count() since box-drawing chars are multi-byte UTF-8.
+        let term_w = super::terminal_width();
+        let max_line = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(max_line <= term_w, "line too wide: {max_line} chars (expected <= {term_w})");
+    }
+
+    #[test]
+    fn display_layered_wrapping_preserves_connectors() {
+        // Layer 0: 6 independent nodes (will wrap at default 120 cols).
+        // Layer 1: 1 node that depends on node 1.
+        let mut g = DependencyGraph::new("test");
+        for i in 1..=6 {
+            g.add_node(make_named_node(i, &format!("Task {i}"), "area"));
+        }
+        g.add_node(make_named_node(7, "Dependent", "area"));
+        g.add_edge(7, 1);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+
+        // Connector arrow should still be present
+        assert!(text.contains('\u{25bc}'), "missing connector arrow");
+        // Both layers should appear
+        assert!(text.contains("Layer 0"));
+        assert!(text.contains("Layer 1"));
     }
 }
