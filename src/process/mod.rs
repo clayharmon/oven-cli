@@ -62,6 +62,7 @@ pub trait CommandRunner: Send + Sync {
         allowed_tools: &[String],
         working_dir: &Path,
         max_turns: Option<u32>,
+        model: Option<String>,
     ) -> impl std::future::Future<Output = Result<AgentResult>> + Send;
 
     fn run_gh(
@@ -81,12 +82,17 @@ impl CommandRunner for RealCommandRunner {
         allowed_tools: &[String],
         working_dir: &Path,
         max_turns: Option<u32>,
+        model: Option<String>,
     ) -> Result<AgentResult> {
         let tools_arg = allowed_tools.join(",");
 
         let mut cmd = Command::new("claude");
         cmd.args(["-p", "--verbose", "--output-format", "stream-json"])
             .args(["--allowedTools", &tools_arg]);
+
+        if let Some(ref model) = model {
+            cmd.args(["--model", model]);
+        }
 
         if let Some(turns) = max_turns {
             cmd.args(["--max-turns", &turns.to_string()]);

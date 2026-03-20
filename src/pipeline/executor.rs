@@ -186,6 +186,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             prompt,
             working_dir: self.repo_dir.clone(),
             max_turns: Some(self.config.pipeline.turn_limit),
+            model: self.config.models.model_for(AgentRole::Planner.as_str()).map(String::from),
         };
 
         match invoke_agent(self.runner.as_ref(), &invocation).await {
@@ -819,6 +820,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             prompt: prompt.to_string(),
             working_dir: working_dir.to_path_buf(),
             max_turns: Some(self.config.pipeline.turn_limit),
+            model: self.config.models.model_for(role.as_str()).map(String::from),
         };
 
         let result = process::run_with_retry(self.runner.as_ref(), &invocation).await;
