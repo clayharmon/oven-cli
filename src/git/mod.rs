@@ -171,7 +171,8 @@ pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
 
     let target = format!("origin/{base_branch}");
 
-    if run_git(repo_dir, &["rebase", &target]).await.is_ok() {
+    let no_editor = [("GIT_EDITOR", "true")];
+    if run_git_with_env(repo_dir, &["rebase", &target], &no_editor).await.is_ok() {
         return RebaseOutcome::Clean;
     }
 
@@ -202,10 +203,11 @@ pub async fn rebase_continue(
     conflicting: &[String],
 ) -> Result<Option<Vec<String>>> {
     for file in conflicting {
-        run_git(repo_dir, &["add", file]).await.with_context(|| format!("staging {file}"))?;
+        run_git(repo_dir, &["add", "--", file]).await.with_context(|| format!("staging {file}"))?;
     }
 
-    if run_git(repo_dir, &["rebase", "--continue"]).await.is_ok() {
+    let no_editor = [("GIT_EDITOR", "true")];
+    if run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await.is_ok() {
         return Ok(None);
     }
 
@@ -263,13 +265,16 @@ pub async fn changed_files_since(repo_dir: &Path, since_ref: &str) -> Result<Vec
 }
 
 async fn run_git(repo_dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("spawning git")?;
+    run_git_with_env(repo_dir, args, &[]).await
+}
+
+async fn run_git_with_env(repo_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_dir).kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().await.context("spawning git")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
