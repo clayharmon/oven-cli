@@ -308,9 +308,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     )
                     .await?;
 
-                // Close the issue when the merger can't do it:
-                // - Local issues: merger can't use `gh issue close`
-                // - Multi-repo: merger runs in target repo, can't close god-repo issue
+                // Close the issue for local and multi-repo cases. Single-repo
+                // GitHub issues are closed directly in the merge step (run_steps)
+                // because they share the same gh context.
                 let should_close =
                     issue.source == IssueOrigin::Local || issue.target_repo.is_some();
 
@@ -426,15 +426,26 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
             self.check_cancelled()?;
-            ctx.pr_number.context("no PR number for merge step")?;
+            let pr_number = ctx.pr_number.context("no PR number for merge step")?;
             self.update_status(run_id, RunStatus::Merging).await?;
-            let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
-            self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
 
-            if let Some(pr_number) = ctx.pr_number {
-                github::safe_comment(&self.github, pr_number, &format_merge_comment(), target_dir)
-                    .await;
+            self.github.merge_pr_in(pr_number, target_dir).await?;
+            info!(run_id = %run_id, pr = pr_number, "PR merged");
+
+            // Close the issue for single-repo GitHub issues. Multi-repo and local
+            // issues are closed by finalize_run instead (different repo context).
+            if ctx.target_repo.is_none() && ctx.issue_source == "github" {
+                if let Err(e) = self
+                    .github
+                    .close_issue(ctx.issue_number, Some(&format!("Implemented in #{pr_number}")))
+                    .await
+                {
+                    warn!(run_id = %run_id, error = %e, "failed to close issue after merge");
+                }
             }
+
+            github::safe_comment(&self.github, pr_number, &format_merge_comment(), target_dir)
+                .await;
         } else if let Some(pr_number) = ctx.pr_number {
             github::safe_comment(&self.github, pr_number, &format_ready_comment(), target_dir)
                 .await;
@@ -849,9 +860,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
-    /// Rebase with fallbacks, including agent-assisted conflict resolution.
+    /// Rebase with agent-assisted conflict resolution.
     ///
-    /// Chain: rebase -> merge -> implementer agent resolves conflicts -> fail.
+    /// Chain: rebase -> if conflicts, agent resolves -> rebase --continue -> loop.
     async fn rebase_with_agent_fallback(
         &self,
         run_id: &str,
@@ -859,90 +870,106 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         worktree_path: &std::path::Path,
         target_dir: &std::path::Path,
     ) -> Result<RebaseOutcome> {
-        let outcome = git::rebase_with_fallbacks(worktree_path, &ctx.base_branch).await;
+        const MAX_REBASE_ROUNDS: u32 = 5;
 
-        let conflicting_files = match outcome {
-            RebaseOutcome::MergeConflicts(ref files) => files.clone(),
+        let outcome = git::start_rebase(worktree_path, &ctx.base_branch).await;
+
+        let mut conflicting_files = match outcome {
+            RebaseOutcome::RebaseConflicts(files) => files,
             other => return Ok(other),
         };
 
-        info!(
-            run_id = %run_id,
-            files = ?conflicting_files,
-            "rebase and merge failed, attempting agent conflict resolution"
-        );
+        for round in 1..=MAX_REBASE_ROUNDS {
+            info!(
+                run_id = %run_id,
+                round,
+                files = ?conflicting_files,
+                "rebase conflicts, attempting agent resolution"
+            );
 
-        // Post a comment so the PR shows what's happening
-        if let Some(pr_number) = ctx.pr_number {
-            github::safe_comment(
-                &self.github,
-                pr_number,
-                &format!(
-                    "### Resolving merge conflicts\n\n\
-                     Rebase and merge both failed. Attempting agent-assisted resolution \
-                     for {} conflicting file{}: {}{COMMENT_FOOTER}",
-                    conflicting_files.len(),
-                    if conflicting_files.len() == 1 { "" } else { "s" },
-                    conflicting_files
-                        .iter()
-                        .map(|f| format!("`{f}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-                target_dir,
-            )
-            .await;
-        }
+            if let Some(pr_number) = ctx.pr_number {
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format!(
+                        "### Resolving rebase conflicts (round {round})\n\n\
+                         Attempting agent-assisted resolution for {} conflicting file{}: \
+                         {}{COMMENT_FOOTER}",
+                        conflicting_files.len(),
+                        if conflicting_files.len() == 1 { "" } else { "s" },
+                        conflicting_files
+                            .iter()
+                            .map(|f| format!("`{f}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    target_dir,
+                )
+                .await;
+            }
 
-        let conflict_prompt = format!(
-            "You are resolving merge conflicts. The following files have unresolved \
-             merge conflicts (<<<<<<< / ======= / >>>>>>> markers):\n\n{}\n\n\
-             Open each file, find the conflict markers, and resolve them by choosing \
-             the correct code. Remove all conflict markers. Do NOT add new features \
-             or refactor -- just resolve the conflicts so the code compiles and tests pass.\n\n\
-             After resolving, run any test/lint commands if available:\n\
-             - Test: {}\n\
-             - Lint: {}",
-            conflicting_files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
-            ctx.test_command.as_deref().unwrap_or("(none)"),
-            ctx.lint_command.as_deref().unwrap_or("(none)"),
-        );
+            let conflict_prompt = format!(
+                "You are resolving rebase conflicts. The following files have unresolved \
+                 conflict markers (<<<<<<< / ======= / >>>>>>> markers):\n\n{}\n\n\
+                 Open each file, find the conflict markers, and resolve them by choosing \
+                 the correct code. Remove all conflict markers. Do NOT add new features \
+                 or refactor -- just resolve the conflicts so the code compiles and tests pass.\n\n\
+                 After resolving, run any test/lint commands if available:\n\
+                 - Test: {}\n\
+                 - Lint: {}",
+                conflicting_files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+                ctx.test_command.as_deref().unwrap_or("(none)"),
+                ctx.lint_command.as_deref().unwrap_or("(none)"),
+            );
 
-        match self
-            .run_agent(run_id, AgentRole::Implementer, &conflict_prompt, worktree_path, 1)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
+            if let Err(e) = self
+                .run_agent(run_id, AgentRole::Implementer, &conflict_prompt, worktree_path, 1)
+                .await
+            {
                 warn!(run_id = %run_id, error = %e, "conflict resolution agent failed");
-                git::abort_merge(worktree_path).await;
+                git::abort_rebase(worktree_path).await;
                 return Ok(RebaseOutcome::Failed(format!(
                     "agent conflict resolution failed: {e:#}"
                 )));
             }
+
+            // Check if the agent actually resolved the conflicts
+            let remaining = git::conflicting_files(worktree_path).await;
+            if !remaining.is_empty() {
+                warn!(
+                    run_id = %run_id,
+                    remaining = ?remaining,
+                    "agent did not resolve all conflicts"
+                );
+                git::abort_rebase(worktree_path).await;
+                return Ok(RebaseOutcome::Failed(format!(
+                    "agent could not resolve conflicts in: {}",
+                    remaining.join(", ")
+                )));
+            }
+
+            // Stage resolved files and continue the rebase
+            match git::rebase_continue(worktree_path, &conflicting_files).await {
+                Ok(None) => {
+                    info!(run_id = %run_id, "agent resolved rebase conflicts");
+                    return Ok(RebaseOutcome::AgentResolved);
+                }
+                Ok(Some(new_conflicts)) => {
+                    // Next commit in the rebase also has conflicts -- loop
+                    conflicting_files = new_conflicts;
+                }
+                Err(e) => {
+                    git::abort_rebase(worktree_path).await;
+                    return Ok(RebaseOutcome::Failed(format!("rebase --continue failed: {e:#}")));
+                }
+            }
         }
 
-        // Check if conflicts are actually resolved
-        let remaining = git::conflicting_files(worktree_path).await;
-        if remaining.is_empty() {
-            if let Err(e) = git::commit_merge(worktree_path, &conflicting_files).await {
-                git::abort_merge(worktree_path).await;
-                return Ok(RebaseOutcome::Failed(format!("failed to commit resolution: {e:#}")));
-            }
-            info!(run_id = %run_id, "agent resolved merge conflicts");
-            Ok(RebaseOutcome::AgentResolved)
-        } else {
-            warn!(
-                run_id = %run_id,
-                remaining = ?remaining,
-                "agent did not resolve all conflicts"
-            );
-            git::abort_merge(worktree_path).await;
-            Ok(RebaseOutcome::Failed(format!(
-                "agent could not resolve conflicts in: {}",
-                remaining.join(", ")
-            )))
-        }
+        // Exhausted all rounds
+        git::abort_rebase(worktree_path).await;
+        Ok(RebaseOutcome::Failed(format!(
+            "rebase conflicts persisted after {MAX_REBASE_ROUNDS} resolution rounds"
+        )))
     }
 
     async fn run_agent(
@@ -1175,28 +1202,22 @@ fn format_rebase_comment(outcome: &RebaseOutcome) -> String {
         RebaseOutcome::Clean => {
             format!("### Rebase\n\nRebased onto base branch cleanly.{COMMENT_FOOTER}")
         }
-        RebaseOutcome::MergeFallback => {
-            format!(
-                "### Rebase\n\n\
-                 Rebase had conflicts, fell back to a merge commit.{COMMENT_FOOTER}"
-            )
-        }
         RebaseOutcome::AgentResolved => {
             format!(
                 "### Rebase\n\n\
-                 Rebase and merge both had conflicts. Agent resolved them.{COMMENT_FOOTER}"
+                 Rebase had conflicts. Agent resolved them.{COMMENT_FOOTER}"
             )
         }
-        RebaseOutcome::MergeConflicts(_) => {
+        RebaseOutcome::RebaseConflicts(_) => {
             format!(
                 "### Rebase\n\n\
-                 Merge conflicts present (awaiting resolution).{COMMENT_FOOTER}"
+                 Rebase conflicts present (awaiting resolution).{COMMENT_FOOTER}"
             )
         }
         RebaseOutcome::Failed(msg) => {
             format!(
                 "### Rebase failed\n\n\
-                 Could not rebase or merge onto the base branch.\n\n\
+                 Could not rebase onto the base branch.\n\n\
                  **Error:** {msg}{COMMENT_FOOTER}"
             )
         }
@@ -1660,14 +1681,11 @@ mod tests {
         let clean = format_rebase_comment(&RebaseOutcome::Clean);
         assert!(clean.contains("Rebased onto base branch cleanly"));
 
-        let merge = format_rebase_comment(&RebaseOutcome::MergeFallback);
-        assert!(merge.contains("fell back to a merge commit"));
-
         let agent = format_rebase_comment(&RebaseOutcome::AgentResolved);
         assert!(agent.contains("Agent resolved them"));
 
         let conflicts =
-            format_rebase_comment(&RebaseOutcome::MergeConflicts(vec!["foo.rs".into()]));
+            format_rebase_comment(&RebaseOutcome::RebaseConflicts(vec!["foo.rs".into()]));
         assert!(conflicts.contains("awaiting resolution"));
 
         let failed = format_rebase_comment(&RebaseOutcome::Failed("conflict in foo.rs".into()));

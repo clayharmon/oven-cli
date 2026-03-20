@@ -327,15 +327,12 @@ async fn setup_git_repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) 
 /// Build a `TestRunner` where the reviewer returns clean findings (no issues).
 ///
 /// - gh calls: all return success. PR create returns a URL with PR #42.
-/// - claude calls: implementer returns code output, reviewer returns clean
-///   findings. Merger dispatches based on tool list (Bash-only).
+/// - claude calls: implementer returns code output, reviewer returns clean findings.
 fn test_runner_clean_review() -> TestRunner {
     TestRunner {
         claude_handler: Box::new(|_prompt, tools, _dir| {
             let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
-            let output = if tool_list == ["Bash"] {
-                "PR marked as ready for review.".to_string()
-            } else if tool_list == ["Read", "Glob", "Grep"] {
+            let output = if tool_list == ["Read", "Glob", "Grep"] {
                 r#"{"findings":[],"summary":"all clean, no issues found"}"#.to_string()
             } else {
                 "Implementation complete. All tests pass.".to_string()
@@ -418,16 +415,11 @@ async fn e2e_pipeline_clean_review_completes() {
     // Verify agent runs were recorded
     let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, &run.id).unwrap();
     drop(conn);
-    assert_eq!(
-        agent_runs.len(),
-        2,
-        "should have implementer + reviewer (no merger in manual mode)"
-    );
+    assert_eq!(agent_runs.len(), 2, "should have implementer + reviewer");
 
     let agents: Vec<&str> = agent_runs.iter().map(|ar| ar.agent.as_str()).collect();
     assert!(agents.contains(&"implementer"));
     assert!(agents.contains(&"reviewer"));
-    assert!(!agents.contains(&"merger"), "merger must not run when auto_merge is false");
 
     // All agent runs should be complete
     for ar in &agent_runs {
@@ -509,9 +501,9 @@ async fn e2e_pipeline_with_one_fix_cycle() {
     let run = &runs[0];
     assert_eq!(run.status, RunStatus::Complete);
 
-    // Should have: implementer, reviewer (findings), fixer, reviewer (clean) -- no merger in manual mode
+    // Should have: implementer, reviewer (findings), fixer, reviewer (clean)
     let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, &run.id).unwrap();
-    assert_eq!(agent_runs.len(), 4, "should have 4 agent runs for one fix cycle (no merger)");
+    assert_eq!(agent_runs.len(), 4, "should have 4 agent runs for one fix cycle");
 
     let agents: Vec<&str> = agent_runs.iter().map(|ar| ar.agent.as_str()).collect();
     assert_eq!(agents, vec!["implementer", "reviewer", "fixer", "reviewer"]);
@@ -1271,45 +1263,38 @@ async fn e2e_local_issue_with_target_repo() {
 // Merger gate tests
 // -------------------------------------------------------------------------
 
-// IMPORTANT: Never change or weaken these assertions. The merger agent must
-// ONLY run when auto_merge is explicitly enabled (-m flag). Running the merger
-// in manual mode wastes API cost and risks unintended merges. If you're here
-// because a test broke, the fix is in the pipeline executor, not here.
+// IMPORTANT: Never change or weaken these assertions. The merge step must
+// ONLY run when auto_merge is explicitly enabled (-m flag). Merging
+// in manual mode risks unintended merges. If you're here because a test
+// broke, the fix is in the pipeline executor, not here.
 
 #[tokio::test]
-async fn merger_never_runs_in_manual_mode() {
+async fn manual_mode_does_not_merge_pr() {
     let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
     let repo_dir = work_dir.path().to_path_buf();
 
-    let agents_called = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let agents_called_clone = Arc::clone(&agents_called);
+    let gh_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let gh_calls_clone = Arc::clone(&gh_calls);
 
     let runner = Arc::new(TestRunner {
-        claude_handler: Box::new(move |_prompt, tools, _dir| {
-            // Merger gets ["Bash"] only; implementer/fixer get ["Read","Write",...,"Bash"]
-            let role = if tools.len() == 1 && tools[0] == "Bash" {
-                "merger"
-            } else if tools.iter().any(|t| t == "Write") {
-                "implementer_or_fixer"
+        claude_handler: Box::new(|_prompt, tools, _dir| {
+            let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let output = if tool_list == ["Read", "Glob", "Grep"] {
+                r#"{"findings":[],"summary":"clean"}"#.to_string()
             } else {
-                "reviewer"
+                "Done.".to_string()
             };
-            agents_called_clone.lock().unwrap().push(role.to_string());
-
             AgentResult {
                 cost_usd: 1.00,
                 duration: Duration::from_secs(5),
                 turns: 3,
-                output: if role == "reviewer" {
-                    r#"{"findings":[],"summary":"clean"}"#.to_string()
-                } else {
-                    "Done.".to_string()
-                },
+                output,
                 session_id: "sess-manual".to_string(),
                 success: true,
             }
         }),
-        gh_handler: Box::new(|args, _dir| {
+        gh_handler: Box::new(move |args, _dir| {
+            gh_calls_clone.lock().unwrap().push(args.to_vec());
             let stdout = if args.get(1).map(String::as_str) == Some("create") {
                 "https://github.com/test/repo/pull/99\n".to_string()
             } else {
@@ -1333,24 +1318,42 @@ async fn merger_never_runs_in_manual_mode() {
         repo_dir,
     });
 
-    let issue = make_github_issue(50, "Manual mode test", "Should not invoke merger.");
+    let issue = make_github_issue(50, "Manual mode test", "Should not merge PR.");
 
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline failed: {result:?}");
 
-    assert!(
-        !agents_called.lock().unwrap().contains(&"merger".to_string()),
-        "merger must never be invoked in manual mode (auto_merge=false), but was called"
-    );
+    let merge_called = gh_calls.lock().unwrap().iter().any(|args| {
+        args.first().map(String::as_str) == Some("pr")
+            && args.get(1).map(String::as_str) == Some("merge")
+    });
+    assert!(!merge_called, "gh pr merge must not be called in manual mode (auto_merge=false)");
 }
 
 #[tokio::test]
-async fn merger_runs_when_auto_merge_enabled() {
+async fn auto_merge_calls_gh_pr_merge() {
     let (work_dir, _bare_dir) = setup_git_repo_with_remote().await;
     let repo_dir = work_dir.path().to_path_buf();
 
+    let gh_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let gh_calls_clone = Arc::clone(&gh_calls);
+
     let runner = Arc::new(test_runner_clean_review());
-    let github = Arc::new(GhClient::new(test_runner_clean_review(), &repo_dir));
+
+    let gh_runner = TestRunner {
+        claude_handler: Box::new(|_, _, _| unreachable!()),
+        gh_handler: Box::new(move |args, _dir| {
+            gh_calls_clone.lock().unwrap().push(args.to_vec());
+            let stdout = if args.get(1).map(String::as_str) == Some("create") {
+                "https://github.com/test/repo/pull/42\n".to_string()
+            } else {
+                String::new()
+            };
+            CommandOutput { stdout, stderr: String::new(), success: true }
+        }),
+    };
+
+    let github = Arc::new(GhClient::new(gh_runner, &repo_dir));
     let issues = make_github_provider(&github);
     let db = Arc::new(Mutex::new(db::open_in_memory().unwrap()));
 
@@ -1364,21 +1367,27 @@ async fn merger_runs_when_auto_merge_enabled() {
         repo_dir,
     });
 
-    let issue = make_github_issue(51, "Auto merge test", "Should invoke merger.");
+    let issue = make_github_issue(51, "Auto merge test", "Should call gh pr merge.");
 
     let result = executor.run_issue(&issue, true).await;
     assert!(result.is_ok(), "pipeline failed: {result:?}");
 
-    let conn = db.lock().await;
-    let runs = db::runs::get_all_runs(&conn).unwrap();
-    let agent_runs = db::agent_runs::get_agent_runs_for_run(&conn, &runs[0].id).unwrap();
-    drop(conn);
-
-    let agents: Vec<&str> = agent_runs.iter().map(|ar| ar.agent.as_str()).collect();
+    let calls = gh_calls.lock().unwrap();
+    let merge_called = calls.iter().any(|args| {
+        args.first().map(String::as_str) == Some("pr")
+            && args.get(1).map(String::as_str) == Some("merge")
+    });
     assert!(
-        agents.contains(&"merger"),
-        "merger must run when auto_merge=true, but agents were: {agents:?}"
+        merge_called,
+        "gh pr merge must be called when auto_merge=true, but gh calls were: {calls:?}"
     );
+
+    let issue_closed = calls.iter().any(|args| {
+        args.first().map(String::as_str) == Some("issue")
+            && args.get(1).map(String::as_str) == Some("close")
+    });
+    drop(calls);
+    assert!(issue_closed, "gh issue close must be called when auto_merge=true for GitHub issues");
 }
 
 // -- Dependency Graph integration tests --
@@ -1739,10 +1748,7 @@ fn test_runner_with_dispute() -> TestRunner {
     TestRunner {
         claude_handler: Box::new(move |prompt, tools, _dir| {
             let tool_list: Vec<&str> = tools.iter().map(String::as_str).collect();
-            let output = if tool_list == ["Bash"] {
-                // Merger
-                "Merged.".to_string()
-            } else if tool_list == ["Read", "Glob", "Grep"] {
+            let output = if tool_list == ["Read", "Glob", "Grep"] {
                 // Reviewer
                 let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {

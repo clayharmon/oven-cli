@@ -161,51 +161,41 @@ pub async fn rebase_on_base(repo_dir: &Path, base_branch: &str) -> Result<()> {
     anyhow::bail!("merge conflicts with {base_branch} that could not be automatically resolved")
 }
 
-/// Outcome of a rebase attempt with fallbacks.
+/// Outcome of a rebase attempt.
 #[derive(Debug)]
 pub enum RebaseOutcome {
     /// Rebase succeeded cleanly.
     Clean,
-    /// Rebase had conflicts, fell back to a merge commit.
-    MergeFallback,
-    /// Both rebase and merge failed. The working tree has unresolved merge
-    /// conflicts -- the caller can attempt agent-assisted resolution before
-    /// calling [`abort_merge`] or committing.
-    MergeConflicts(Vec<String>),
-    /// Agent resolved the merge conflicts after both rebase and merge failed.
+    /// Rebase had conflicts. The working tree is left in a mid-rebase state
+    /// so the caller can attempt agent-assisted resolution via
+    /// [`rebase_continue`] / [`abort_rebase`].
+    RebaseConflicts(Vec<String>),
+    /// Agent resolved the rebase conflicts.
     AgentResolved,
     /// Unrecoverable failure (e.g. fetch failed).
     Failed(String),
 }
 
-/// Rebase the current branch onto the latest `origin/<base_branch>` with fallbacks.
+/// Start a rebase of the current branch onto the latest `origin/<base_branch>`.
 ///
-/// Tries rebase first. If that fails (merge conflicts), falls back to a merge
-/// commit. If both fail, returns `MergeConflicts` with the list of conflicting
-/// files -- the working tree is left in a conflicted state so the caller can
-/// attempt agent-assisted resolution.
-pub async fn rebase_with_fallbacks(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
+/// If the rebase succeeds cleanly, returns `Clean`. If it hits conflicts, the
+/// working tree is left in a mid-rebase state and `RebaseConflicts` is returned
+/// with the list of conflicting files. The caller should resolve them and call
+/// [`rebase_continue`], or [`abort_rebase`] to give up.
+pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
     if let Err(e) = run_git(repo_dir, &["fetch", "origin", base_branch]).await {
         return RebaseOutcome::Failed(format!("failed to fetch {base_branch}: {e}"));
     }
 
     let target = format!("origin/{base_branch}");
 
-    // Try 1: rebase
     if run_git(repo_dir, &["rebase", &target]).await.is_ok() {
         return RebaseOutcome::Clean;
     }
-    let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
 
-    // Try 2: merge
-    if run_git(repo_dir, &["merge", &target, "--no-edit"]).await.is_ok() {
-        return RebaseOutcome::MergeFallback;
-    }
-
-    // Merge failed with conflicts -- leave the tree in conflict state so the
-    // caller can attempt agent resolution. List the conflicting files.
+    // Rebase stopped with conflicts -- leave the tree in mid-rebase state.
     let conflicting = conflicting_files(repo_dir).await;
-    RebaseOutcome::MergeConflicts(conflicting)
+    RebaseOutcome::RebaseConflicts(conflicting)
 }
 
 /// List files with unresolved merge conflicts.
@@ -215,22 +205,34 @@ pub async fn conflicting_files(repo_dir: &Path) -> Vec<String> {
         .map_or_else(|_| vec![], |output| output.lines().map(String::from).collect())
 }
 
-/// Abort an in-progress merge.
-pub async fn abort_merge(repo_dir: &Path) {
-    let _ = run_git(repo_dir, &["merge", "--abort"]).await;
+/// Abort an in-progress rebase.
+pub async fn abort_rebase(repo_dir: &Path) {
+    let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
 }
 
-/// Stage resolved conflict files and commit (used after agent conflict resolution).
+/// Stage resolved conflict files and continue the in-progress rebase.
 ///
-/// Only stages files that git considers part of the merge (previously conflicting),
-/// rather than `git add -A` which could accidentally stage untracked files the
-/// agent left behind.
-pub async fn commit_merge(repo_dir: &Path, conflicting: &[String]) -> Result<()> {
+/// Returns `Ok(None)` if the rebase completed successfully after continuing.
+/// Returns `Ok(Some(files))` if continuing hit new conflicts on the next commit.
+/// Returns `Err` on unexpected failures.
+pub async fn rebase_continue(
+    repo_dir: &Path,
+    conflicting: &[String],
+) -> Result<Option<Vec<String>>> {
     for file in conflicting {
         run_git(repo_dir, &["add", file]).await.with_context(|| format!("staging {file}"))?;
     }
-    run_git(repo_dir, &["commit", "--no-edit"]).await.context("committing merge resolution")?;
-    Ok(())
+
+    if run_git(repo_dir, &["rebase", "--continue"]).await.is_ok() {
+        return Ok(None);
+    }
+
+    // rebase --continue stopped again -- new conflicts on the next commit.
+    let new_conflicts = conflicting_files(repo_dir).await;
+    if new_conflicts.is_empty() {
+        anyhow::bail!("rebase --continue failed but no conflicting files found");
+    }
+    Ok(Some(new_conflicts))
 }
 
 /// Get the default branch name (main or master).
@@ -494,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebase_with_fallbacks_clean() {
+    async fn start_rebase_clean() {
         let dir = init_temp_repo().await;
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
 
@@ -513,14 +515,14 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = rebase_with_fallbacks(dir.path(), &branch).await;
+        let outcome = start_rebase(dir.path(), &branch).await;
         assert!(matches!(outcome, RebaseOutcome::Clean));
         assert!(dir.path().join("feature.txt").exists());
         assert!(dir.path().join("base.txt").exists());
     }
 
     #[tokio::test]
-    async fn rebase_with_fallbacks_merge_fallback() {
+    async fn start_rebase_conflicts() {
         let dir = init_temp_repo().await;
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
 
@@ -541,21 +543,64 @@ mod tests {
             .await
             .unwrap();
 
-        // Rebase will conflict, but merge should succeed (git merge auto-resolves
-        // content conflicts differently than rebase in some cases). If both fail,
-        // MergeConflicts is returned with the conflicting files.
-        let outcome = rebase_with_fallbacks(dir.path(), &branch).await;
+        let outcome = start_rebase(dir.path(), &branch).await;
         assert!(
-            matches!(outcome, RebaseOutcome::MergeFallback | RebaseOutcome::MergeConflicts(_)),
-            "expected MergeFallback or MergeConflicts, got {outcome:?}"
+            matches!(outcome, RebaseOutcome::RebaseConflicts(_)),
+            "expected RebaseConflicts, got {outcome:?}"
         );
+
+        // Tree should be in mid-rebase state
+        assert!(
+            dir.path().join(".git/rebase-merge").exists()
+                || dir.path().join(".git/rebase-apply").exists()
+        );
+
+        // Clean up
+        abort_rebase(dir.path()).await;
     }
 
     #[tokio::test]
-    async fn rebase_with_fallbacks_no_remote_fails() {
+    async fn start_rebase_no_remote_fails() {
         let dir = init_temp_repo().await;
         // No remote configured, so fetch will fail
-        let outcome = rebase_with_fallbacks(dir.path(), "main").await;
+        let outcome = start_rebase(dir.path(), "main").await;
         assert!(matches!(outcome, RebaseOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn rebase_continue_resolves_conflict() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "feature version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "base version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let outcome = start_rebase(dir.path(), &branch).await;
+        let files = match outcome {
+            RebaseOutcome::RebaseConflicts(f) => f,
+            other => panic!("expected RebaseConflicts, got {other:?}"),
+        };
+
+        // Manually resolve the conflict
+        tokio::fs::write(dir.path().join("README.md"), "resolved version").await.unwrap();
+
+        let result = rebase_continue(dir.path(), &files).await.unwrap();
+        assert!(result.is_none(), "expected rebase to complete, got more conflicts");
+
+        // Verify rebase completed (no rebase-merge dir)
+        assert!(!dir.path().join(".git/rebase-merge").exists());
+        assert!(!dir.path().join(".git/rebase-apply").exists());
     }
 }
