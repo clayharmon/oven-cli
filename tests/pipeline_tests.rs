@@ -48,6 +48,7 @@ impl CommandRunner for TestRunner {
         allowed_tools: &[String],
         working_dir: &Path,
         _max_turns: Option<u32>,
+        _model: Option<String>,
     ) -> Result<AgentResult> {
         Ok((self.claude_handler)(prompt, allowed_tools, working_dir))
     }

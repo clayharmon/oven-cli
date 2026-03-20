@@ -96,6 +96,7 @@ pub struct AgentInvocation {
     pub prompt: String,
     pub working_dir: PathBuf,
     pub max_turns: Option<u32>,
+    pub model: Option<String>,
 }
 
 /// Invoke an agent via the command runner.
@@ -109,6 +110,7 @@ pub async fn invoke_agent<R: CommandRunner>(
             &invocation.role.tools_as_strings(),
             &invocation.working_dir,
             invocation.max_turns,
+            invocation.model.clone(),
         )
         .await
 }
