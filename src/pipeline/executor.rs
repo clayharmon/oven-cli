@@ -677,8 +677,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 drop(conn);
             }
         } else {
-            self.process_fixer_disputes(run_id, &actionable, &fixer_output).await?;
-            self.process_fixer_addressed(run_id, &actionable, &fixer_output).await?;
+            self.process_fixer_results(run_id, &actionable, &fixer_output).await?;
         }
 
         // Post fix comment on PR
@@ -695,24 +694,26 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(())
     }
 
-    /// Process fixer disputes by marking corresponding review findings as resolved.
+    /// Process all fixer results (disputes + addressed) in a single lock acquisition.
     ///
     /// The fixer references findings by 1-indexed position in the list it received.
-    /// We map those back to the actual `ReviewFinding` IDs and mark them resolved
-    /// with the fixer's dispute reason.
-    async fn process_fixer_disputes(
+    /// We map those back to the actual `ReviewFinding` IDs and mark them resolved.
+    /// Disputed findings store the fixer's reason directly; addressed findings get
+    /// an `ADDRESSED: ` prefix so we can distinguish them when building the next
+    /// reviewer prompt.
+    async fn process_fixer_results(
         &self,
         run_id: &str,
         findings_sent_to_fixer: &[ReviewFinding],
         fixer_output: &agents::FixerOutput,
     ) -> Result<()> {
-        if fixer_output.disputed.is_empty() {
+        if fixer_output.disputed.is_empty() && fixer_output.addressed.is_empty() {
             return Ok(());
         }
 
         let conn = self.db.lock().await;
+
         for dispute in &fixer_output.disputed {
-            // finding numbers are 1-indexed
             let idx = dispute.finding.saturating_sub(1) as usize;
             if let Some(finding) = findings_sent_to_fixer.get(idx) {
                 db::agent_runs::resolve_finding(&conn, finding.id, &dispute.reason)?;
@@ -724,26 +725,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 );
             }
         }
-        drop(conn);
-        Ok(())
-    }
 
-    /// Process fixer addressed actions by marking corresponding review findings as resolved.
-    ///
-    /// Similar to `process_fixer_disputes`, but for findings the fixer actually fixed.
-    /// Stores the action with an `ADDRESSED: ` prefix so we can distinguish addressed
-    /// findings from disputed ones when building the next reviewer prompt.
-    async fn process_fixer_addressed(
-        &self,
-        run_id: &str,
-        findings_sent_to_fixer: &[ReviewFinding],
-        fixer_output: &agents::FixerOutput,
-    ) -> Result<()> {
-        if fixer_output.addressed.is_empty() {
-            return Ok(());
-        }
-
-        let conn = self.db.lock().await;
         for action in &fixer_output.addressed {
             let idx = action.finding.saturating_sub(1) as usize;
             if let Some(finding) = findings_sent_to_fixer.get(idx) {
@@ -757,6 +739,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 );
             }
         }
+
         drop(conn);
         Ok(())
     }
@@ -766,10 +749,8 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     /// Non-actionable findings are auto-resolved in the DB so they don't accumulate
     /// as zombie findings across cycles.
     async fn filter_actionable_findings(&self, run_id: &str) -> Result<Vec<ReviewFinding>> {
-        let unresolved = {
-            let conn = self.db.lock().await;
-            db::agent_runs::get_unresolved_findings(&conn, run_id)?
-        };
+        let conn = self.db.lock().await;
+        let unresolved = db::agent_runs::get_unresolved_findings(&conn, run_id)?;
 
         let (actionable, non_actionable): (Vec<_>, Vec<_>) =
             unresolved.into_iter().partition(|f| f.file_path.is_some());
@@ -780,7 +761,6 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 count = non_actionable.len(),
                 "auto-resolving non-actionable findings (no file_path)"
             );
-            let conn = self.db.lock().await;
             for f in &non_actionable {
                 db::agent_runs::resolve_finding(
                     &conn,
@@ -788,9 +768,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     "ADDRESSED: auto-resolved -- finding has no file path, not actionable by fixer",
                 )?;
             }
-            drop(conn);
         }
 
+        drop(conn);
         Ok(actionable)
     }
 
