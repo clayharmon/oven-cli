@@ -143,24 +143,6 @@ pub async fn force_push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rebase the current branch onto the latest `origin/<base_branch>`.
-///
-/// Fetches the base branch first, then attempts a rebase. If the rebase fails
-/// (merge conflicts), it aborts the rebase and returns an error.
-pub async fn rebase_on_base(repo_dir: &Path, base_branch: &str) -> Result<()> {
-    run_git(repo_dir, &["fetch", "origin", base_branch])
-        .await
-        .context("fetching base branch before rebase")?;
-
-    let target = format!("origin/{base_branch}");
-    if run_git(repo_dir, &["rebase", &target]).await.is_ok() {
-        return Ok(());
-    }
-
-    let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
-    anyhow::bail!("merge conflicts with {base_branch} that could not be automatically resolved")
-}
-
 /// Outcome of a rebase attempt.
 #[derive(Debug)]
 pub enum RebaseOutcome {
@@ -189,7 +171,8 @@ pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
 
     let target = format!("origin/{base_branch}");
 
-    if run_git(repo_dir, &["rebase", &target]).await.is_ok() {
+    let no_editor = [("GIT_EDITOR", "true")];
+    if run_git_with_env(repo_dir, &["rebase", &target], &no_editor).await.is_ok() {
         return RebaseOutcome::Clean;
     }
 
@@ -220,10 +203,11 @@ pub async fn rebase_continue(
     conflicting: &[String],
 ) -> Result<Option<Vec<String>>> {
     for file in conflicting {
-        run_git(repo_dir, &["add", file]).await.with_context(|| format!("staging {file}"))?;
+        run_git(repo_dir, &["add", "--", file]).await.with_context(|| format!("staging {file}"))?;
     }
 
-    if run_git(repo_dir, &["rebase", "--continue"]).await.is_ok() {
+    let no_editor = [("GIT_EDITOR", "true")];
+    if run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await.is_ok() {
         return Ok(None);
     }
 
@@ -281,13 +265,16 @@ pub async fn changed_files_since(repo_dir: &Path, since_ref: &str) -> Result<Vec
 }
 
 async fn run_git(repo_dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("spawning git")?;
+    run_git_with_env(repo_dir, args, &[]).await
+}
+
+async fn run_git_with_env(repo_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_dir).kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().await.context("spawning git")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -391,74 +378,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = list_worktrees(dir.path()).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn rebase_on_base_clean() {
-        let dir = init_temp_repo().await;
-        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
-
-        // Create a feature branch with a non-conflicting change
-        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
-        tokio::fs::write(dir.path().join("feature.txt"), "feature work").await.unwrap();
-        run_git(dir.path(), &["add", "."]).await.unwrap();
-        run_git(dir.path(), &["commit", "-m", "feature commit"]).await.unwrap();
-
-        // Add a non-conflicting commit on the base branch
-        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
-        tokio::fs::write(dir.path().join("base.txt"), "base work").await.unwrap();
-        run_git(dir.path(), &["add", "."]).await.unwrap();
-        run_git(dir.path(), &["commit", "-m", "base commit"]).await.unwrap();
-
-        // Go back to feature branch and rebase
-        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
-
-        // rebase_on_base fetches from origin, so we need a remote.
-        // Use the repo itself as origin for testing.
-        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
-            .await
-            .unwrap();
-
-        let result = rebase_on_base(dir.path(), &branch).await;
-        assert!(result.is_ok());
-
-        // Verify both files exist after rebase
-        assert!(dir.path().join("feature.txt").exists());
-        assert!(dir.path().join("base.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn rebase_on_base_conflict_aborts() {
-        let dir = init_temp_repo().await;
-        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
-
-        // Create a feature branch with a conflicting change to README.md
-        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
-        tokio::fs::write(dir.path().join("README.md"), "feature version").await.unwrap();
-        run_git(dir.path(), &["add", "."]).await.unwrap();
-        run_git(dir.path(), &["commit", "-m", "feature conflict"]).await.unwrap();
-
-        // Add a conflicting commit on the base branch
-        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
-        tokio::fs::write(dir.path().join("README.md"), "base version").await.unwrap();
-        run_git(dir.path(), &["add", "."]).await.unwrap();
-        run_git(dir.path(), &["commit", "-m", "base conflict"]).await.unwrap();
-
-        // Go back to feature and set up origin
-        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
-        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
-            .await
-            .unwrap();
-
-        let result = rebase_on_base(dir.path(), &branch).await;
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("merge conflicts"),
-            "error should mention merge conflicts"
-        );
-
-        // Verify rebase was aborted (no .git/rebase-merge directory)
-        assert!(!dir.path().join(".git/rebase-merge").exists());
     }
 
     #[tokio::test]
