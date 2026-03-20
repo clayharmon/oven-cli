@@ -257,6 +257,27 @@ pub async fn default_branch(repo_dir: &Path) -> Result<String> {
     Ok(output)
 }
 
+/// Get the current HEAD commit SHA.
+pub async fn head_sha(repo_dir: &Path) -> Result<String> {
+    run_git(repo_dir, &["rev-parse", "HEAD"]).await.context("getting HEAD sha")
+}
+
+/// Count commits between a ref and HEAD.
+pub async fn commit_count_since(repo_dir: &Path, since_ref: &str) -> Result<u32> {
+    let output = run_git(repo_dir, &["rev-list", "--count", &format!("{since_ref}..HEAD")])
+        .await
+        .context("counting commits since ref")?;
+    output.parse::<u32>().context("parsing commit count")
+}
+
+/// List files changed between a ref and HEAD.
+pub async fn changed_files_since(repo_dir: &Path, since_ref: &str) -> Result<Vec<String>> {
+    let output = run_git(repo_dir, &["diff", "--name-only", since_ref, "HEAD"])
+        .await
+        .context("listing changed files since ref")?;
+    Ok(output.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
 async fn run_git(repo_dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
