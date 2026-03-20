@@ -880,6 +880,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         };
 
         for round in 1..=MAX_REBASE_ROUNDS {
+            self.check_cancelled()?;
             info!(
                 run_id = %run_id,
                 round,
