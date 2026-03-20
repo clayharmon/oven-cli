@@ -1,6 +1,5 @@
 pub mod fixer;
 pub mod implementer;
-pub mod merger;
 pub mod planner;
 pub mod reviewer;
 
@@ -11,14 +10,13 @@ use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{db::ReviewFinding, process::CommandRunner};
 
-/// The five agent roles in the pipeline.
+/// The four agent roles in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentRole {
     Planner,
     Implementer,
     Reviewer,
     Fixer,
-    Merger,
 }
 
 impl AgentRole {
@@ -26,7 +24,6 @@ impl AgentRole {
         match self {
             Self::Planner | Self::Reviewer => &["Read", "Glob", "Grep"],
             Self::Implementer | Self::Fixer => &["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-            Self::Merger => &["Bash"],
         }
     }
 
@@ -36,7 +33,6 @@ impl AgentRole {
             Self::Implementer => "implementer",
             Self::Reviewer => "reviewer",
             Self::Fixer => "fixer",
-            Self::Merger => "merger",
         }
     }
 
@@ -60,7 +56,6 @@ impl std::str::FromStr for AgentRole {
             "implementer" => Ok(Self::Implementer),
             "reviewer" => Ok(Self::Reviewer),
             "fixer" => Ok(Self::Fixer),
-            "merger" => Ok(Self::Merger),
             other => anyhow::bail!("unknown agent role: {other}"),
         }
     }
@@ -79,14 +74,11 @@ pub struct AgentContext {
     pub review_findings: Option<Vec<ReviewFinding>>,
     pub cycle: u32,
     /// When set, indicates this is a multi-repo pipeline where the PR lives in a
-    /// different repo than the issue. The merger should skip closing the issue
-    /// (the executor handles it).
+    /// different repo than the issue.
     pub target_repo: Option<String>,
-    /// Issue source: "github" or "local". The merger skips `gh issue close`
-    /// for local issues since they're not on GitHub.
+    /// Issue source: "github" or "local".
     pub issue_source: String,
-    /// The default branch name (e.g. "main" or "master"). Used by the merger
-    /// to diff against the correct base.
+    /// The default branch name (e.g. "main" or "master").
     pub base_branch: String,
 }
 
@@ -415,17 +407,12 @@ mod tests {
 
     use super::*;
 
-    const ALL_ROLES: [AgentRole; 5] = [
-        AgentRole::Planner,
-        AgentRole::Implementer,
-        AgentRole::Reviewer,
-        AgentRole::Fixer,
-        AgentRole::Merger,
-    ];
+    const ALL_ROLES: [AgentRole; 4] =
+        [AgentRole::Planner, AgentRole::Implementer, AgentRole::Reviewer, AgentRole::Fixer];
 
     proptest! {
         #[test]
-        fn agent_role_display_fromstr_roundtrip(idx in 0..5usize) {
+        fn agent_role_display_fromstr_roundtrip(idx in 0..4usize) {
             let role = ALL_ROLES[idx];
             let s = role.to_string();
             let parsed: AgentRole = s.parse().unwrap();
@@ -492,18 +479,12 @@ mod tests {
             AgentRole::Fixer.allowed_tools(),
             &["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
         );
-        assert_eq!(AgentRole::Merger.allowed_tools(), &["Bash"]);
     }
 
     #[test]
     fn role_display_roundtrip() {
-        let roles = [
-            AgentRole::Planner,
-            AgentRole::Implementer,
-            AgentRole::Reviewer,
-            AgentRole::Fixer,
-            AgentRole::Merger,
-        ];
+        let roles =
+            [AgentRole::Planner, AgentRole::Implementer, AgentRole::Reviewer, AgentRole::Fixer];
         for role in roles {
             let s = role.to_string();
             let parsed: AgentRole = s.parse().unwrap();

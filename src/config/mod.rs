@@ -52,7 +52,6 @@ pub struct ModelConfig {
     pub implementer: Option<String>,
     pub reviewer: Option<String>,
     pub fixer: Option<String>,
-    pub merger: Option<String>,
 }
 
 impl ModelConfig {
@@ -64,7 +63,6 @@ impl ModelConfig {
             "implementer" => self.implementer.as_deref(),
             "reviewer" => self.reviewer.as_deref(),
             "fixer" => self.fixer.as_deref(),
-            "merger" => self.merger.as_deref(),
             _ => None,
         };
         agent_override.or(self.default.as_deref())
@@ -170,7 +168,6 @@ struct RawModelConfig {
     implementer: Option<String>,
     reviewer: Option<String>,
     fixer: Option<String>,
-    merger: Option<String>,
 }
 
 impl Config {
@@ -382,9 +379,6 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
         }
         if models.fixer.is_some() {
             config.models.fixer.clone_from(&models.fixer);
-        }
-        if models.merger.is_some() {
-            config.models.merger.clone_from(&models.merger);
         }
     }
 
@@ -798,7 +792,6 @@ fixer = "opus"
         assert_eq!(config.models.fixer.as_deref(), Some("opus"));
         assert!(config.models.planner.is_none());
         assert!(config.models.reviewer.is_none());
-        assert!(config.models.merger.is_none());
     }
 
     #[test]

@@ -308,9 +308,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     )
                     .await?;
 
-                // Close the issue when the merger can't do it:
-                // - Local issues: merger can't use `gh issue close`
-                // - Multi-repo: merger runs in target repo, can't close god-repo issue
+                // Close the issue for local and multi-repo cases. Single-repo
+                // GitHub issues are closed directly in the merge step (run_steps)
+                // because they share the same gh context.
                 let should_close =
                     issue.source == IssueOrigin::Local || issue.target_repo.is_some();
 
@@ -426,15 +426,26 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // 4. Merge (only when auto-merge is enabled)
         if auto_merge {
             self.check_cancelled()?;
-            ctx.pr_number.context("no PR number for merge step")?;
+            let pr_number = ctx.pr_number.context("no PR number for merge step")?;
             self.update_status(run_id, RunStatus::Merging).await?;
-            let merge_prompt = agents::merger::build_prompt(ctx, auto_merge)?;
-            self.run_agent(run_id, AgentRole::Merger, &merge_prompt, worktree_path, 1).await?;
 
-            if let Some(pr_number) = ctx.pr_number {
-                github::safe_comment(&self.github, pr_number, &format_merge_comment(), target_dir)
-                    .await;
+            self.github.merge_pr_in(pr_number, target_dir).await?;
+            info!(run_id = %run_id, pr = pr_number, "PR merged");
+
+            // Close the issue for single-repo GitHub issues. Multi-repo and local
+            // issues are closed by finalize_run instead (different repo context).
+            if ctx.target_repo.is_none() && ctx.issue_source == "github" {
+                if let Err(e) = self
+                    .github
+                    .close_issue(ctx.issue_number, Some(&format!("Implemented in #{pr_number}")))
+                    .await
+                {
+                    warn!(run_id = %run_id, error = %e, "failed to close issue after merge");
+                }
             }
+
+            github::safe_comment(&self.github, pr_number, &format_merge_comment(), target_dir)
+                .await;
         } else if let Some(pr_number) = ctx.pr_number {
             github::safe_comment(&self.github, pr_number, &format_ready_comment(), target_dir)
                 .await;

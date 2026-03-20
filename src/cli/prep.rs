@@ -11,7 +11,6 @@ const AGENT_PROMPTS: &[(&str, &str)] = &[
     ("reviewer.md", include_str!("../../templates/reviewer.txt")),
     ("fixer.md", include_str!("../../templates/fixer.txt")),
     ("planner.md", include_str!("../../templates/planner.txt")),
-    ("merger.md", include_str!("../../templates/merger.txt")),
 ];
 
 /// Embedded skill templates for scaffolding into .claude/skills/<name>/SKILL.md.
@@ -201,7 +200,7 @@ mod tests {
 
     #[test]
     fn agent_prompts_are_embedded() {
-        assert_eq!(AGENT_PROMPTS.len(), 5);
+        assert_eq!(AGENT_PROMPTS.len(), 4);
         for (name, content) in AGENT_PROMPTS {
             assert!(!name.is_empty());
             assert!(!content.is_empty());
