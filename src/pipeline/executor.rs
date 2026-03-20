@@ -428,7 +428,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             let pr_number = ctx.pr_number.context("no PR number for merge step")?;
             self.update_status(run_id, RunStatus::Merging).await?;
 
-            self.github.merge_pr_in(pr_number, target_dir).await?;
+            self.github
+                .merge_pr_in(pr_number, &self.config.pipeline.merge_strategy, target_dir)
+                .await?;
             info!(run_id = %run_id, pr = pr_number, "PR merged");
 
             // Close the issue for single-repo GitHub issues. Multi-repo and local

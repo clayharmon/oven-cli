@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use super::{GhClient, PrState};
-use crate::process::CommandRunner;
+use crate::{config::MergeStrategy, process::CommandRunner};
 
 impl<R: CommandRunner> GhClient<R> {
     /// Create a draft pull request and return its number.
@@ -137,16 +137,27 @@ impl<R: CommandRunner> GhClient<R> {
     }
 
     /// Merge a pull request (in the default repo).
-    pub async fn merge_pr(&self, pr_number: u32) -> Result<()> {
-        self.merge_pr_in(pr_number, &self.repo_dir).await
+    pub async fn merge_pr(&self, pr_number: u32, strategy: &MergeStrategy) -> Result<()> {
+        self.merge_pr_in(pr_number, strategy, &self.repo_dir).await
     }
 
     /// Merge a pull request in a specific repo directory.
-    pub async fn merge_pr_in(&self, pr_number: u32, repo_dir: &Path) -> Result<()> {
+    pub async fn merge_pr_in(
+        &self,
+        pr_number: u32,
+        strategy: &MergeStrategy,
+        repo_dir: &Path,
+    ) -> Result<()> {
         let output = self
             .runner
             .run_gh(
-                &Self::s(&["pr", "merge", &pr_number.to_string(), "--squash", "--delete-branch"]),
+                &Self::s(&[
+                    "pr",
+                    "merge",
+                    &pr_number.to_string(),
+                    strategy.gh_flag(),
+                    "--delete-branch",
+                ]),
                 repo_dir,
             )
             .await
@@ -161,6 +172,7 @@ mod tests {
     use std::path::Path;
 
     use crate::{
+        config::MergeStrategy,
         github::GhClient,
         process::{CommandOutput, MockCommandRunner},
     };
@@ -269,7 +281,7 @@ mod tests {
         });
 
         let client = GhClient::new(mock, Path::new("/tmp"));
-        let result = client.merge_pr(42).await;
+        let result = client.merge_pr(42, &MergeStrategy::Squash).await;
         assert!(result.is_ok());
     }
 
@@ -359,7 +371,7 @@ mod tests {
         });
 
         let client = GhClient::new(mock, Path::new("/tmp"));
-        let result = client.merge_pr(42).await;
+        let result = client.merge_pr(42, &MergeStrategy::Squash).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("merge conflict"));
     }
@@ -424,7 +436,50 @@ mod tests {
         });
 
         let client = GhClient::new(mock, Path::new("/repos/god"));
-        let result = client.merge_pr_in(42, Path::new("/repos/backend")).await;
+        let result =
+            client.merge_pr_in(42, &MergeStrategy::Squash, Path::new("/repos/backend")).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn merge_pr_passes_squash_flag() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"--squash".to_string()), "expected --squash in {args:?}");
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        client.merge_pr(42, &MergeStrategy::Squash).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_pr_passes_merge_flag() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"--merge".to_string()), "expected --merge in {args:?}");
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        client.merge_pr(42, &MergeStrategy::Merge).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_pr_passes_rebase_flag() {
+        let mut mock = MockCommandRunner::new();
+        mock.expect_run_gh().returning(|args, _| {
+            assert!(args.contains(&"--rebase".to_string()), "expected --rebase in {args:?}");
+            Box::pin(async {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            })
+        });
+
+        let client = GhClient::new(mock, Path::new("/tmp"));
+        client.merge_pr(42, &MergeStrategy::Rebase).await.unwrap();
     }
 }

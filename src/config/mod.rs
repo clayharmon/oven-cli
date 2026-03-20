@@ -15,6 +15,27 @@ pub enum IssueSource {
     Local,
 }
 
+/// How PRs are merged into the base branch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStrategy {
+    Squash,
+    #[default]
+    Merge,
+    Rebase,
+}
+
+impl MergeStrategy {
+    /// Return the `gh pr merge` CLI flag for this strategy.
+    pub const fn gh_flag(&self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -85,6 +106,7 @@ pub struct PipelineConfig {
     pub cost_budget: f64,
     pub poll_interval: u64,
     pub turn_limit: u32,
+    pub merge_strategy: MergeStrategy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,7 +120,13 @@ pub struct LabelConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self { max_parallel: 2, cost_budget: 15.0, poll_interval: 60, turn_limit: 50 }
+        Self {
+            max_parallel: 2,
+            cost_budget: 15.0,
+            poll_interval: 60,
+            turn_limit: 50,
+            merge_strategy: MergeStrategy::default(),
+        }
     }
 }
 
@@ -142,6 +170,7 @@ struct RawPipelineConfig {
     cost_budget: Option<f64>,
     poll_interval: Option<u64>,
     turn_limit: Option<u32>,
+    merge_strategy: Option<MergeStrategy>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -263,6 +292,7 @@ impl Config {
 # cost_budget = 15.0
 # poll_interval = 60
 # turn_limit = 50
+# merge_strategy = "merge"  # "merge" (default), "squash", or "rebase"
 
 # [labels]
 # ready = "o-ready"
@@ -290,6 +320,7 @@ impl Config {
 max_parallel = 2
 cost_budget = 15.0
 poll_interval = 60
+# merge_strategy = "merge"  # "merge" (default), "squash", or "rebase"
 
 # [labels]
 # ready = "o-ready"
@@ -336,6 +367,9 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
         }
         if let Some(v) = pipeline.turn_limit {
             config.pipeline.turn_limit = v;
+        }
+        if let Some(ref v) = pipeline.merge_strategy {
+            config.pipeline.merge_strategy = v.clone();
         }
     }
 
@@ -411,7 +445,7 @@ mod tests {
         ) {
             let config = Config {
                 project: ProjectConfig::default(),
-                pipeline: PipelineConfig { max_parallel, cost_budget, poll_interval, turn_limit },
+                pipeline: PipelineConfig { max_parallel, cost_budget, poll_interval, turn_limit, ..Default::default() },
                 labels: LabelConfig { ready, cooking, complete, failed },
                 multi_repo: MultiRepoConfig::default(),
                 models: ModelConfig::default(),
@@ -827,5 +861,86 @@ max_parallel = 1
         let mut config = Config::default();
         apply_raw(&mut config, &raw, false);
         assert_eq!(config.models, ModelConfig::default());
+    }
+
+    #[test]
+    fn merge_strategy_defaults_to_merge() {
+        let config = Config::default();
+        assert_eq!(config.pipeline.merge_strategy, MergeStrategy::Merge);
+    }
+
+    #[test]
+    fn merge_strategy_squash_parses() {
+        let toml_str = r#"
+[pipeline]
+merge_strategy = "squash"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.pipeline.merge_strategy, MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn merge_strategy_rebase_parses() {
+        let toml_str = r#"
+[pipeline]
+merge_strategy = "rebase"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.pipeline.merge_strategy, MergeStrategy::Rebase);
+    }
+
+    #[test]
+    fn merge_strategy_invalid_errors() {
+        let toml_str = r#"
+[pipeline]
+merge_strategy = "fast-forward"
+"#;
+        let result = toml::from_str::<RawConfig>(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_strategy_project_overrides_user() {
+        let user_toml = r#"
+[pipeline]
+merge_strategy = "squash"
+"#;
+        let project_toml = r#"
+[pipeline]
+merge_strategy = "rebase"
+"#;
+        let mut config = Config::default();
+        let user_raw: RawConfig = toml::from_str(user_toml).unwrap();
+        apply_raw(&mut config, &user_raw, true);
+        assert_eq!(config.pipeline.merge_strategy, MergeStrategy::Squash);
+
+        let project_raw: RawConfig = toml::from_str(project_toml).unwrap();
+        apply_raw(&mut config, &project_raw, false);
+        assert_eq!(config.pipeline.merge_strategy, MergeStrategy::Rebase);
+    }
+
+    #[test]
+    fn merge_strategy_gh_flags() {
+        assert_eq!(MergeStrategy::Squash.gh_flag(), "--squash");
+        assert_eq!(MergeStrategy::Merge.gh_flag(), "--merge");
+        assert_eq!(MergeStrategy::Rebase.gh_flag(), "--rebase");
+    }
+
+    #[test]
+    fn merge_strategy_roundtrip() {
+        let config = Config {
+            pipeline: PipelineConfig {
+                merge_strategy: MergeStrategy::Rebase,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.pipeline.merge_strategy, MergeStrategy::Rebase);
     }
 }
