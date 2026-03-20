@@ -450,16 +450,23 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         worktree_path: &std::path::Path,
         target_dir: &std::path::Path,
     ) -> Result<()> {
+        let mut pre_fix_ref: Option<String> = None;
+
         for cycle in 1..=3 {
             self.check_cancelled()?;
 
             self.update_status(run_id, RunStatus::Reviewing).await?;
 
-            let (prior_addressed, prior_disputes) =
+            let (prior_addressed, prior_disputes, prior_unresolved) =
                 self.gather_prior_findings(run_id, cycle).await?;
 
-            let review_prompt =
-                agents::reviewer::build_prompt(ctx, &prior_addressed, &prior_disputes)?;
+            let review_prompt = agents::reviewer::build_prompt(
+                ctx,
+                &prior_addressed,
+                &prior_disputes,
+                &prior_unresolved,
+                pre_fix_ref.as_deref(),
+            )?;
 
             // Reviewer failure: skip review and continue (don't kill pipeline)
             let review_result = match self
@@ -516,24 +523,28 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 return Ok(());
             }
 
+            // Snapshot HEAD before fix step so next reviewer can scope to fixer changes
+            pre_fix_ref = Some(git::head_sha(worktree_path).await?);
+
             self.run_fix_step(run_id, ctx, worktree_path, target_dir, cycle).await?;
         }
 
         Ok(())
     }
 
-    /// Gather prior addressed and disputed findings for review cycles 2+.
+    /// Gather prior addressed, disputed, and unresolved findings for review cycles 2+.
     async fn gather_prior_findings(
         &self,
         run_id: &str,
         cycle: u32,
-    ) -> Result<(Vec<ReviewFinding>, Vec<ReviewFinding>)> {
+    ) -> Result<(Vec<ReviewFinding>, Vec<ReviewFinding>, Vec<ReviewFinding>)> {
         if cycle <= 1 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
         let conn = self.db.lock().await;
         let all_resolved = db::agent_runs::get_resolved_findings(&conn, run_id)?;
+        let all_unresolved = db::agent_runs::get_unresolved_findings(&conn, run_id)?;
         drop(conn);
 
         let (mut addressed, disputed): (Vec<_>, Vec<_>) = all_resolved.into_iter().partition(|f| {
@@ -549,13 +560,18 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
             }
         }
 
-        Ok((addressed, disputed))
+        Ok((addressed, disputed, all_unresolved))
     }
 
     /// Run the fixer agent for a given cycle, process its output, and push.
     ///
     /// If the fixer agent fails, posts a comment on the PR and returns `Ok(())`
     /// so the caller can continue to the next review cycle.
+    ///
+    /// Handles three fixer outcome scenarios:
+    /// 1. Normal: fixer produces structured JSON with addressed/disputed findings
+    /// 2. Silent commits: fixer makes commits but no structured output (infer from git)
+    /// 3. Did nothing: no commits and no output (mark findings as not actionable)
     async fn run_fix_step(
         &self,
         run_id: &str,
@@ -567,12 +583,30 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         self.check_cancelled()?;
         self.update_status(run_id, RunStatus::Fixing).await?;
 
-        let unresolved = {
-            let conn = self.db.lock().await;
-            db::agent_runs::get_unresolved_findings(&conn, run_id)?
-        };
+        let actionable = self.filter_actionable_findings(run_id).await?;
 
-        let fix_prompt = agents::fixer::build_prompt(ctx, &unresolved)?;
+        if actionable.is_empty() {
+            info!(run_id = %run_id, cycle, "no actionable findings for fixer, skipping");
+            if let Some(pr_number) = ctx.pr_number {
+                github::safe_comment(
+                    &self.github,
+                    pr_number,
+                    &format!(
+                        "### Fix skipped (cycle {cycle})\n\n\
+                         No actionable findings (all findings lacked file paths).\
+                         {COMMENT_FOOTER}"
+                    ),
+                    target_dir,
+                )
+                .await;
+            }
+            return Ok(());
+        }
+
+        // Snapshot HEAD before fixer runs
+        let pre_fix_head = git::head_sha(worktree_path).await?;
+
+        let fix_prompt = agents::fixer::build_prompt(ctx, &actionable)?;
 
         // Fixer failure: skip fix (caller continues to next review cycle)
         let fix_result =
@@ -594,20 +628,56 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 }
             };
 
-        // Parse fixer output and mark disputed + addressed findings as resolved
+        // Parse fixer output and detect "did nothing" scenarios
         let fixer_output = parse_fixer_output(&fix_result.output);
-        self.process_fixer_disputes(run_id, &unresolved, &fixer_output).await?;
-        self.process_fixer_addressed(run_id, &unresolved, &fixer_output).await?;
+        let fixer_did_nothing =
+            fixer_output.addressed.is_empty() && fixer_output.disputed.is_empty();
+
+        let new_commits = if fixer_did_nothing {
+            git::commit_count_since(worktree_path, &pre_fix_head).await.unwrap_or(0)
+        } else {
+            0
+        };
+
+        if fixer_did_nothing {
+            if new_commits > 0 {
+                // Fixer made commits but didn't produce structured output.
+                // Infer which findings were addressed by checking changed files.
+                warn!(
+                    run_id = %run_id, cycle, commits = new_commits,
+                    "fixer output unparseable but commits exist, inferring addressed from git"
+                );
+                self.infer_addressed_from_git(run_id, &actionable, worktree_path, &pre_fix_head)
+                    .await?;
+            } else {
+                // Fixer did literally nothing. Mark findings so they don't zombie.
+                warn!(
+                    run_id = %run_id, cycle,
+                    "fixer produced no output and no commits, marking findings not actionable"
+                );
+                let conn = self.db.lock().await;
+                for f in &actionable {
+                    db::agent_runs::resolve_finding(
+                        &conn,
+                        f.id,
+                        "ADDRESSED: fixer could not act on this finding (no commits, no output)",
+                    )?;
+                }
+                drop(conn);
+            }
+        } else {
+            self.process_fixer_disputes(run_id, &actionable, &fixer_output).await?;
+            self.process_fixer_addressed(run_id, &actionable, &fixer_output).await?;
+        }
 
         // Post fix comment on PR
         if let Some(pr_number) = ctx.pr_number {
-            github::safe_comment(
-                &self.github,
-                pr_number,
-                &format_fix_comment(cycle, &fixer_output),
-                target_dir,
-            )
-            .await;
+            let comment = if fixer_did_nothing {
+                format_fixer_recovery_comment(cycle, new_commits)
+            } else {
+                format_fix_comment(cycle, &fixer_output)
+            };
+            github::safe_comment(&self.github, pr_number, &comment, target_dir).await;
         }
 
         git::push_branch(worktree_path, &ctx.branch).await?;
@@ -675,6 +745,78 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     "finding addressed by fixer, marked resolved"
                 );
             }
+        }
+        drop(conn);
+        Ok(())
+    }
+
+    /// Filter unresolved findings into actionable (has `file_path`) and non-actionable.
+    ///
+    /// Non-actionable findings are auto-resolved in the DB so they don't accumulate
+    /// as zombie findings across cycles.
+    async fn filter_actionable_findings(&self, run_id: &str) -> Result<Vec<ReviewFinding>> {
+        let unresolved = {
+            let conn = self.db.lock().await;
+            db::agent_runs::get_unresolved_findings(&conn, run_id)?
+        };
+
+        let (actionable, non_actionable): (Vec<_>, Vec<_>) =
+            unresolved.into_iter().partition(|f| f.file_path.is_some());
+
+        if !non_actionable.is_empty() {
+            warn!(
+                run_id = %run_id,
+                count = non_actionable.len(),
+                "auto-resolving non-actionable findings (no file_path)"
+            );
+            let conn = self.db.lock().await;
+            for f in &non_actionable {
+                db::agent_runs::resolve_finding(
+                    &conn,
+                    f.id,
+                    "ADDRESSED: auto-resolved -- finding has no file path, not actionable by fixer",
+                )?;
+            }
+            drop(conn);
+        }
+
+        Ok(actionable)
+    }
+
+    /// Infer which findings were addressed by the fixer based on git changes.
+    ///
+    /// When the fixer makes commits but doesn't produce structured JSON output,
+    /// we cross-reference the changed files against the finding file paths.
+    async fn infer_addressed_from_git(
+        &self,
+        run_id: &str,
+        findings: &[ReviewFinding],
+        worktree_path: &std::path::Path,
+        pre_fix_head: &str,
+    ) -> Result<()> {
+        let changed_files =
+            git::changed_files_since(worktree_path, pre_fix_head).await.unwrap_or_default();
+
+        let conn = self.db.lock().await;
+        for f in findings {
+            let was_touched = f.file_path.as_ref().is_some_and(|fp| {
+                changed_files.iter().any(|cf| cf == fp || cf.ends_with(fp) || fp.ends_with(cf))
+            });
+
+            let reason = if was_touched {
+                "ADDRESSED: inferred from git -- fixer modified this file (no structured output)"
+            } else {
+                "ADDRESSED: inferred from git -- file not modified (no structured output)"
+            };
+
+            db::agent_runs::resolve_finding(&conn, f.id, reason)?;
+            info!(
+                run_id = %run_id,
+                finding_id = f.id,
+                file = ?f.file_path,
+                touched = was_touched,
+                "finding resolved via git inference"
+            );
         }
         drop(conn);
         Ok(())
@@ -993,6 +1135,23 @@ fn format_fix_comment(cycle: u32, fixer: &agents::FixerOutput) -> String {
         a_s = if addressed == 1 { "" } else { "s" },
         d_s = if disputed == 1 { "" } else { "s" },
     )
+}
+
+fn format_fixer_recovery_comment(cycle: u32, new_commits: u32) -> String {
+    if new_commits > 0 {
+        format!(
+            "### Fix complete (cycle {cycle})\n\n\
+             Fixer made {new_commits} commit{s} but did not produce structured output. \
+             Addressed findings inferred from changed files.{COMMENT_FOOTER}",
+            s = if new_commits == 1 { "" } else { "s" },
+        )
+    } else {
+        format!(
+            "### Fix complete (cycle {cycle})\n\n\
+             Fixer could not act on the findings (no code changes made). \
+             Findings marked as not actionable.{COMMENT_FOOTER}"
+        )
+    }
 }
 
 fn format_review_skipped_comment(cycle: u32, error: &anyhow::Error) -> String {
