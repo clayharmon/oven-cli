@@ -564,56 +564,43 @@ impl DependencyGraph {
         }
 
         if connections.is_empty() {
-            lines_with_gap(1)
-        } else {
-            // Render a simple connector region
-            let max_x =
-                from_centers.iter().chain(to_centers.iter()).map(|(_, x)| *x).max().unwrap_or(0)
-                    + full_box_width;
-
-            // Row 1: vertical drops from source centers
-            let mut row1 = vec![' '; max_x + 4];
-            for &(from_x, _) in &connections {
-                row1[from_x + 2] = '\u{2502}'; // │
-            }
-
-            // Row 2: horizontal connections + corners
-            let mut row2 = vec![' '; max_x + 4];
-            for &(from_x, to_x) in &connections {
-                let (left, right) = if from_x <= to_x { (from_x, to_x) } else { (to_x, from_x) };
-                for x in left..=right {
-                    let cell = row2[x + 2];
-                    if cell == '\u{2502}' || cell == '\u{253c}' || cell == '\u{2500}' {
-                        row2[x + 2] = '\u{253c}'; // ┼ (junction)
-                    } else if (x == left || x == right) && cell == ' ' {
-                        row2[x + 2] = if from_x == to_x {
-                            '\u{2502}' // │ straight down
-                        } else if x == from_x {
-                            if from_x < to_x { '\u{2514}' } else { '\u{2518}' } // └ or ┘
-                        } else if x == to_x {
-                            if to_x > from_x { '\u{2510}' } else { '\u{250c}' } // ┐ or ┌
-                        } else {
-                            '\u{2500}' // ─
-                        };
-                    } else if cell == ' ' {
-                        row2[x + 2] = '\u{2500}'; // ─
-                    }
-                }
-            }
-
-            // Row 3: vertical drops into target centers
-            let mut row3 = vec![' '; max_x + 4];
-            for &(_, to_x) in &connections {
-                row3[to_x + 2] = '\u{25bc}'; // ▼
-            }
-
-            vec![
-                format!("  {}", row1.iter().collect::<String>().trim_end()),
-                format!("  {}", row2.iter().collect::<String>().trim_end()),
-                format!("  {}", row3.iter().collect::<String>().trim_end()),
-                String::new(),
-            ]
+            return lines_with_gap(1);
         }
+
+        let max_x =
+            from_centers.iter().chain(to_centers.iter()).map(|(_, x)| *x).max().unwrap_or(0)
+                + full_box_width;
+        let width = max_x + 4;
+
+        // Track which columns are sources and targets
+        let mut source_cols: HashSet<usize> = HashSet::new();
+        let mut target_cols: HashSet<usize> = HashSet::new();
+        for &(from_x, to_x) in &connections {
+            source_cols.insert(from_x);
+            target_cols.insert(to_x);
+        }
+
+        // Row 1: vertical pipes from source boxes
+        let mut row1 = vec![' '; width];
+        for &col in &source_cols {
+            row1[col + 2] = '\u{2502}'; // │
+        }
+
+        // Row 2: build direction flags per column, then convert to box-drawing
+        let row2 = build_connector_row(&connections, &source_cols, &target_cols, width);
+
+        // Row 3: arrows into target boxes
+        let mut row3 = vec![' '; width];
+        for &col in &target_cols {
+            row3[col + 2] = '\u{25bc}'; // ▼
+        }
+
+        vec![
+            format!("  {}", row1.iter().collect::<String>().trim_end()),
+            format!("  {}", row2.trim_end()),
+            format!("  {}", row3.iter().collect::<String>().trim_end()),
+            String::new(),
+        ]
     }
 
     /// Build planner context from the current graph state.
@@ -642,6 +629,67 @@ impl DependencyGraph {
                 })
             })
             .collect()
+    }
+}
+
+/// Build the horizontal connector row between two layers.
+///
+/// For each column, compute which directions (up/down/left/right) have connections,
+/// then pick the appropriate Unicode box-drawing character.
+fn build_connector_row(
+    connections: &[(usize, usize)],
+    source_cols: &HashSet<usize>,
+    target_cols: &HashSet<usize>,
+    width: usize,
+) -> String {
+    let mut dirs = vec![0u8; width];
+
+    for &col in source_cols {
+        dirs[col + 2] |= DIR_UP;
+    }
+    for &col in target_cols {
+        dirs[col + 2] |= DIR_DOWN;
+    }
+
+    for &(from_x, to_x) in connections {
+        if from_x == to_x {
+            continue;
+        }
+        let (lo, hi) = if from_x < to_x { (from_x, to_x) } else { (to_x, from_x) };
+        dirs[lo + 2] |= DIR_RIGHT;
+        dirs[hi + 2] |= DIR_LEFT;
+        for col in (lo + 1)..hi {
+            dirs[col + 2] |= DIR_LEFT | DIR_RIGHT;
+        }
+    }
+
+    dirs.iter().map(|&d| box_drawing_char(d)).collect()
+}
+
+const DIR_UP: u8 = 0b1000;
+const DIR_DOWN: u8 = 0b0100;
+const DIR_LEFT: u8 = 0b0010;
+const DIR_RIGHT: u8 = 0b0001;
+
+/// Map a direction bitmask to the appropriate Unicode box-drawing character.
+const fn box_drawing_char(dirs: u8) -> char {
+    match dirs {
+        0b1100 => '\u{2502}', // │  up+down
+        0b0011 => '\u{2500}', // ─  left+right
+        0b1001 => '\u{2514}', // └  up+right
+        0b1010 => '\u{2518}', // ┘  up+left
+        0b0101 => '\u{250c}', // ┌  down+right
+        0b0110 => '\u{2510}', // ┐  down+left
+        0b1110 => '\u{2524}', // ┤  up+down+left
+        0b1101 => '\u{251c}', // ├  up+down+right
+        0b0111 => '\u{252c}', // ┬  down+left+right
+        0b1011 => '\u{2534}', // ┴  up+left+right
+        0b1111 => '\u{253c}', // ┼  all
+        0b1000 => '\u{2575}', // ╵  up only
+        0b0100 => '\u{2577}', // ╷  down only
+        0b0010 => '\u{2574}', // ╴  left only
+        0b0001 => '\u{2576}', // ╶  right only
+        _ => ' ',
     }
 }
 
