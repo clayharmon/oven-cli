@@ -25,6 +25,8 @@ use crate::{
 pub struct PipelineOutcome {
     pub run_id: String,
     pub pr_number: u32,
+    /// Branch name, needed for cleanup after the worktree is removed.
+    pub branch: String,
     /// Worktree path, retained so the caller can clean up after merge.
     pub worktree_path: PathBuf,
     /// Repo directory the worktree belongs to (needed for `git::remove_worktree`).
@@ -138,13 +140,21 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // Update status to AwaitingMerge
         self.update_status(&run_id, RunStatus::AwaitingMerge).await?;
 
-        Ok(PipelineOutcome { run_id, pr_number, worktree_path: worktree.path, target_dir })
+        Ok(PipelineOutcome {
+            run_id,
+            pr_number,
+            branch: worktree.branch,
+            worktree_path: worktree.path,
+            target_dir,
+        })
     }
 
     /// Finalize a run after its PR has been merged.
     ///
-    /// Transitions labels, closes issues, marks the run as complete, and cleans
-    /// up the worktree that was left around while awaiting merge.
+    /// Transitions labels, closes issues, marks the run as complete, cleans
+    /// up the worktree, and deletes the local branch. The worktree must be
+    /// removed before the branch because git refuses to delete a branch that
+    /// is checked out in a worktree.
     pub async fn finalize_merge(
         &self,
         outcome: &PipelineOutcome,
@@ -158,6 +168,16 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 error = %e,
                 "failed to clean up worktree after merge"
             );
+        }
+        if !outcome.branch.is_empty() {
+            if let Err(e) = git::delete_branch(&outcome.target_dir, &outcome.branch).await {
+                warn!(
+                    run_id = %outcome.run_id,
+                    branch = %outcome.branch,
+                    error = %e,
+                    "failed to delete local branch after merge"
+                );
+            }
         }
         Ok(())
     }
@@ -227,8 +247,9 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     /// Reconstruct a `PipelineOutcome` from graph node data (for merge polling).
     ///
     /// Worktree paths are deterministic, so we can rebuild the outcome from
-    /// the issue metadata stored on the graph node.
-    pub fn reconstruct_outcome(
+    /// the issue metadata stored on the graph node. The branch name is looked
+    /// up from the runs table (it was recorded when the worktree was created).
+    pub async fn reconstruct_outcome(
         &self,
         issue: &PipelineIssue,
         run_id: &str,
@@ -237,7 +258,21 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         let (target_dir, _) = self.resolve_target_dir(issue.target_repo.as_ref())?;
         let worktree_path =
             target_dir.join(".oven").join("worktrees").join(format!("issue-{}", issue.number));
-        Ok(PipelineOutcome { run_id: run_id.to_string(), pr_number, worktree_path, target_dir })
+
+        let branch = {
+            let conn = self.db.lock().await;
+            db::runs::get_run(&conn, run_id)?
+                .and_then(|r| r.branch)
+                .unwrap_or_default()
+        };
+
+        Ok(PipelineOutcome {
+            run_id: run_id.to_string(),
+            pr_number,
+            branch,
+            worktree_path,
+            target_dir,
+        })
     }
 
     async fn record_worktree(&self, run_id: &str, worktree: &git::Worktree) -> Result<()> {

@@ -151,13 +151,7 @@ impl<R: CommandRunner> GhClient<R> {
         let output = self
             .runner
             .run_gh(
-                &Self::s(&[
-                    "pr",
-                    "merge",
-                    &pr_number.to_string(),
-                    strategy.gh_flag(),
-                    "--delete-branch",
-                ]),
+                &Self::s(&["pr", "merge", &pr_number.to_string(), strategy.gh_flag()]),
                 repo_dir,
             )
             .await
