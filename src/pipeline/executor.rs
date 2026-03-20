@@ -128,11 +128,10 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         let result = self.run_steps(&run_id, &ctx, &worktree.path, auto_merge, &target_dir).await;
 
         if let Err(ref e) = result {
-            // On failure, finalize immediately (no merge to wait for)
+            // On failure, finalize immediately (no merge to wait for).
+            // Worktree is intentionally preserved so uncommitted work is not lost.
+            // Use `oven clean` to remove worktrees manually.
             self.finalize_run(&run_id, issue, pr_number, &result, &target_dir).await?;
-            if let Err(e) = git::remove_worktree(&target_dir, &worktree.path).await {
-                warn!(run_id = %run_id, error = %e, "failed to clean up worktree");
-            }
             return Err(anyhow::anyhow!("{e:#}"));
         }
 
