@@ -11,7 +11,7 @@ Oven is a CLI that runs Claude Code agent pipelines against your GitHub issues. 
 3. An implementer writes the code and tests
 4. A reviewer checks quality, security, and simplicity
 5. A fixer addresses any findings (up to 2 rounds, can dispute false positives)
-6. You get a PR ready for human review
+6. Oven rebases, merges (with `-m`), or leaves the PR ready for human review
 
 All agent activity shows up as comments on the PR. You stay in the loop without being in the way.
 
@@ -22,7 +22,7 @@ flowchart LR
     C --> D[Reviewer]
     D -- findings --> E[Fixer]
     E -- up to 2x --> D
-    D -- clean --> F[Merger]
+    D -- clean --> F[Rebase + Merge]
 
     style A fill:#d4edda,stroke:#555
     style F fill:#d4edda,stroke:#555
@@ -88,6 +88,11 @@ lint = "cargo clippy"
 max_parallel = 2
 cost_budget = 15.0
 poll_interval = 60
+
+[models]
+# default = "sonnet"       # all agents use this unless overridden
+# implementer = "opus"     # per-agent override
+# fixer = "opus"
 ```
 
 Multi-repo support goes in the user config:

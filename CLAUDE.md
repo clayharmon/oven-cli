@@ -19,12 +19,11 @@ Issue source is configurable: GitHub (default) or local `.oven/issues/` files. P
 - `oven clean` - remove worktrees, logs, merged branches. `--only-logs`, `--only-trees`, `--only-branches`.
 - `oven ticket create|list|view|close|label|edit` - local issue management in .oven/issues/
 
-### Agents (5, all invoked via `claude -p --output-format stream-json`)
+### Agents (4, all invoked via `claude -p --output-format stream-json`)
 1. **Planner** - read-only. Analyzes issues and produces a dependency graph (DAG) with `nodes` and `depends_on` edges. Each node has issue metadata, complexity, and predicted files. Also accepts `graph_context` about in-flight issues for incremental re-planning. Legacy `batches` format auto-converts to DAG.
-2. **Implementer** - full access. Writes code + tests in a worktree. PR is marked ready-for-review and description is filled after implementation.
-3. **Reviewer** - read-only. Code quality + security + simplify in one pass. Outputs structured findings (critical/warning/info). Receives prior disputed findings to avoid re-raising them.
-4. **Fixer** - full access. Addresses critical + warning findings from reviewer. Outputs structured JSON with resolved/disputed findings and a summary.
-5. **Merger** - gh CLI. Merges the PR and closes the linked issue.
+2. **Implementer** - full access. Writes code + tests in a worktree. PR is marked ready-for-review and description is filled after implementation. Also used for agent-assisted rebase conflict resolution.
+3. **Reviewer** - read-only. Code quality + security + simplify in one pass. Outputs structured findings (critical/warning/info). Receives prior disputed/unresolved findings to avoid re-raising them. Cycle 2+ reviews are scoped to fixer changes only.
+4. **Fixer** - full access. Addresses critical + warning findings from reviewer. Outputs structured JSON with resolved/disputed findings and a summary. Pipeline is resilient to fixer failures (silent commits, no output).
 
 ### Agent tool scoping
 | Agent | Allowed tools |
@@ -33,10 +32,11 @@ Issue source is configurable: GitHub (default) or local `.oven/issues/` files. P
 | Implementer | Read, Write, Edit, Glob, Grep, Bash |
 | Reviewer | Read, Glob, Grep |
 | Fixer | Read, Write, Edit, Glob, Grep, Bash |
-| Merger | Bash |
 
 ### Review-fix loop
-Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. The fixer can dispute findings it believes are incorrect; disputed findings are passed back to the reviewer so they aren't re-raised. If still broken after max cycles, stop and comment on PR with unresolved findings. No resume, no retry on format/parse errors. Clean and start over.
+Max 2 cycles: implement -> review -> fix -> review -> fix -> final review. The fixer can dispute findings it believes are incorrect; disputed findings are passed back to the reviewer so they aren't re-raised. Unresolved findings (fixer produced no output) are also tracked to prevent goalpost-moving. Cycle 2+ reviews are scoped to fixer changes via `pre_fix_ref`. If still broken after max cycles, stop and comment on PR with unresolved findings.
+
+The fixer is resilient to failures: if it produces no structured output but makes commits, findings are inferred from git. If it does nothing, findings are marked not actionable. Merging is done directly via `gh pr merge` (no merger agent).
 
 Hard caps: per-cycle cap (2 fix rounds), cost cap (configurable per-pipeline budget), turn cap (max turns per agent invocation).
 
@@ -46,6 +46,7 @@ Hard caps: per-cycle cap (2 fix rounds), cost cap (configurable per-pipeline bud
 ### Config (TOML, two levels)
 - User: `~/.config/oven/recipe.toml` - defaults, multi-repo repo path mappings (only user config can set `[repos]` for security)
 - Project: `recipe.toml` in repo root - overrides user config
+- `[models]` section: per-agent model overrides (`default`, `planner`, `implementer`, `reviewer`, `fixer`). Values passed as `--model` flag to claude CLI.
 
 ### Multi-repo
 Issues in a "god repo" can target other repos via `target_repo` frontmatter (in issue body for GitHub, in YAML frontmatter for local). Repo name -> local path mappings live in user config. PRs and worktrees go to the target repo; labels and comments stay on the god repo.
@@ -117,7 +118,6 @@ src/
     implementer.rs
     reviewer.rs             structured findings output
     fixer.rs
-    merger.rs
   pipeline/
     mod.rs                  module declarations
     graph.rs                in-memory dependency graph, cycle detection, layer scheduling
@@ -130,7 +130,6 @@ templates/
   implementer.txt
   reviewer.txt
   fixer.txt
-  merger.txt
   skills/
     cook.md                 /cook skill template (scaffolded by oven prep)
     refine.md               /refine skill template
@@ -243,7 +242,7 @@ Migrations via rusqlite_migration (user_version based, no migration table). Test
 ## Process management
 - `tokio::process::Command` with `kill_on_drop(true)` for all subprocesses.
 - Graceful shutdown: `CancellationToken` from tokio-util combined with `tokio::signal::ctrl_c()`.
-- Agent invocation: `claude -p --verbose --output-format stream-json --allowedTools <TOOLS>`.
+- Agent invocation: `claude -p --verbose --output-format stream-json --allowedTools <TOOLS> [--model <MODEL>]`.
 - Detached mode: spawn new process with `std::process::Command` (not fork). Write PID to `.oven/oven.pid`.
 - Always `wait()` on child processes to prevent zombies.
 
