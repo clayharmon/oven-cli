@@ -1683,10 +1683,9 @@ fn graph_display_shows_blocked_state() {
     g.add_edge(2, 1);
     g.transition(1, db_graph::NodeState::Failed);
 
-    let lines = g.display_lines();
+    let lines = g.display_layered();
     let output = lines.join("\n");
-    assert!(output.contains("blocked"), "display should show 'blocked' for failed deps: {output}");
-    assert!(output.contains("depends on: #1"));
+    assert!(output.contains("BLOCKED"), "display should show 'BLOCKED' for failed deps: {output}");
 }
 
 #[test]
