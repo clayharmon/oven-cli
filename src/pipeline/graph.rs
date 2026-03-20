@@ -342,25 +342,278 @@ impl DependencyGraph {
         add_planned_edges(self, &new_nodes);
     }
 
-    /// Format the graph for display in CLI output.
-    pub fn display_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+    /// Compute topological layers: layer 0 has no deps, layer N has all deps in layers < N.
+    fn compute_layers(&self) -> Vec<Vec<u32>> {
+        fn compute_depth(
+            node: u32,
+            edges: &HashMap<u32, HashSet<u32>>,
+            depth: &mut HashMap<u32, usize>,
+        ) -> usize {
+            if let Some(&d) = depth.get(&node) {
+                return d;
+            }
+            let d = edges.get(&node).map_or(0, |deps| {
+                deps.iter().map(|&dep| compute_depth(dep, edges, depth) + 1).max().unwrap_or(0)
+            });
+            depth.insert(node, d);
+            d
+        }
+
+        let mut depth: HashMap<u32, usize> = HashMap::new();
         let issues = self.all_issues();
 
-        for num in issues {
-            let Some(node) = self.nodes.get(&num) else { continue };
-            let blocked = if self.is_blocked(num) { " (blocked)" } else { "" };
-            let state_str = format!("[{}]{blocked}", node.state);
-            lines.push(format!("  #{num} {} {:.<40} {state_str}", node.title, "."));
-            let deps = self.dependencies(num);
-            if !deps.is_empty() {
-                let mut dep_nums: Vec<u32> = deps.into_iter().collect();
-                dep_nums.sort_unstable();
-                let dep_strs: Vec<String> = dep_nums.iter().map(|d| format!("#{d}")).collect();
-                lines.push(format!("    depends on: {}", dep_strs.join(", ")));
+        for &num in &issues {
+            compute_depth(num, &self.edges, &mut depth);
+        }
+
+        let max_depth = depth.values().copied().max().unwrap_or(0);
+        let mut layers: Vec<Vec<u32>> = vec![vec![]; max_depth + 1];
+        for &num in &issues {
+            let d = depth[&num];
+            layers[d].push(num);
+        }
+        for layer in &mut layers {
+            layer.sort_unstable();
+        }
+        layers
+    }
+
+    /// Render a layered box-drawing DAG visualization for terminal output.
+    pub fn display_layered(&self) -> Vec<String> {
+        if self.nodes.is_empty() {
+            return vec!["  (empty graph)".to_string()];
+        }
+
+        let layers = self.compute_layers();
+        let mut lines = Vec::new();
+
+        // Summary line
+        let total = self.nodes.len();
+        let merged = self.nodes.values().filter(|n| n.state == NodeState::Merged).count();
+        let in_flight = self.nodes.values().filter(|n| n.state == NodeState::InFlight).count();
+        let failed = self.nodes.values().filter(|n| n.state == NodeState::Failed).count();
+
+        let mut summary_parts = vec![format!("{total} issues")];
+        if merged > 0 {
+            summary_parts.push(format!("{merged} merged"));
+        }
+        if in_flight > 0 {
+            summary_parts.push(format!("{in_flight} in flight"));
+        }
+        if failed > 0 {
+            summary_parts.push(format!("{failed} failed"));
+        }
+        lines.push(format!("  {}", summary_parts.join(", ")));
+        lines.push(String::new());
+
+        let box_width = self.compute_box_width();
+
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            // Layer header
+            let label = if layer_idx == 0 { "no deps" } else { "" };
+            if label.is_empty() {
+                lines.push(format!("  Layer {layer_idx}"));
+            } else {
+                lines.push(format!("  Layer {layer_idx} ({label})"));
+            }
+            lines.push(String::new());
+
+            // Render boxes for this layer
+            let boxes: Vec<Vec<String>> =
+                layer.iter().map(|&num| self.render_box(num, box_width)).collect();
+
+            // Merge box lines side by side with spacing
+            let max_height = boxes.iter().map(Vec::len).max().unwrap_or(0);
+            for row in 0..max_height {
+                let mut line = String::from("  ");
+                for (i, b) in boxes.iter().enumerate() {
+                    if i > 0 {
+                        line.push_str("  ");
+                    }
+                    if row < b.len() {
+                        line.push_str(&b[row]);
+                    } else {
+                        // Pad with spaces to match box width
+                        line.push_str(&" ".repeat(box_width + 2));
+                    }
+                }
+                lines.push(line);
+            }
+
+            // Draw connectors to next layer if there is one
+            if layer_idx + 1 < layers.len() {
+                let next_layer = &layers[layer_idx + 1];
+                let connector_lines = self.render_connectors(layer, next_layer, box_width);
+                lines.extend(connector_lines);
             }
         }
+
+        // Legend
+        lines.push(String::new());
+        lines.push(
+            "  Legend: [*] merged  [~] in flight  [ ] pending  [?] awaiting merge  [!] failed"
+                .to_string(),
+        );
+
         lines
+    }
+
+    /// Compute a consistent box width based on the longest content.
+    fn compute_box_width(&self) -> usize {
+        let min_width = 30;
+        let max_width = 44;
+        let longest = self
+            .nodes
+            .values()
+            .map(|n| {
+                let issue_label = format!("#{}", n.issue_number);
+                // State indicator (3) + space + issue label + 2 spaces + title
+                3 + 1 + issue_label.len() + 2 + n.title.len()
+            })
+            .max()
+            .unwrap_or(min_width);
+        longest.clamp(min_width, max_width)
+    }
+
+    /// Render a single node as a Unicode box.
+    fn render_box(&self, issue: u32, width: usize) -> Vec<String> {
+        let Some(node) = self.nodes.get(&issue) else {
+            return vec![];
+        };
+
+        let state_char = match node.state {
+            NodeState::Merged => '*',
+            NodeState::InFlight => '~',
+            NodeState::Pending => ' ',
+            NodeState::AwaitingMerge => '?',
+            NodeState::Failed => '!',
+        };
+
+        let blocked = if self.is_blocked(issue) { " BLOCKED" } else { "" };
+
+        let issue_label = format!("#{issue}");
+        let title_line = format!("[{state_char}] {issue_label}  {}", node.title);
+        let title_truncated = if title_line.len() > width {
+            format!("{}..", &title_line[..width - 2])
+        } else {
+            title_line
+        };
+
+        // Second line: area + PR + blocked
+        let mut detail_parts = vec![node.area.clone()];
+        if let Some(pr) = node.pr_number {
+            detail_parts.push(format!("PR #{pr}"));
+        }
+        let mut detail_line = detail_parts.join("  ");
+        if !blocked.is_empty() {
+            detail_line.push_str(blocked);
+        }
+        let detail_truncated = if detail_line.len() > width {
+            format!("{}..", &detail_line[..width - 2])
+        } else {
+            detail_line
+        };
+
+        let top = format!("\u{250c}{}\u{2510}", "\u{2500}".repeat(width));
+        let mid = format!("\u{2502}{title_truncated:<width$}\u{2502}");
+        let mid2 = format!("\u{2502}{detail_truncated:<width$}\u{2502}");
+        let bot = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(width));
+
+        vec![top, mid, mid2, bot]
+    }
+
+    /// Render connector lines between two adjacent layers.
+    fn render_connectors(
+        &self,
+        from_layer: &[u32],
+        to_layer: &[u32],
+        box_width: usize,
+    ) -> Vec<String> {
+        // For each node in to_layer, find which nodes in from_layer it depends on.
+        // We draw simple vertical/horizontal pipe connectors.
+        let full_box_width = box_width + 2; // include border chars
+        let spacing = 2usize;
+
+        // Compute center x position for each node in from_layer and to_layer
+        let from_centers: Vec<(u32, usize)> = from_layer
+            .iter()
+            .enumerate()
+            .map(|(i, &num)| {
+                let x = i * (full_box_width + spacing) + full_box_width / 2;
+                (num, x)
+            })
+            .collect();
+        let to_centers: Vec<(u32, usize)> = to_layer
+            .iter()
+            .enumerate()
+            .map(|(i, &num)| {
+                let x = i * (full_box_width + spacing) + full_box_width / 2;
+                (num, x)
+            })
+            .collect();
+
+        // Collect all edges between these two layers
+        let mut connections: Vec<(usize, usize)> = Vec::new(); // (from_x, to_x)
+        for &(to_num, to_x) in &to_centers {
+            let deps = self.dependencies(to_num);
+            for &(from_num, from_x) in &from_centers {
+                if deps.contains(&from_num) {
+                    connections.push((from_x, to_x));
+                }
+            }
+        }
+
+        if connections.is_empty() {
+            lines_with_gap(1)
+        } else {
+            // Render a simple connector region
+            let max_x =
+                from_centers.iter().chain(to_centers.iter()).map(|(_, x)| *x).max().unwrap_or(0)
+                    + full_box_width;
+
+            // Row 1: vertical drops from source centers
+            let mut row1 = vec![' '; max_x + 4];
+            for &(from_x, _) in &connections {
+                row1[from_x + 2] = '\u{2502}'; // │
+            }
+
+            // Row 2: horizontal connections + corners
+            let mut row2 = vec![' '; max_x + 4];
+            for &(from_x, to_x) in &connections {
+                let (left, right) = if from_x <= to_x { (from_x, to_x) } else { (to_x, from_x) };
+                for x in left..=right {
+                    let cell = row2[x + 2];
+                    if cell == '\u{2502}' || cell == '\u{253c}' || cell == '\u{2500}' {
+                        row2[x + 2] = '\u{253c}'; // ┼ (junction)
+                    } else if (x == left || x == right) && cell == ' ' {
+                        row2[x + 2] = if from_x == to_x {
+                            '\u{2502}' // │ straight down
+                        } else if x == from_x {
+                            if from_x < to_x { '\u{2514}' } else { '\u{2518}' } // └ or ┘
+                        } else if x == to_x {
+                            if to_x > from_x { '\u{2510}' } else { '\u{250c}' } // ┐ or ┌
+                        } else {
+                            '\u{2500}' // ─
+                        };
+                    } else if cell == ' ' {
+                        row2[x + 2] = '\u{2500}'; // ─
+                    }
+                }
+            }
+
+            // Row 3: vertical drops into target centers
+            let mut row3 = vec![' '; max_x + 4];
+            for &(_, to_x) in &connections {
+                row3[to_x + 2] = '\u{25bc}'; // ▼
+            }
+
+            vec![
+                format!("  {}", row1.iter().collect::<String>().trim_end()),
+                format!("  {}", row2.iter().collect::<String>().trim_end()),
+                format!("  {}", row3.iter().collect::<String>().trim_end()),
+                String::new(),
+            ]
+        }
     }
 
     /// Build planner context from the current graph state.
@@ -390,6 +643,10 @@ impl DependencyGraph {
             })
             .collect()
     }
+}
+
+fn lines_with_gap(count: usize) -> Vec<String> {
+    vec![String::new(); count]
 }
 
 fn node_from_planned(node: &PlannedNode, issue: Option<&PipelineIssue>) -> GraphNode {
@@ -587,20 +844,6 @@ mod tests {
         assert!(g.dependencies(3).is_empty());
         // Reverse edge from 1 to 2 should be gone
         assert!(g.dependents(1).is_empty());
-    }
-
-    #[test]
-    fn display_lines_format() {
-        let mut g = DependencyGraph::new("test");
-        g.add_node(make_node(1));
-        g.add_node(make_node(2));
-        g.add_edge(2, 1);
-        g.transition(1, NodeState::Merged);
-
-        let lines = g.display_lines();
-        assert!(!lines.is_empty());
-        assert!(lines.iter().any(|l| l.contains("#1")));
-        assert!(lines.iter().any(|l| l.contains("depends on")));
     }
 
     #[test]
@@ -923,5 +1166,247 @@ mod tests {
         assert!(loaded.contains(10));
         assert!(!loaded.contains(1));
         assert!(!loaded.contains(2));
+    }
+
+    fn make_named_node(num: u32, title: &str, area: &str) -> GraphNode {
+        GraphNode {
+            issue_number: num,
+            title: title.to_string(),
+            area: area.to_string(),
+            predicted_files: vec![],
+            has_migration: false,
+            complexity: "full".to_string(),
+            state: NodeState::Pending,
+            pr_number: None,
+            run_id: None,
+            issue: None,
+            target_repo: None,
+        }
+    }
+
+    // --- display_layered tests ---
+
+    #[test]
+    fn display_layered_empty_graph() {
+        let g = DependencyGraph::new("test");
+        let lines = g.display_layered();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("empty graph"));
+    }
+
+    #[test]
+    fn display_layered_single_node() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Add auth", "backend"));
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("1 issues"));
+        assert!(text.contains("Layer 0"));
+        assert!(text.contains("#1"));
+        assert!(text.contains("Add auth"));
+        assert!(text.contains("Legend"));
+    }
+
+    #[test]
+    fn display_layered_linear_chain() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Database schema", "db"));
+        g.add_node(make_named_node(2, "API endpoints", "backend"));
+        g.add_node(make_named_node(3, "Frontend views", "frontend"));
+        g.add_edge(2, 1);
+        g.add_edge(3, 2);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        // Should have 3 layers
+        assert!(text.contains("Layer 0"));
+        assert!(text.contains("Layer 1"));
+        assert!(text.contains("Layer 2"));
+        // All issues present
+        assert!(text.contains("#1"));
+        assert!(text.contains("#2"));
+        assert!(text.contains("#3"));
+    }
+
+    #[test]
+    fn display_layered_diamond_dag() {
+        // 1 is root, 2 and 3 depend on 1, 4 depends on 2 and 3
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Core lib", "core"));
+        g.add_node(make_named_node(2, "Auth module", "auth"));
+        g.add_node(make_named_node(3, "Logging module", "infra"));
+        g.add_node(make_named_node(4, "Integration", "all"));
+        g.add_edge(2, 1);
+        g.add_edge(3, 1);
+        g.add_edge(4, 2);
+        g.add_edge(4, 3);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("Layer 0"));
+        assert!(text.contains("Layer 1"));
+        assert!(text.contains("Layer 2"));
+        assert!(text.contains("4 issues"));
+        // Layer 1 should have both #2 and #3 side by side
+        assert!(text.contains("#2"));
+        assert!(text.contains("#3"));
+    }
+
+    #[test]
+    fn display_layered_independent_nodes() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Fix typo", "docs"));
+        g.add_node(make_named_node(2, "Add lint", "ci"));
+        g.add_node(make_named_node(3, "Bump deps", "deps"));
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        // All in layer 0, no other layers
+        assert!(text.contains("Layer 0 (no deps)"));
+        assert!(!text.contains("Layer 1"));
+        // All three boxes rendered
+        assert!(text.contains("#1"));
+        assert!(text.contains("#2"));
+        assert!(text.contains("#3"));
+    }
+
+    #[test]
+    fn display_layered_shows_state_indicators() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Done thing", "core"));
+        g.add_node(make_named_node(2, "Running thing", "core"));
+        g.add_node(make_named_node(3, "Broken thing", "core"));
+        g.add_node(make_named_node(4, "Waiting thing", "core"));
+        g.add_node(make_named_node(5, "Pending thing", "core"));
+        g.transition(1, NodeState::Merged);
+        g.transition(2, NodeState::InFlight);
+        g.transition(3, NodeState::Failed);
+        g.transition(4, NodeState::AwaitingMerge);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("[*]")); // merged
+        assert!(text.contains("[~]")); // in_flight
+        assert!(text.contains("[!]")); // failed
+        assert!(text.contains("[?]")); // awaiting_merge
+        assert!(text.contains("[ ]")); // pending
+    }
+
+    #[test]
+    fn display_layered_shows_pr_number() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Has PR", "core"));
+        g.set_pr_number(1, 42);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("PR #42"));
+    }
+
+    #[test]
+    fn display_layered_summary_counts() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "A", "core"));
+        g.add_node(make_named_node(2, "B", "core"));
+        g.add_node(make_named_node(3, "C", "core"));
+        g.transition(1, NodeState::Merged);
+        g.transition(2, NodeState::InFlight);
+        g.transition(3, NodeState::Failed);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("3 issues"));
+        assert!(text.contains("1 merged"));
+        assert!(text.contains("1 in flight"));
+        assert!(text.contains("1 failed"));
+    }
+
+    #[test]
+    fn display_layered_shows_blocked() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Root", "core"));
+        g.add_node(make_named_node(2, "Blocked child", "core"));
+        g.add_edge(2, 1);
+        g.transition(1, NodeState::Failed);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        assert!(text.contains("BLOCKED"));
+    }
+
+    #[test]
+    fn display_layered_has_connectors_between_layers() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Root", "core"));
+        g.add_node(make_named_node(2, "Child", "core"));
+        g.add_edge(2, 1);
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        // Should contain connector characters between layers
+        assert!(text.contains('\u{25bc}')); // ▼ arrow
+    }
+
+    #[test]
+    fn display_layered_box_drawing_chars() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_named_node(1, "Test node", "core"));
+
+        let lines = g.display_layered();
+        let text = lines.join("\n");
+        // Box corners
+        assert!(text.contains('\u{250c}')); // ┌
+        assert!(text.contains('\u{2510}')); // ┐
+        assert!(text.contains('\u{2514}')); // └
+        assert!(text.contains('\u{2518}')); // ┘
+        assert!(text.contains('\u{2500}')); // ─
+        assert!(text.contains('\u{2502}')); // │
+    }
+
+    #[test]
+    fn compute_layers_linear() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_edge(2, 1);
+        g.add_edge(3, 2);
+
+        let layers = g.compute_layers();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![1]);
+        assert_eq!(layers[1], vec![2]);
+        assert_eq!(layers[2], vec![3]);
+    }
+
+    #[test]
+    fn compute_layers_diamond() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+        g.add_node(make_node(4));
+        g.add_edge(2, 1);
+        g.add_edge(3, 1);
+        g.add_edge(4, 2);
+        g.add_edge(4, 3);
+
+        let layers = g.compute_layers();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![1]);
+        assert_eq!(layers[1], vec![2, 3]);
+        assert_eq!(layers[2], vec![4]);
+    }
+
+    #[test]
+    fn compute_layers_independent() {
+        let mut g = DependencyGraph::new("test");
+        g.add_node(make_node(1));
+        g.add_node(make_node(2));
+        g.add_node(make_node(3));
+
+        let layers = g.compute_layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0], vec![1, 2, 3]);
     }
 }
