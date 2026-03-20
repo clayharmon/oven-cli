@@ -871,18 +871,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 github::safe_comment(
                     &self.github,
                     pr_number,
-                    &format!(
-                        "### Resolving rebase conflicts (round {round})\n\n\
-                         Attempting agent-assisted resolution for {} conflicting file{}: \
-                         {}{COMMENT_FOOTER}",
-                        conflicting_files.len(),
-                        if conflicting_files.len() == 1 { "" } else { "s" },
-                        conflicting_files
-                            .iter()
-                            .map(|f| format!("`{f}`"))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    ),
+                    &format_rebase_conflict_comment(round, &conflicting_files),
                     target_dir,
                 )
                 .await;
@@ -1141,6 +1130,17 @@ fn format_fix_comment(cycle: u32, fixer: &agents::FixerOutput) -> String {
          **Disputed:** {disputed} finding{d_s}{COMMENT_FOOTER}",
         a_s = if addressed == 1 { "" } else { "s" },
         d_s = if disputed == 1 { "" } else { "s" },
+    )
+}
+
+fn format_rebase_conflict_comment(round: u32, conflicting_files: &[String]) -> String {
+    format!(
+        "### Resolving rebase conflicts (round {round})\n\n\
+         Attempting agent-assisted resolution for {} conflicting file{}: \
+         {}{COMMENT_FOOTER}",
+        conflicting_files.len(),
+        if conflicting_files.len() == 1 { "" } else { "s" },
+        conflicting_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", "),
     )
 }
 
