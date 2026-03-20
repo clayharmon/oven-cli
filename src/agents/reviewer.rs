@@ -10,14 +10,19 @@ struct ReviewerPrompt<'a> {
     ctx: &'a AgentContext,
     prior_addressed: &'a [ReviewFinding],
     prior_disputes: &'a [ReviewFinding],
+    prior_unresolved: &'a [ReviewFinding],
+    pre_fix_ref: Option<&'a str>,
 }
 
 pub fn build_prompt(
     ctx: &AgentContext,
     prior_addressed: &[ReviewFinding],
     prior_disputes: &[ReviewFinding],
+    prior_unresolved: &[ReviewFinding],
+    pre_fix_ref: Option<&str>,
 ) -> Result<String> {
-    let tmpl = ReviewerPrompt { ctx, prior_addressed, prior_disputes };
+    let tmpl =
+        ReviewerPrompt { ctx, prior_addressed, prior_disputes, prior_unresolved, pre_fix_ref };
     tmpl.render().context("rendering reviewer template")
 }
 
@@ -45,7 +50,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_review_instructions() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(prompt.contains("reviewer agent"));
         assert!(prompt.contains("#42"));
         assert!(prompt.contains("<issue_title>Fix bug</issue_title>"));
@@ -54,7 +59,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_all_checklist_categories() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(prompt.contains("Pattern Consistency"));
         assert!(prompt.contains("Error Handling"));
         assert!(prompt.contains("Test Coverage"));
@@ -65,7 +70,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_severity_guide() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(prompt.contains("**critical**: Must fix before merge"));
         assert!(prompt.contains("**warning**: Should fix"));
         assert!(prompt.contains("**info**: Noteworthy"));
@@ -73,7 +78,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_json_output_format() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(prompt.contains("\"severity\": \"critical\""));
         assert!(prompt.contains("\"file_path\""));
         assert!(prompt.contains("\"line_number\""));
@@ -81,7 +86,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_specificity_requirement() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(prompt.contains("Specificity Requirement"));
     }
 
@@ -98,7 +103,7 @@ mod tests {
             resolved: true,
             dispute_reason: Some("FlashList v2 removed this prop".to_string()),
         }];
-        let prompt = build_prompt(&sample_context(), &[], &disputes).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &disputes, &[], None).unwrap();
         assert!(prompt.contains("Prior Disputes"));
         assert!(prompt.contains("FlashList v2 removed this prop"));
         assert!(prompt.contains("Missing estimatedItemSize"));
@@ -107,7 +112,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_disputes_section_when_empty() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(!prompt.contains("Prior Disputes"));
     }
 
@@ -124,7 +129,7 @@ mod tests {
             resolved: true,
             dispute_reason: Some("Fixed by changing to entries.present?".to_string()),
         }];
-        let prompt = build_prompt(&sample_context(), &addressed, &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &addressed, &[], &[], None).unwrap();
         assert!(prompt.contains("Prior Addressed Findings"));
         assert!(prompt.contains("Fixed by changing to entries.present?"));
         assert!(prompt.contains("has_more hardcoded to true"));
@@ -133,7 +138,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_addressed_section_when_empty() {
-        let prompt = build_prompt(&sample_context(), &[], &[]).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &[], &[], None).unwrap();
         assert!(!prompt.contains("Prior Addressed Findings"));
         assert!(!prompt.contains("Anti-Goalpost Rules"));
     }
@@ -151,7 +156,7 @@ mod tests {
             resolved: true,
             dispute_reason: Some("reason".to_string()),
         }];
-        let prompt = build_prompt(&sample_context(), &[], &disputes).unwrap();
+        let prompt = build_prompt(&sample_context(), &[], &disputes, &[], None).unwrap();
         assert!(prompt.contains("Anti-Goalpost Rules"));
     }
 }

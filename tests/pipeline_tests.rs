@@ -451,7 +451,7 @@ fn test_runner_with_fix_cycle() -> TestRunner {
             } else if tool_list == ["Read", "Glob", "Grep"] {
                 let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    r#"{"findings":[{"severity":"warning","category":"bug","message":"missing error handling"}],"summary":"1 issue"}"#.to_string()
+                    r#"{"findings":[{"severity":"warning","category":"bug","file_path":"src/main.rs","line_number":10,"message":"missing error handling"}],"summary":"1 issue"}"#.to_string()
                 } else {
                     r#"{"findings":[],"summary":"all clean"}"#.to_string()
                 }
@@ -1841,7 +1841,7 @@ async fn fixer_prose_output_does_not_break_pipeline() {
             } else if tool_list == ["Read", "Glob", "Grep"] {
                 let count = review_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    r#"{"findings":[{"severity":"warning","category":"bug","message":"issue"}],"summary":"1 issue"}"#.to_string()
+                    r#"{"findings":[{"severity":"warning","category":"bug","file_path":"src/lib.rs","line_number":5,"message":"issue"}],"summary":"1 issue"}"#.to_string()
                 } else {
                     r#"{"findings":[],"summary":"clean"}"#.to_string()
                 }
@@ -1887,10 +1887,15 @@ async fn fixer_prose_output_does_not_break_pipeline() {
     let result = executor.run_issue(&issue, false).await;
     assert!(result.is_ok(), "pipeline should succeed with prose fixer output: {result:?}");
 
-    // No findings should be resolved (parse_fixer_output returned default)
+    // Findings should be resolved via "not actionable" recovery (no commits + no output)
     let conn = db_conn.lock().await;
     let runs = db::runs::get_all_runs(&conn).unwrap();
     let resolved = db::agent_runs::get_resolved_findings(&conn, &runs[0].id).unwrap();
     drop(conn);
-    assert!(resolved.is_empty(), "no disputes should be tracked for prose output");
+    assert_eq!(resolved.len(), 1, "finding should be resolved via fixer recovery");
+    assert!(
+        resolved[0].dispute_reason.as_deref().is_some_and(|r| r.contains("no commits")),
+        "should be marked as not actionable: {:?}",
+        resolved[0].dispute_reason,
+    );
 }
