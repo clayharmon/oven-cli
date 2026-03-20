@@ -254,6 +254,14 @@ GitHub Actions with dtolnay/rust-toolchain + Swatinem/rust-cache. Run locally wi
 - `coverage` - cargo-llvm-cov with 85% threshold
 - `deny` - cargo-deny for license/advisory/source audits
 
+## Releasing
+1. Merge the fix/feature PR into `main`.
+2. Create a release branch (`release/vX.Y.Z`), bump the version in `Cargo.toml`, commit, push, open PR, and merge.
+3. Tag the merge on `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. The `release.yml` workflow handles the rest: runs CI, publishes to crates.io, and creates a GitHub Release with auto-generated notes.
+
+Do NOT run `cargo publish` manually. The release workflow owns that step.
+
 ## Skills (Claude Code skills, not oven commands)
 - `/cook` - interactive issue design. Researches the codebase, asks targeted questions, drafts an implementation-ready issue, creates it via `gh issue create` or `oven ticket create` depending on `issue_source` config. Scaffolded into `.claude/skills/` by `oven prep`.
 - `/refine` - codebase audit across 6 dimensions (security, errors, patterns, tests, data, dependencies). Produces a prioritized findings report and offers to create issues from critical/high findings. Scaffolded by `oven prep`.
