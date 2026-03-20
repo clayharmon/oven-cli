@@ -125,8 +125,9 @@ fn show_graph(conn: &rusqlite::Connection, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let graph = DependencyGraph::from_db(conn, &session_id)?;
-        println!("Dependency Graph (session {session_id}):");
-        for line in graph.display_lines() {
+        println!("Dependency Graph (session {session_id})");
+        println!();
+        for line in graph.display_layered() {
             println!("{line}");
         }
     }
