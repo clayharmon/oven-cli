@@ -149,6 +149,34 @@ pub async fn fetch_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Advance the local branch ref to match `origin/<branch>` after a fetch.
+///
+/// If the branch is currently checked out, uses `merge --ff-only` so the
+/// working tree stays in sync. Otherwise updates the ref directly after
+/// verifying the move is a fast-forward. Errors are non-fatal for the
+/// pipeline (which only needs `origin/<branch>`), but keeping the local
+/// branch current avoids surprise "behind by N commits" messages.
+pub async fn advance_local_branch(repo_dir: &Path, branch: &str) -> Result<()> {
+    let remote_ref = format!("origin/{branch}");
+    let current = run_git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .context("detecting current branch")?;
+
+    if current == branch {
+        run_git(repo_dir, &["merge", "--ff-only", &remote_ref])
+            .await
+            .context("fast-forwarding checked-out branch")?;
+    } else {
+        // Only update if it's a fast-forward (local is ancestor of remote).
+        if run_git(repo_dir, &["merge-base", "--is-ancestor", branch, &remote_ref]).await.is_ok() {
+            run_git(repo_dir, &["branch", "-f", branch, &remote_ref])
+                .await
+                .context("updating local branch ref")?;
+        }
+    }
+    Ok(())
+}
+
 /// Force-push a branch to origin using `--force-with-lease` for safety.
 ///
 /// Used after rebasing a pipeline branch onto the updated base branch.
@@ -791,50 +819,13 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_branch_updates_remote_tracking_ref() {
-        let dir = init_temp_repo().await;
+        let (dir, remote_dir) = init_temp_repo_with_remote().await;
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
 
-        // Set up a bare remote
-        let remote_dir = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .args(["clone", "--bare", &dir.path().to_string_lossy(), "."])
-            .current_dir(remote_dir.path())
-            .output()
-            .await
-            .unwrap();
-        run_git(dir.path(), &["remote", "add", "origin", &remote_dir.path().to_string_lossy()])
-            .await
-            .unwrap();
-
-        // Initial fetch to create the tracking ref
-        run_git(dir.path(), &["fetch", "origin"]).await.unwrap();
         let before_sha =
             run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
 
-        // Simulate a remote advance: clone the bare repo, commit, push
-        let other_dir = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .args(["clone", &remote_dir.path().to_string_lossy(), "."])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        tokio::fs::write(other_dir.path().join("remote.txt"), "new content").await.unwrap();
-        run_git(other_dir.path(), &["add", "."]).await.unwrap();
-        run_git(other_dir.path(), &["commit", "-m", "remote commit"]).await.unwrap();
-        run_git(other_dir.path(), &["push", "origin", &branch]).await.unwrap();
+        let _other = push_remote_commit(remote_dir.path(), &branch, "remote.txt").await;
 
         // Remote tracking ref should still be at the old SHA
         let stale_sha =
@@ -861,39 +852,85 @@ mod tests {
         let (dir, remote_dir) = init_temp_repo_with_remote().await;
         let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
 
-        // Simulate a remote advance (like a merged PR)
-        let other_dir = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .args(["clone", &remote_dir.path().to_string_lossy(), "."])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(other_dir.path())
-            .output()
-            .await
-            .unwrap();
-        tokio::fs::write(other_dir.path().join("merged.txt"), "from merged PR").await.unwrap();
-        run_git(other_dir.path(), &["add", "."]).await.unwrap();
-        run_git(other_dir.path(), &["commit", "-m", "merged PR commit"]).await.unwrap();
-        run_git(other_dir.path(), &["push", "origin", &branch]).await.unwrap();
+        let _other = push_remote_commit(remote_dir.path(), &branch, "merged.txt").await;
 
-        // Fetch to update origin/<branch>
         fetch_branch(dir.path(), &branch).await.unwrap();
 
-        // Create a worktree -- it should include the remote change
         let wt = create_worktree(dir.path(), 99, &branch).await.unwrap();
         assert!(
             wt.path.join("merged.txt").exists(),
             "worktree should contain the file from the merged PR"
         );
+    }
+
+    /// Helper: push a commit from a separate clone so the local repo falls behind.
+    async fn push_remote_commit(
+        remote_dir: &std::path::Path,
+        branch: &str,
+        filename: &str,
+    ) -> tempfile::TempDir {
+        let other = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["clone", &remote_dir.to_string_lossy(), "."])
+            .current_dir(other.path())
+            .output()
+            .await
+            .unwrap();
+        for args in
+            [&["config", "user.email", "test@test.com"][..], &["config", "user.name", "Test"]]
+        {
+            Command::new("git").args(args).current_dir(other.path()).output().await.unwrap();
+        }
+        tokio::fs::write(other.path().join(filename), "content").await.unwrap();
+        run_git(other.path(), &["add", "."]).await.unwrap();
+        run_git(other.path(), &["commit", "-m", &format!("add {filename}")]).await.unwrap();
+        run_git(other.path(), &["push", "origin", branch]).await.unwrap();
+        other
+    }
+
+    #[tokio::test]
+    async fn advance_local_branch_when_checked_out() {
+        let (dir, remote_dir) = init_temp_repo_with_remote().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        let before = run_git(dir.path(), &["rev-parse", &branch]).await.unwrap();
+
+        let _other = push_remote_commit(remote_dir.path(), &branch, "new.txt").await;
+        fetch_branch(dir.path(), &branch).await.unwrap();
+
+        // Local branch should still be behind after fetch
+        let after_fetch = run_git(dir.path(), &["rev-parse", &branch]).await.unwrap();
+        assert_eq!(before, after_fetch, "local branch should not advance from fetch alone");
+
+        // advance_local_branch should fast-forward it
+        advance_local_branch(dir.path(), &branch).await.unwrap();
+
+        let after_advance = run_git(dir.path(), &["rev-parse", &branch]).await.unwrap();
+        let remote_sha =
+            run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
+        assert_eq!(after_advance, remote_sha, "local branch should match origin after advance");
+        assert!(dir.path().join("new.txt").exists(), "working tree should have the new file");
+    }
+
+    #[tokio::test]
+    async fn advance_local_branch_when_not_checked_out() {
+        let (dir, remote_dir) = init_temp_repo_with_remote().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        // Switch to a different branch so the base branch is not checked out
+        run_git(dir.path(), &["checkout", "-b", "other"]).await.unwrap();
+
+        let before = run_git(dir.path(), &["rev-parse", &branch]).await.unwrap();
+
+        let _other = push_remote_commit(remote_dir.path(), &branch, "new.txt").await;
+        fetch_branch(dir.path(), &branch).await.unwrap();
+
+        advance_local_branch(dir.path(), &branch).await.unwrap();
+
+        let after = run_git(dir.path(), &["rev-parse", &branch]).await.unwrap();
+        let remote_sha =
+            run_git(dir.path(), &["rev-parse", &format!("origin/{branch}")]).await.unwrap();
+        assert_ne!(before, after, "local branch should have moved");
+        assert_eq!(after, remote_sha, "local branch should match origin after advance");
     }
 }

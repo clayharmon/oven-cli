@@ -509,6 +509,12 @@ async fn fetch_base_branch_in(repo_dir: &Path) {
                     "failed to fetch base branch after merge"
                 );
             } else {
+                if let Err(e) = git::advance_local_branch(repo_dir, &branch).await {
+                    warn!(
+                        repo = %repo_dir.display(), branch = %branch, error = %e,
+                        "failed to advance local branch after fetch"
+                    );
+                }
                 info!(
                     repo = %repo_dir.display(), branch = %branch,
                     "updated base branch after merge"
