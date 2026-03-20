@@ -903,8 +903,12 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 )));
             }
 
-            // Check if the agent actually resolved the conflicts
-            let remaining = git::conflicting_files(worktree_path).await;
+            // Check if the agent actually resolved the conflicts by inspecting
+            // file content for markers. We cannot use `conflicting_files()` here
+            // because it checks git index state (diff-filter=U), and files remain
+            // "Unmerged" until staged with `git add` -- which hasn't happened yet.
+            let remaining =
+                git::files_with_conflict_markers(worktree_path, &conflicting_files).await;
             if !remaining.is_empty() {
                 warn!(
                     run_id = %run_id,
