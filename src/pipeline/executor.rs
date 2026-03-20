@@ -26,7 +26,7 @@ pub struct PipelineOutcome {
     pub run_id: String,
     pub pr_number: u32,
     /// Branch name, needed for cleanup after the worktree is removed.
-    pub branch: String,
+    pub branch: Option<String>,
     /// Worktree path, retained so the caller can clean up after merge.
     pub worktree_path: PathBuf,
     /// Repo directory the worktree belongs to (needed for `git::remove_worktree`).
@@ -143,7 +143,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         Ok(PipelineOutcome {
             run_id,
             pr_number,
-            branch: worktree.branch,
+            branch: Some(worktree.branch),
             worktree_path: worktree.path,
             target_dir,
         })
@@ -169,11 +169,11 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                 "failed to clean up worktree after merge"
             );
         }
-        if !outcome.branch.is_empty() {
-            if let Err(e) = git::delete_branch(&outcome.target_dir, &outcome.branch).await {
+        if let Some(ref branch) = outcome.branch {
+            if let Err(e) = git::delete_branch(&outcome.target_dir, branch).await {
                 warn!(
                     run_id = %outcome.run_id,
-                    branch = %outcome.branch,
+                    branch = %branch,
                     error = %e,
                     "failed to delete local branch after merge"
                 );
@@ -261,7 +261,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         let branch = {
             let conn = self.db.lock().await;
-            db::runs::get_run(&conn, run_id)?.and_then(|r| r.branch).unwrap_or_default()
+            db::runs::get_run(&conn, run_id)?.and_then(|r| r.branch)
         };
 
         Ok(PipelineOutcome {

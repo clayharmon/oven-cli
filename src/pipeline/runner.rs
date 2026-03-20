@@ -683,7 +683,7 @@ mod tests {
             let outcome = PipelineOutcome {
                 run_id: "run-abc".to_string(),
                 pr_number: 42,
-                branch: "oven/issue-1-abc12345".to_string(),
+                branch: Some("oven/issue-1-abc12345".to_string()),
                 worktree_path: PathBuf::from("/tmp/wt"),
                 target_dir: PathBuf::from("/tmp"),
             };
@@ -869,7 +869,7 @@ mod tests {
             let outcome = PipelineOutcome {
                 run_id: "run-1".to_string(),
                 pr_number: 10,
-                branch: "oven/issue-1-abc12345".to_string(),
+                branch: Some("oven/issue-1-abc12345".to_string()),
                 worktree_path: PathBuf::from("/tmp/wt"),
                 target_dir: PathBuf::from("/tmp"),
             };
