@@ -190,11 +190,33 @@ pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
     RebaseOutcome::RebaseConflicts(conflicting)
 }
 
-/// List files with unresolved merge conflicts.
+/// List files with unresolved merge conflicts (git index state).
+///
+/// Uses `git diff --diff-filter=U` which checks the index, not file content.
+/// A file stays "Unmerged" until `git add` is run on it, even if conflict
+/// markers have been removed from the working tree.
 pub async fn conflicting_files(repo_dir: &Path) -> Vec<String> {
     run_git(repo_dir, &["diff", "--name-only", "--diff-filter=U"])
         .await
         .map_or_else(|_| vec![], |output| output.lines().map(String::from).collect())
+}
+
+/// Check which files still contain conflict markers in their content.
+///
+/// Unlike [`conflicting_files`], this reads the actual working tree content
+/// rather than relying on git index state. This is the correct check after an
+/// agent edits files to resolve conflicts but before `git add` is run.
+pub async fn files_with_conflict_markers(repo_dir: &Path, files: &[String]) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for file in files {
+        let path = repo_dir.join(file);
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
+                unresolved.push(file.clone());
+            }
+        }
+    }
+    unresolved
 }
 
 /// Abort an in-progress rebase.
@@ -644,5 +666,91 @@ mod tests {
 
         assert!(!dir.path().join(".git/rebase-merge").exists());
         assert!(!dir.path().join(".git/rebase-apply").exists());
+    }
+
+    #[tokio::test]
+    async fn conflict_markers_detected_in_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_markers = "line 1\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nline 2";
+        let without_markers = "line 1\nresolved content\nline 2";
+
+        tokio::fs::write(dir.path().join("conflicted.txt"), with_markers).await.unwrap();
+        tokio::fs::write(dir.path().join("resolved.txt"), without_markers).await.unwrap();
+
+        let files = vec!["conflicted.txt".to_string(), "resolved.txt".to_string()];
+        let result = files_with_conflict_markers(dir.path(), &files).await;
+
+        assert_eq!(result, vec!["conflicted.txt"]);
+    }
+
+    #[tokio::test]
+    async fn conflict_markers_empty_when_all_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "clean content").await.unwrap();
+        tokio::fs::write(dir.path().join("b.txt"), "also clean").await.unwrap();
+
+        let files = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let result = files_with_conflict_markers(dir.path(), &files).await;
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflict_markers_missing_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec!["nonexistent.txt".to_string()];
+        let result = files_with_conflict_markers(dir.path(), &files).await;
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_file_still_unmerged_in_index() {
+        // Reproduces the root cause: agent resolves conflict markers in the
+        // working tree, but git index still shows the file as Unmerged because
+        // `git add` hasn't been run yet.
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "feature version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "base version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let outcome = start_rebase(dir.path(), &branch).await;
+        let files = match outcome {
+            RebaseOutcome::RebaseConflicts(f) => f,
+            other => panic!("expected RebaseConflicts, got {other:?}"),
+        };
+
+        // Resolve the conflict markers in the working tree (simulating what an agent does)
+        tokio::fs::write(dir.path().join("README.md"), "resolved version").await.unwrap();
+
+        // Index-based check still sees the file as Unmerged (the old broken check)
+        let index_conflicts = conflicting_files(dir.path()).await;
+        assert!(
+            !index_conflicts.is_empty(),
+            "file should still be Unmerged in git index before git add"
+        );
+
+        // Content-based check correctly sees no conflict markers
+        let content_conflicts = files_with_conflict_markers(dir.path(), &files).await;
+        assert!(
+            content_conflicts.is_empty(),
+            "file content has no conflict markers, should be empty"
+        );
+
+        // Clean up
+        abort_rebase(dir.path()).await;
     }
 }
