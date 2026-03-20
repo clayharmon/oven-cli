@@ -22,6 +22,7 @@ pub struct Config {
     pub pipeline: PipelineConfig,
     pub labels: LabelConfig,
     pub multi_repo: MultiRepoConfig,
+    pub models: ModelConfig,
     #[serde(default)]
     pub repos: HashMap<String, PathBuf>,
 }
@@ -36,6 +37,37 @@ pub struct MultiRepoConfig {
 impl Default for MultiRepoConfig {
     fn default() -> Self {
         Self { enabled: false, target_field: "target_repo".to_string() }
+    }
+}
+
+/// Per-agent model overrides.
+///
+/// `default` applies to any agent without an explicit override. Values are passed
+/// directly as the `--model` flag to the claude CLI (e.g. "opus", "sonnet").
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelConfig {
+    pub default: Option<String>,
+    pub planner: Option<String>,
+    pub implementer: Option<String>,
+    pub reviewer: Option<String>,
+    pub fixer: Option<String>,
+    pub merger: Option<String>,
+}
+
+impl ModelConfig {
+    /// Get the model for a given agent role, falling back to `default`.
+    /// Returns `None` if neither the agent nor default is set (use CLI default).
+    pub fn model_for(&self, role: &str) -> Option<&str> {
+        let agent_override = match role {
+            "planner" => self.planner.as_deref(),
+            "implementer" => self.implementer.as_deref(),
+            "reviewer" => self.reviewer.as_deref(),
+            "fixer" => self.fixer.as_deref(),
+            "merger" => self.merger.as_deref(),
+            _ => None,
+        };
+        agent_override.or(self.default.as_deref())
     }
 }
 
@@ -92,6 +124,7 @@ struct RawConfig {
     pipeline: Option<RawPipelineConfig>,
     labels: Option<RawLabelConfig>,
     multi_repo: Option<RawMultiRepoConfig>,
+    models: Option<RawModelConfig>,
     repos: Option<HashMap<String, PathBuf>>,
 }
 
@@ -127,6 +160,17 @@ struct RawLabelConfig {
 struct RawMultiRepoConfig {
     enabled: Option<bool>,
     target_field: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawModelConfig {
+    default: Option<String>,
+    planner: Option<String>,
+    implementer: Option<String>,
+    reviewer: Option<String>,
+    fixer: Option<String>,
+    merger: Option<String>,
 }
 
 impl Config {
@@ -255,6 +299,11 @@ poll_interval = 60
 # cooking = "o-cooking"
 # complete = "o-complete"
 # failed = "o-failed"
+
+# [models]
+# default = "sonnet"
+# implementer = "opus"
+# fixer = "opus"
 "#
         .to_string()
     }
@@ -318,6 +367,27 @@ fn apply_raw(config: &mut Config, raw: &RawConfig, allow_repos: bool) {
         }
     }
 
+    if let Some(ref models) = raw.models {
+        if models.default.is_some() {
+            config.models.default.clone_from(&models.default);
+        }
+        if models.planner.is_some() {
+            config.models.planner.clone_from(&models.planner);
+        }
+        if models.implementer.is_some() {
+            config.models.implementer.clone_from(&models.implementer);
+        }
+        if models.reviewer.is_some() {
+            config.models.reviewer.clone_from(&models.reviewer);
+        }
+        if models.fixer.is_some() {
+            config.models.fixer.clone_from(&models.fixer);
+        }
+        if models.merger.is_some() {
+            config.models.merger.clone_from(&models.merger);
+        }
+    }
+
     // repos only honored from user config (security: project config shouldn't
     // be able to point the tool at arbitrary repos on the filesystem)
     if allow_repos {
@@ -350,6 +420,7 @@ mod tests {
                 pipeline: PipelineConfig { max_parallel, cost_budget, poll_interval, turn_limit },
                 labels: LabelConfig { ready, cooking, complete, failed },
                 multi_repo: MultiRepoConfig::default(),
+                models: ModelConfig::default(),
                 repos: HashMap::new(),
             };
             let serialized = toml::to_string(&config).unwrap();
@@ -528,6 +599,7 @@ api = "/home/user/dev/api"
             pipeline: PipelineConfig { max_parallel: 5, cost_budget: 25.0, ..Default::default() },
             labels: LabelConfig::default(),
             multi_repo: MultiRepoConfig::default(),
+            models: ModelConfig::default(),
             repos: HashMap::from([("svc".to_string(), PathBuf::from("/tmp/svc"))]),
         };
         let serialized = toml::to_string(&config).unwrap();
@@ -691,5 +763,76 @@ issue_source = "jira"
         let serialized = toml::to_string(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.project.issue_source, IssueSource::Local);
+    }
+
+    #[test]
+    fn model_for_returns_agent_override() {
+        let models = ModelConfig {
+            default: Some("sonnet".to_string()),
+            implementer: Some("opus".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(models.model_for("implementer"), Some("opus"));
+        assert_eq!(models.model_for("reviewer"), Some("sonnet"));
+    }
+
+    #[test]
+    fn model_for_returns_none_when_unset() {
+        let models = ModelConfig::default();
+        assert_eq!(models.model_for("planner"), None);
+    }
+
+    #[test]
+    fn model_config_from_toml() {
+        let toml_str = r#"
+[models]
+default = "sonnet"
+implementer = "opus"
+fixer = "opus"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.models.default.as_deref(), Some("sonnet"));
+        assert_eq!(config.models.implementer.as_deref(), Some("opus"));
+        assert_eq!(config.models.fixer.as_deref(), Some("opus"));
+        assert!(config.models.planner.is_none());
+        assert!(config.models.reviewer.is_none());
+        assert!(config.models.merger.is_none());
+    }
+
+    #[test]
+    fn model_config_project_overrides_user() {
+        let user_toml = r#"
+[models]
+default = "sonnet"
+implementer = "sonnet"
+"#;
+        let project_toml = r#"
+[models]
+implementer = "opus"
+"#;
+        let mut config = Config::default();
+        let user_raw: RawConfig = toml::from_str(user_toml).unwrap();
+        apply_raw(&mut config, &user_raw, true);
+        assert_eq!(config.models.implementer.as_deref(), Some("sonnet"));
+
+        let project_raw: RawConfig = toml::from_str(project_toml).unwrap();
+        apply_raw(&mut config, &project_raw, false);
+        assert_eq!(config.models.implementer.as_deref(), Some("opus"));
+        // default stays from user config
+        assert_eq!(config.models.default.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn model_config_defaults_when_not_specified() {
+        let toml_str = r"
+[pipeline]
+max_parallel = 1
+";
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        apply_raw(&mut config, &raw, false);
+        assert_eq!(config.models, ModelConfig::default());
     }
 }
