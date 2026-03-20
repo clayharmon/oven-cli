@@ -301,7 +301,7 @@ async fn poll_awaiting_merges<R: CommandRunner + 'static>(
             crate::github::PrState::Merged => {
                 info!(issue = num, pr = pr_number, "PR merged, finalizing");
                 if let Some(ref issue) = issue {
-                    match executor.reconstruct_outcome(issue, &run_id, pr_number) {
+                    match executor.reconstruct_outcome(issue, &run_id, pr_number).await {
                         Ok(outcome) => {
                             if let Err(e) = executor.finalize_merge(&outcome, issue).await {
                                 warn!(issue = num, error = %e, "finalize_merge after poll failed");
@@ -683,6 +683,7 @@ mod tests {
             let outcome = PipelineOutcome {
                 run_id: "run-abc".to_string(),
                 pr_number: 42,
+                branch: Some("oven/issue-1-abc12345".to_string()),
                 worktree_path: PathBuf::from("/tmp/wt"),
                 target_dir: PathBuf::from("/tmp"),
             };
@@ -868,6 +869,7 @@ mod tests {
             let outcome = PipelineOutcome {
                 run_id: "run-1".to_string(),
                 pr_number: 10,
+                branch: Some("oven/issue-1-abc12345".to_string()),
                 worktree_path: PathBuf::from("/tmp/wt"),
                 target_dir: PathBuf::from("/tmp"),
             };
