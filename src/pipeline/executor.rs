@@ -515,7 +515,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
                     info!(run_id = %run_id, pr = pr_number, attempt, "PR merged");
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_MERGE_ATTEMPTS && is_not_mergeable(&e) => {
+                Err(e) if attempt < MAX_MERGE_ATTEMPTS && is_retryable_merge_error(&e) => {
                     warn!(
                         run_id = %run_id, pr = pr_number, attempt,
                         "PR not mergeable, re-rebasing and retrying"
@@ -1138,14 +1138,21 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
     }
 }
 
-/// Check whether a merge error indicates the PR is not mergeable (stale branch).
+/// Check whether a merge error is retryable (stale branch, not permanently blocked).
 ///
-/// GitHub's GraphQL API returns "Pull Request is not mergeable" when the branch
-/// needs updating. This is distinct from permanent errors like "Squash merges
-/// are not allowed" which should not be retried.
-fn is_not_mergeable(err: &anyhow::Error) -> bool {
+/// GitHub's GraphQL API returns different errors for stale branches:
+/// - "Pull Request is not mergeable" (branch has conflicts)
+/// - "Head branch is out of date" (branch protection requires up-to-date branch)
+/// - "Required status check ... is expected" (checks haven't run on rebased branch)
+///
+/// These are distinct from permanent errors like "Squash merges are not allowed"
+/// or "merge method not allowed" which should not be retried.
+fn is_retryable_merge_error(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("not mergeable") && !msg.contains("not allowed")
+    if msg.contains("not allowed") {
+        return false;
+    }
+    msg.contains("not mergeable") || msg.contains("out of date") || msg.contains("is expected")
 }
 
 const COMMENT_FOOTER: &str =
@@ -1787,22 +1794,38 @@ mod tests {
     }
 
     #[test]
-    fn is_not_mergeable_detects_graphql_error() {
+    fn retryable_merge_error_not_mergeable() {
         let err = anyhow::anyhow!("GraphQL: Pull Request is not mergeable (mergePullRequest)");
-        assert!(is_not_mergeable(&err));
+        assert!(is_retryable_merge_error(&err));
     }
 
     #[test]
-    fn is_not_mergeable_rejects_not_allowed_errors() {
+    fn retryable_merge_error_out_of_date() {
+        let err = anyhow::anyhow!(
+            "GraphQL: Head branch is out of date. \
+             Review and try the merge again. (mergePullRequest)"
+        );
+        assert!(is_retryable_merge_error(&err));
+    }
+
+    #[test]
+    fn retryable_merge_error_status_check_expected() {
+        let err =
+            anyhow::anyhow!("GraphQL: Required status check \"ci\" is expected (mergePullRequest)");
+        assert!(is_retryable_merge_error(&err));
+    }
+
+    #[test]
+    fn retryable_merge_error_rejects_not_allowed() {
         let err = anyhow::anyhow!(
             "GraphQL: Squash merges are not allowed on this repository. (mergePullRequest)"
         );
-        assert!(!is_not_mergeable(&err));
+        assert!(!is_retryable_merge_error(&err));
     }
 
     #[test]
-    fn is_not_mergeable_rejects_unrelated_errors() {
+    fn retryable_merge_error_rejects_unrelated() {
         let err = anyhow::anyhow!("network timeout");
-        assert!(!is_not_mergeable(&err));
+        assert!(!is_retryable_merge_error(&err));
     }
 }
