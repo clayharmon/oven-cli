@@ -132,6 +132,36 @@ pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if the worktree has any uncommitted changes, including untracked files.
+pub async fn is_dirty(repo_dir: &Path) -> Result<bool> {
+    let output =
+        run_git(repo_dir, &["status", "--porcelain"]).await.context("checking dirty state")?;
+    Ok(!output.is_empty())
+}
+
+/// Stage modified/deleted tracked files and commit them with the given message.
+///
+/// Used to preserve agent work (e.g. fixer edits) that wasn't committed before
+/// the rebase step. Uses `git add -u` (tracked files only) rather than `git add -A`
+/// to avoid committing untracked artifacts like temp files or test output.
+///
+/// Checks for tracked changes with `-uno` (ignore untracked) so that worktrees
+/// with only untracked files don't trigger a commit attempt that would fail.
+///
+/// Returns `Ok(true)` if a commit was created, `Ok(false)` if there was nothing
+/// to commit.
+pub async fn commit_all(repo_dir: &Path, message: &str) -> Result<bool> {
+    let tracked_changes = run_git(repo_dir, &["status", "--porcelain", "-uno"])
+        .await
+        .context("checking tracked changes")?;
+    if tracked_changes.is_empty() {
+        return Ok(false);
+    }
+    run_git(repo_dir, &["add", "-u"]).await.context("staging tracked changes")?;
+    run_git(repo_dir, &["commit", "-m", message]).await.context("committing changes")?;
+    Ok(true)
+}
+
 /// Push a branch to origin.
 pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_git(repo_dir, &["push", "origin", branch]).await.context("pushing branch")?;
@@ -141,12 +171,12 @@ pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
 /// Fetch a branch from origin to update the remote tracking ref.
 ///
 /// Used between pipeline layers so that new worktrees (which branch from
-/// `origin/<branch>`) start from post-merge state.
+/// `origin/<branch>`) start from post-merge state. Retries once on transient
+/// ref lock contention from parallel fetches.
 pub async fn fetch_branch(repo_dir: &Path, branch: &str) -> Result<()> {
-    run_git(repo_dir, &["fetch", "origin", branch])
+    fetch_with_retry(repo_dir, branch)
         .await
-        .with_context(|| format!("fetching {branch} from origin"))?;
-    Ok(())
+        .with_context(|| format!("fetching {branch} from origin"))
 }
 
 /// Advance the local branch ref to match `origin/<branch>` after a fetch.
@@ -207,28 +237,40 @@ pub enum RebaseOutcome {
 /// working tree is left in a mid-rebase state and `RebaseConflicts` is returned
 /// with the list of conflicting files. The caller should resolve them and call
 /// [`rebase_continue`], or [`abort_rebase`] to give up.
+///
+/// Uses `--empty=drop` so commits that become empty after rebase (because their
+/// changes are already on the target branch) are silently dropped instead of
+/// stopping the rebase.
 pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
-    if let Err(e) = run_git(repo_dir, &["fetch", "origin", base_branch]).await {
+    if let Err(e) = fetch_with_retry(repo_dir, base_branch).await {
         return RebaseOutcome::Failed(format!("failed to fetch {base_branch}: {e}"));
     }
 
     let target = format!("origin/{base_branch}");
 
     let no_editor = [("GIT_EDITOR", "true")];
-    if run_git_with_env(repo_dir, &["rebase", &target], &no_editor).await.is_ok() {
+    let Err(rebase_err) =
+        run_git_with_env(repo_dir, &["rebase", "--empty=drop", &target], &no_editor).await
+    else {
         return RebaseOutcome::Clean;
+    };
+
+    // Rebase command failed. Check if a rebase is actually in progress -- if not,
+    // the failure was something else entirely (dirty worktree, invalid ref, etc.)
+    // and we should report the real error rather than misclassifying it.
+    if !rebase_in_progress(repo_dir).await {
+        return RebaseOutcome::Failed(format!("rebase could not start: {rebase_err}"));
     }
 
-    // Rebase stopped -- check if it's real conflicts or an empty commit.
     let conflicting = conflicting_files(repo_dir).await;
     if conflicting.is_empty() {
-        // No conflicting files means an empty commit (patch already applied).
-        // Skip it rather than sending an agent to resolve nothing.
-        match skip_empty_rebase_commits(repo_dir).await {
-            Ok(None) => return RebaseOutcome::Clean,
-            Ok(Some(files)) => return RebaseOutcome::RebaseConflicts(files),
-            Err(e) => return RebaseOutcome::Failed(format!("{e:#}")),
-        }
+        // Rebase is in progress but no conflicting files. This shouldn't happen
+        // with --empty=drop (empty commits are auto-dropped), but handle it
+        // gracefully by aborting and reporting the unexpected state.
+        abort_rebase(repo_dir).await;
+        return RebaseOutcome::Failed(
+            "rebase stopped with no conflicts and no empty commits".to_string(),
+        );
     }
     RebaseOutcome::RebaseConflicts(conflicting)
 }
@@ -267,34 +309,41 @@ pub async fn abort_rebase(repo_dir: &Path) {
     let _ = run_git(repo_dir, &["rebase", "--abort"]).await;
 }
 
-/// Skip empty commits during a rebase when no conflicting files are present.
+/// Check whether a rebase is currently in progress.
 ///
-/// During rebase replay, a commit can become empty if its changes are already
-/// present on the target branch. Git stops on these by default. This function
-/// runs `git rebase --skip` in a loop until the rebase completes or real
-/// conflicts appear.
-///
-/// Returns `Ok(None)` if the rebase completed after skipping.
-/// Returns `Ok(Some(files))` if real conflicts appeared after a skip.
-/// Returns `Err` if the maximum number of skips was exhausted.
-async fn skip_empty_rebase_commits(repo_dir: &Path) -> Result<Option<Vec<String>>> {
-    const MAX_SKIPS: u32 = 10;
-    let no_editor = [("GIT_EDITOR", "true")];
+/// Git creates `.git/rebase-merge` (for interactive/standard rebase) or
+/// `.git/rebase-apply` (for `git am` / `git rebase --apply`) while a rebase
+/// is active. Worktrees store these under `.git/worktrees/<name>/` instead,
+/// so we use `git rev-parse --git-dir` to find the correct location.
+pub async fn rebase_in_progress(repo_dir: &Path) -> bool {
+    let git_dir = run_git(repo_dir, &["rev-parse", "--git-dir"])
+        .await
+        .map_or_else(|_| repo_dir.join(".git"), |s| PathBuf::from(s.trim()));
 
-    for _ in 0..MAX_SKIPS {
-        if run_git_with_env(repo_dir, &["rebase", "--skip"], &no_editor).await.is_ok() {
-            return Ok(None);
-        }
+    let git_dir = if git_dir.is_absolute() { git_dir } else { repo_dir.join(git_dir) };
 
-        // Skip stopped again -- check for real conflicts vs another empty commit.
-        let conflicts = conflicting_files(repo_dir).await;
-        if !conflicts.is_empty() {
-            return Ok(Some(conflicts));
+    tokio::fs::try_exists(git_dir.join("rebase-merge")).await.unwrap_or(false)
+        || tokio::fs::try_exists(git_dir.join("rebase-apply")).await.unwrap_or(false)
+}
+
+/// Fetch with a single retry for transient failures (e.g. ref lock contention).
+async fn fetch_with_retry(repo_dir: &Path, branch: &str) -> Result<()> {
+    match run_git(repo_dir, &["fetch", "origin", branch]).await {
+        Ok(_) => Ok(()),
+        Err(first_err) => {
+            let msg = format!("{first_err:#}");
+            if msg.contains("unable to update local ref") || msg.contains("cannot lock ref") {
+                tracing::warn!(branch, "fetch failed with ref lock contention, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                run_git(repo_dir, &["fetch", "origin", branch])
+                    .await
+                    .map(|_| ())
+                    .with_context(|| format!("retry fetch {branch}"))
+            } else {
+                Err(first_err)
+            }
         }
     }
-
-    abort_rebase(repo_dir).await;
-    anyhow::bail!("rebase had too many empty commits (skipped {MAX_SKIPS} times)")
 }
 
 /// Stage resolved conflict files and continue the in-progress rebase.
@@ -302,6 +351,10 @@ async fn skip_empty_rebase_commits(repo_dir: &Path) -> Result<Option<Vec<String>
 /// Returns `Ok(None)` if the rebase completed successfully after continuing.
 /// Returns `Ok(Some(files))` if continuing hit new conflicts on the next commit.
 /// Returns `Err` on unexpected failures.
+///
+/// Because the parent `start_rebase` uses `--empty=drop`, any commits that
+/// become empty after conflict resolution are automatically dropped by git
+/// during `--continue`.
 pub async fn rebase_continue(
     repo_dir: &Path,
     conflicting: &[String],
@@ -311,15 +364,19 @@ pub async fn rebase_continue(
     }
 
     let no_editor = [("GIT_EDITOR", "true")];
-    if run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await.is_ok() {
+    let Err(continue_err) = run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await
+    else {
         return Ok(None);
+    };
+
+    // rebase --continue stopped again -- check for new conflicts on the next commit.
+    if !rebase_in_progress(repo_dir).await {
+        anyhow::bail!("rebase --continue failed and no rebase is in progress: {continue_err}");
     }
 
-    // rebase --continue stopped again -- new conflicts on the next commit.
     let new_conflicts = conflicting_files(repo_dir).await;
     if new_conflicts.is_empty() {
-        // Empty commit after continue -- skip it.
-        return skip_empty_rebase_commits(repo_dir).await;
+        anyhow::bail!("rebase stopped after continue with no conflicts: {continue_err}");
     }
     Ok(Some(new_conflicts))
 }
@@ -815,6 +872,120 @@ mod tests {
 
         // Clean up
         abort_rebase(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn is_dirty_detects_modified_files() {
+        let dir = init_temp_repo().await;
+        assert!(!is_dirty(dir.path()).await.unwrap());
+
+        tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
+        assert!(is_dirty(dir.path()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn commit_all_commits_tracked_changes_only() {
+        let dir = init_temp_repo().await;
+
+        // Untracked file should NOT be staged (git add -u ignores untracked)
+        tokio::fs::write(dir.path().join("new.txt"), "new file").await.unwrap();
+        // Modified tracked file should be staged
+        tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
+
+        let committed = commit_all(dir.path(), "save agent work").await.unwrap();
+        assert!(committed);
+
+        let log = run_git(dir.path(), &["log", "--oneline", "-1"]).await.unwrap();
+        assert!(log.contains("save agent work"));
+
+        // README.md should be committed, new.txt should still be untracked
+        let diff = run_git(dir.path(), &["diff", "HEAD~1", "--name-only"]).await.unwrap();
+        assert!(diff.contains("README.md"));
+        assert!(!diff.contains("new.txt"));
+
+        // Worktree still dirty because of the untracked file
+        assert!(is_dirty(dir.path()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn commit_all_returns_false_when_clean() {
+        let dir = init_temp_repo().await;
+        let committed = commit_all(dir.path(), "nothing to commit").await.unwrap();
+        assert!(!committed);
+    }
+
+    #[tokio::test]
+    async fn commit_all_skips_untracked_only_worktree() {
+        let dir = init_temp_repo().await;
+
+        // Only untracked files -- is_dirty sees them but commit_all should skip
+        tokio::fs::write(dir.path().join("temp.log"), "agent output").await.unwrap();
+        assert!(is_dirty(dir.path()).await.unwrap());
+
+        let committed = commit_all(dir.path(), "should not commit").await.unwrap();
+        assert!(!committed);
+
+        // The untracked file should still be there, not committed
+        let log = run_git(dir.path(), &["log", "--oneline", "-1"]).await.unwrap();
+        assert!(!log.contains("should not commit"));
+    }
+
+    #[tokio::test]
+    async fn start_rebase_dirty_worktree_returns_failed() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("feature.txt"), "feature work").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature commit"]).await.unwrap();
+
+        // Leave uncommitted changes to a tracked file (simulating fixer that didn't commit)
+        tokio::fs::write(dir.path().join("README.md"), "uncommitted work").await.unwrap();
+
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let outcome = start_rebase(dir.path(), &branch).await;
+        assert!(
+            matches!(outcome, RebaseOutcome::Failed(ref msg) if msg.contains("could not start")),
+            "expected Failed with 'could not start' message, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_in_progress_false_when_clean() {
+        let dir = init_temp_repo().await;
+        assert!(!rebase_in_progress(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn rebase_in_progress_true_during_conflict() {
+        let dir = init_temp_repo().await;
+        let branch = run_git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "-b", "feature"]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "feature version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "feature change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", &branch]).await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "base version").await.unwrap();
+        run_git(dir.path(), &["add", "."]).await.unwrap();
+        run_git(dir.path(), &["commit", "-m", "base change"]).await.unwrap();
+
+        run_git(dir.path(), &["checkout", "feature"]).await.unwrap();
+        run_git(dir.path(), &["remote", "add", "origin", &dir.path().to_string_lossy()])
+            .await
+            .unwrap();
+
+        let outcome = start_rebase(dir.path(), &branch).await;
+        assert!(matches!(outcome, RebaseOutcome::RebaseConflicts(_)));
+        assert!(rebase_in_progress(dir.path()).await);
+
+        abort_rebase(dir.path()).await;
+        assert!(!rebase_in_progress(dir.path()).await);
     }
 
     #[tokio::test]
