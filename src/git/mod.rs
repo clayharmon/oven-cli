@@ -132,7 +132,7 @@ pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check if the worktree has uncommitted changes (staged or unstaged tracked files).
+/// Check if the worktree has any uncommitted changes, including untracked files.
 pub async fn is_dirty(repo_dir: &Path) -> Result<bool> {
     let output =
         run_git(repo_dir, &["status", "--porcelain"]).await.context("checking dirty state")?;

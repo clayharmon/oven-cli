@@ -1152,7 +1152,9 @@ fn is_retryable_merge_error(err: &anyhow::Error) -> bool {
     if msg.contains("not allowed") {
         return false;
     }
-    msg.contains("not mergeable") || msg.contains("out of date") || msg.contains("is expected")
+    msg.contains("not mergeable")
+        || msg.contains("out of date")
+        || (msg.contains("status check") && msg.contains("is expected"))
 }
 
 const COMMENT_FOOTER: &str =
