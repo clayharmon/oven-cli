@@ -433,7 +433,14 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
         // 2. Review-fix loop (posts its own step comments on the PR)
         self.run_review_fix_loop(run_id, ctx, worktree_path, target_dir).await?;
 
-        // 3. Rebase onto base branch to resolve any conflicts from parallel merges
+        // 3. Commit any uncommitted agent work before rebasing. Agents (especially
+        //    the fixer) sometimes modify files without committing. Without this,
+        //    git rebase refuses to start on a dirty worktree.
+        if git::commit_all(worktree_path, "chore: commit uncommitted agent changes").await? {
+            info!(run_id = %run_id, "committed uncommitted agent changes before rebase");
+        }
+
+        // 4. Rebase onto base branch to resolve any conflicts from parallel merges
         self.check_cancelled()?;
         info!(run_id = %run_id, base = %ctx.base_branch, "rebasing onto base branch");
         let rebase_outcome =
@@ -455,7 +462,7 @@ impl<R: CommandRunner + 'static> PipelineExecutor<R> {
 
         git::force_push_branch(worktree_path, &ctx.branch).await?;
 
-        // 4. Merge (only when auto-merge is enabled)
+        // 5. Merge (only when auto-merge is enabled)
         if auto_merge {
             let pr_number = ctx.pr_number.context("no PR number for merge step")?;
             self.update_status(run_id, RunStatus::Merging).await?;

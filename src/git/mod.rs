@@ -132,6 +132,25 @@ pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if the worktree has uncommitted changes (staged or unstaged tracked files).
+pub async fn is_dirty(repo_dir: &Path) -> bool {
+    run_git(repo_dir, &["status", "--porcelain"]).await.is_ok_and(|output| !output.is_empty())
+}
+
+/// Stage all changes and commit them with the given message.
+///
+/// Used to preserve agent work (e.g. fixer edits) that wasn't committed before
+/// the rebase step. Returns `Ok(true)` if a commit was created, `Ok(false)` if
+/// there was nothing to commit.
+pub async fn commit_all(repo_dir: &Path, message: &str) -> Result<bool> {
+    if !is_dirty(repo_dir).await {
+        return Ok(false);
+    }
+    run_git(repo_dir, &["add", "-A"]).await.context("staging all changes")?;
+    run_git(repo_dir, &["commit", "-m", message]).await.context("committing changes")?;
+    Ok(true)
+}
+
 /// Push a branch to origin.
 pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_git(repo_dir, &["push", "origin", branch]).await.context("pushing branch")?;
@@ -840,6 +859,37 @@ mod tests {
 
         // Clean up
         abort_rebase(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn is_dirty_detects_modified_files() {
+        let dir = init_temp_repo().await;
+        assert!(!is_dirty(dir.path()).await);
+
+        tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
+        assert!(is_dirty(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn commit_all_commits_dirty_state() {
+        let dir = init_temp_repo().await;
+
+        tokio::fs::write(dir.path().join("new.txt"), "new file").await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
+
+        let committed = commit_all(dir.path(), "save agent work").await.unwrap();
+        assert!(committed);
+        assert!(!is_dirty(dir.path()).await);
+
+        let log = run_git(dir.path(), &["log", "--oneline", "-1"]).await.unwrap();
+        assert!(log.contains("save agent work"));
+    }
+
+    #[tokio::test]
+    async fn commit_all_returns_false_when_clean() {
+        let dir = init_temp_repo().await;
+        let committed = commit_all(dir.path(), "nothing to commit").await.unwrap();
+        assert!(!committed);
     }
 
     #[tokio::test]
