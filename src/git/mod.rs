@@ -133,20 +133,25 @@ pub async fn empty_commit(repo_dir: &Path, message: &str) -> Result<()> {
 }
 
 /// Check if the worktree has uncommitted changes (staged or unstaged tracked files).
-pub async fn is_dirty(repo_dir: &Path) -> bool {
-    run_git(repo_dir, &["status", "--porcelain"]).await.is_ok_and(|output| !output.is_empty())
+pub async fn is_dirty(repo_dir: &Path) -> Result<bool> {
+    let output =
+        run_git(repo_dir, &["status", "--porcelain"]).await.context("checking dirty state")?;
+    Ok(!output.is_empty())
 }
 
-/// Stage all changes and commit them with the given message.
+/// Stage modified/deleted tracked files and commit them with the given message.
 ///
 /// Used to preserve agent work (e.g. fixer edits) that wasn't committed before
-/// the rebase step. Returns `Ok(true)` if a commit was created, `Ok(false)` if
-/// there was nothing to commit.
+/// the rebase step. Uses `git add -u` (tracked files only) rather than `git add -A`
+/// to avoid committing untracked artifacts like temp files or test output.
+///
+/// Returns `Ok(true)` if a commit was created, `Ok(false)` if there was nothing
+/// to commit.
 pub async fn commit_all(repo_dir: &Path, message: &str) -> Result<bool> {
-    if !is_dirty(repo_dir).await {
+    if !is_dirty(repo_dir).await? {
         return Ok(false);
     }
-    run_git(repo_dir, &["add", "-A"]).await.context("staging all changes")?;
+    run_git(repo_dir, &["add", "-u"]).await.context("staging tracked changes")?;
     run_git(repo_dir, &["commit", "-m", message]).await.context("committing changes")?;
     Ok(true)
 }
@@ -160,12 +165,12 @@ pub async fn push_branch(repo_dir: &Path, branch: &str) -> Result<()> {
 /// Fetch a branch from origin to update the remote tracking ref.
 ///
 /// Used between pipeline layers so that new worktrees (which branch from
-/// `origin/<branch>`) start from post-merge state.
+/// `origin/<branch>`) start from post-merge state. Retries once on transient
+/// ref lock contention from parallel fetches.
 pub async fn fetch_branch(repo_dir: &Path, branch: &str) -> Result<()> {
-    run_git(repo_dir, &["fetch", "origin", branch])
+    fetch_with_retry(repo_dir, branch)
         .await
-        .with_context(|| format!("fetching {branch} from origin"))?;
-    Ok(())
+        .with_context(|| format!("fetching {branch} from origin"))
 }
 
 /// Advance the local branch ref to match `origin/<branch>` after a fetch.
@@ -238,17 +243,17 @@ pub async fn start_rebase(repo_dir: &Path, base_branch: &str) -> RebaseOutcome {
     let target = format!("origin/{base_branch}");
 
     let no_editor = [("GIT_EDITOR", "true")];
-    if run_git_with_env(repo_dir, &["rebase", "--empty=drop", &target], &no_editor).await.is_ok() {
+    let Err(rebase_err) =
+        run_git_with_env(repo_dir, &["rebase", "--empty=drop", &target], &no_editor).await
+    else {
         return RebaseOutcome::Clean;
-    }
+    };
 
     // Rebase command failed. Check if a rebase is actually in progress -- if not,
     // the failure was something else entirely (dirty worktree, invalid ref, etc.)
     // and we should report the real error rather than misclassifying it.
     if !rebase_in_progress(repo_dir).await {
-        return RebaseOutcome::Failed(
-            "rebase could not start (dirty worktree or invalid state)".to_string(),
-        );
+        return RebaseOutcome::Failed(format!("rebase could not start: {rebase_err}"));
     }
 
     let conflicting = conflicting_files(repo_dir).await;
@@ -311,7 +316,8 @@ pub async fn rebase_in_progress(repo_dir: &Path) -> bool {
 
     let git_dir = if git_dir.is_absolute() { git_dir } else { repo_dir.join(git_dir) };
 
-    git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+    tokio::fs::try_exists(git_dir.join("rebase-merge")).await.unwrap_or(false)
+        || tokio::fs::try_exists(git_dir.join("rebase-apply")).await.unwrap_or(false)
 }
 
 /// Fetch with a single retry for transient failures (e.g. ref lock contention).
@@ -864,25 +870,34 @@ mod tests {
     #[tokio::test]
     async fn is_dirty_detects_modified_files() {
         let dir = init_temp_repo().await;
-        assert!(!is_dirty(dir.path()).await);
+        assert!(!is_dirty(dir.path()).await.unwrap());
 
         tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
-        assert!(is_dirty(dir.path()).await);
+        assert!(is_dirty(dir.path()).await.unwrap());
     }
 
     #[tokio::test]
-    async fn commit_all_commits_dirty_state() {
+    async fn commit_all_commits_tracked_changes_only() {
         let dir = init_temp_repo().await;
 
+        // Untracked file should NOT be staged (git add -u ignores untracked)
         tokio::fs::write(dir.path().join("new.txt"), "new file").await.unwrap();
+        // Modified tracked file should be staged
         tokio::fs::write(dir.path().join("README.md"), "modified").await.unwrap();
 
         let committed = commit_all(dir.path(), "save agent work").await.unwrap();
         assert!(committed);
-        assert!(!is_dirty(dir.path()).await);
 
         let log = run_git(dir.path(), &["log", "--oneline", "-1"]).await.unwrap();
         assert!(log.contains("save agent work"));
+
+        // README.md should be committed, new.txt should still be untracked
+        let diff = run_git(dir.path(), &["diff", "HEAD~1", "--name-only"]).await.unwrap();
+        assert!(diff.contains("README.md"));
+        assert!(!diff.contains("new.txt"));
+
+        // Worktree still dirty because of the untracked file
+        assert!(is_dirty(dir.path()).await.unwrap());
     }
 
     #[tokio::test]
@@ -911,8 +926,8 @@ mod tests {
 
         let outcome = start_rebase(dir.path(), &branch).await;
         assert!(
-            matches!(outcome, RebaseOutcome::Failed(ref msg) if msg.contains("dirty worktree")),
-            "expected Failed with dirty worktree message, got {outcome:?}"
+            matches!(outcome, RebaseOutcome::Failed(ref msg) if msg.contains("could not start")),
+            "expected Failed with 'could not start' message, got {outcome:?}"
         );
     }
 
