@@ -145,10 +145,16 @@ pub async fn is_dirty(repo_dir: &Path) -> Result<bool> {
 /// the rebase step. Uses `git add -u` (tracked files only) rather than `git add -A`
 /// to avoid committing untracked artifacts like temp files or test output.
 ///
+/// Checks for tracked changes with `-uno` (ignore untracked) so that worktrees
+/// with only untracked files don't trigger a commit attempt that would fail.
+///
 /// Returns `Ok(true)` if a commit was created, `Ok(false)` if there was nothing
 /// to commit.
 pub async fn commit_all(repo_dir: &Path, message: &str) -> Result<bool> {
-    if !is_dirty(repo_dir).await? {
+    let tracked_changes = run_git(repo_dir, &["status", "--porcelain", "-uno"])
+        .await
+        .context("checking tracked changes")?;
+    if tracked_changes.is_empty() {
         return Ok(false);
     }
     run_git(repo_dir, &["add", "-u"]).await.context("staging tracked changes")?;
@@ -358,18 +364,19 @@ pub async fn rebase_continue(
     }
 
     let no_editor = [("GIT_EDITOR", "true")];
-    if run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await.is_ok() {
+    let Err(continue_err) = run_git_with_env(repo_dir, &["rebase", "--continue"], &no_editor).await
+    else {
         return Ok(None);
-    }
+    };
 
     // rebase --continue stopped again -- check for new conflicts on the next commit.
     if !rebase_in_progress(repo_dir).await {
-        anyhow::bail!("rebase --continue failed and no rebase is in progress");
+        anyhow::bail!("rebase --continue failed and no rebase is in progress: {continue_err}");
     }
 
     let new_conflicts = conflicting_files(repo_dir).await;
     if new_conflicts.is_empty() {
-        anyhow::bail!("rebase stopped after continue with no conflicts");
+        anyhow::bail!("rebase stopped after continue with no conflicts: {continue_err}");
     }
     Ok(Some(new_conflicts))
 }
@@ -905,6 +912,22 @@ mod tests {
         let dir = init_temp_repo().await;
         let committed = commit_all(dir.path(), "nothing to commit").await.unwrap();
         assert!(!committed);
+    }
+
+    #[tokio::test]
+    async fn commit_all_skips_untracked_only_worktree() {
+        let dir = init_temp_repo().await;
+
+        // Only untracked files -- is_dirty sees them but commit_all should skip
+        tokio::fs::write(dir.path().join("temp.log"), "agent output").await.unwrap();
+        assert!(is_dirty(dir.path()).await.unwrap());
+
+        let committed = commit_all(dir.path(), "should not commit").await.unwrap();
+        assert!(!committed);
+
+        // The untracked file should still be there, not committed
+        let log = run_git(dir.path(), &["log", "--oneline", "-1"]).await.unwrap();
+        assert!(!log.contains("should not commit"));
     }
 
     #[tokio::test]
